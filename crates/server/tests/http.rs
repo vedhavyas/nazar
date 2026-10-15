@@ -940,6 +940,24 @@ async fn the_spa_serves_index_and_revalidates_with_etags() {
         "no-cache",
         "the bundle revalidates rather than sticking in a cache"
     );
+    assert_eq!(
+        root.headers()
+            .get(reqwest::header::X_CONTENT_TYPE_OPTIONS)
+            .expect("nosniff")
+            .to_str()
+            .expect("a header value"),
+        "nosniff",
+        "the SPA is not sniffed into another type"
+    );
+    assert_eq!(
+        root.headers()
+            .get(reqwest::header::CONTENT_SECURITY_POLICY)
+            .expect("csp")
+            .to_str()
+            .expect("a header value"),
+        "frame-ancestors 'none'",
+        "nobody frames the house"
+    );
     let body = root.text().await.expect("body");
     assert_eq!(body, index, "the built index is served");
 

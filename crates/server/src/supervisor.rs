@@ -6,8 +6,8 @@
 //! fresh login heals the streams without restarting the server.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live};
@@ -74,6 +74,9 @@ pub struct Supervisor {
     /// Set when Qubo turns the session away; `/api/cameras` carries it so
     /// the UI can route back to login instead of holding a dead screen.
     needs_login: Arc<AtomicBool>,
+    /// When discovery last ran, so a refused session is re-tried on a
+    /// cadence rather than on every gated request.
+    last_discovery: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Supervisor {
@@ -86,7 +89,17 @@ impl Supervisor {
             state: Arc::new(RwLock::new(HashMap::new())),
             devices: Arc::new(RwLock::new(Vec::new())),
             needs_login: Arc::new(AtomicBool::new(false)),
+            last_discovery: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Whether a refused session's re-discovery is worth trying yet.
+    pub fn discovery_due(&self) -> bool {
+        let last = *self
+            .last_discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        last.is_none_or(|last| last.elapsed() >= DISCOVERY_BACKOFF)
     }
 
     /// Whether Qubo has refused the stored session; the UI must log in.
@@ -96,6 +109,10 @@ impl Supervisor {
 
     /// Discover the account's devices and remember them.
     pub async fn refresh_devices(&self) -> Result<Vec<Device>, SupervisorError> {
+        *self
+            .last_discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         let session = self.sessions.load()?.ok_or(qubo::QuboError::Auth {
             code: None,
             message: "no Qubo session; log in".to_owned(),
@@ -303,6 +320,10 @@ impl Supervisor {
             .state = StreamState::Degraded { reason };
     }
 }
+
+/// How often a refused session is re-tried; the UI is already routed to
+/// login, so this is just how soon recovery is noticed.
+const DISCOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 fn new_tracked() -> Tracked {
     Tracked {
