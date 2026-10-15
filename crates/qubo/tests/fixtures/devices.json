@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "deviceUUID": "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01",
+      "deviceName": "Hall",
+      "deviceType": "HCP01",
+      "aModelNo": "HCP01",
+      "extraData": { "serialNumber": "SN0001" },
+      "entityUUID": "default",
+      "isOnline": true
+    },
+    {
+      "deviceUUID": "7d2b4a11-9c3e-4f5a-b6d7-8e9f0a1b2c03",
+      "deviceName": "Gate",
+      "deviceType": "HCD01",
+      "aModelNo": "HCD01",
+      "extraData": {},
+      "entityUUID": "default",
+      "isOnline": false
+    }
+  ]
+}

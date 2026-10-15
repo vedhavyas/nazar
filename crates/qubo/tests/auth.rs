@@ -1,13 +1,14 @@
 //! OTP login wire tests.
 //!
-//! Fixture provenance. `otp_request.json` / `otp_verify.json` carry the
-//! response shapes the reference client parses (qubopy `auth.py`) and the
-//! stored session file's real shape; all values are synthesized.
-//! `error_otp_001.json`'s code is recorded (APK decompile, `Y4.java:1850`) -
-//! its message text is synthesized. `error_rate_limit.json`'s code comes from
-//! the M1 plan and appears in no spec or decompile on disk; its text is
-//! synthesized. What these tests pin is that whatever code and message the
-//! gateway sends survive into `QuboError`.
+//! Fixture provenance (spec §3.7). `otp_request.json` / `otp_verify.json`
+//! carry the response shapes the reference client parses (qubopy `auth.py`)
+//! and the stored session file's real shape; all values are synthesized.
+//! `error_otp_001.json`'s code is the wrong-OTP code recorded in the APK
+//! decompile (`Y4.java:1850`). `error_rate_limit.json`'s code was observed
+//! live 2026-10-13 as the OTP resend rate limit (reported window: "try after
+//! 15 minutes"). Both fixtures' message text is synthesized; the envelope
+//! shape (`message` as an array) is live-captured. What these tests pin is
+//! that whatever code and message the gateway sends survive into `QuboError`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

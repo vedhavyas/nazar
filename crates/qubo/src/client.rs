@@ -111,7 +111,7 @@ impl QuboClient {
     /// GET `path`, relative to the gateway, authenticated when a session
     /// is given.
     pub async fn get_json(&self, path: &str, auth: Option<&Session>) -> Result<Value, QuboError> {
-        self.send(Method::GET, path, None, auth).await
+        self.send(Method::GET, path, &[], None, auth).await
     }
 
     /// POST a JSON `body` to `path`, authenticated when a session is
@@ -122,17 +122,30 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, Some(body), auth).await
+        self.send(Method::POST, path, &[], Some(body), auth).await
+    }
+
+    /// POST a JSON `body` to `path` with query parameters, authenticated
+    /// when a session is given.
+    pub async fn post_json_query(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &Value,
+        auth: Option<&Session>,
+    ) -> Result<Value, QuboError> {
+        self.send(Method::POST, path, query, Some(body), auth).await
     }
 
     async fn send(
         &self,
         method: Method,
         path: &str,
+        query: &[(&str, &str)],
         body: Option<&Value>,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        let url = self.url_for(path)?;
+        let url = self.url_for(path, query)?;
         let mut request = self
             .http
             .request(method, url)
@@ -167,15 +180,19 @@ impl QuboClient {
         Err(error_for_status(status, &text))
     }
 
-    fn url_for(&self, path: &str) -> Result<Url, QuboError> {
+    fn url_for(&self, path: &str, query: &[(&str, &str)]) -> Result<Url, QuboError> {
         let path = if path.starts_with('/') {
             path.to_owned()
         } else {
             format!("/{path}")
         };
-        self.base.join(&path).map_err(|err| QuboError::Http {
+        let mut url = self.base.join(&path).map_err(|err| QuboError::Http {
             status: None,
             message: format!("invalid path {path}: {err}"),
-        })
+        })?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        Ok(url)
     }
 }
