@@ -339,6 +339,28 @@ async fn a_cancelled_start_does_not_strand_the_device() {
 }
 
 #[tokio::test]
+async fn a_put_go2rtc_did_not_take_is_degraded_not_live() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    mint_mock(200, &mint_body("first")).mount(&h.qubo).await;
+    h.go2rtc.set_streams_visible(false);
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+
+    match h.supervisor.status(DEVICE_ID).await {
+        StreamState::Degraded { reason } => {
+            assert_eq!(
+                reason, "go2rtc did not take the stream",
+                "an acked PUT with no producer is not Live"
+            );
+        }
+        other => panic!("expected Degraded, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+#[tokio::test]
 async fn vod_is_reserved_for_m3() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     let err = h

@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,12 +20,14 @@ pub struct FakeApi {
     pub base: reqwest::Url,
     puts: Arc<Mutex<Vec<(String, String)>>>,
     put_status: Arc<AtomicU16>,
+    streams_visible: Arc<AtomicBool>,
 }
 
 impl FakeApi {
     pub async fn start() -> Self {
         let puts = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
+        let streams_visible = Arc::new(AtomicBool::new(true));
         let app = Router::new()
             .route(
                 "/api/streams",
@@ -51,7 +53,37 @@ impl FakeApi {
                         }
                     }
                 })
-                .get(|| async { include_str!("../fixtures/streams.json") }),
+                .get({
+                    let recorded = Arc::clone(&puts);
+                    let visible = Arc::clone(&streams_visible);
+                    move || {
+                        let recorded = Arc::clone(&recorded);
+                        let visible = Arc::clone(&visible);
+                        async move {
+                            let recorded = recorded.lock().unwrap().clone();
+                            if recorded.is_empty() {
+                                return include_str!("../fixtures/streams.json").to_owned();
+                            }
+                            if !visible.load(Ordering::SeqCst) {
+                                return "{}".to_owned();
+                            }
+                            // go2rtc materializes a producer as soon as the
+                            // source is set, which is what the fixture's
+                            // unset case cannot show.
+                            let mut streams = serde_json::Map::new();
+                            for (name, source) in recorded {
+                                streams.insert(
+                                    name,
+                                    serde_json::json!({
+                                        "producers": [{ "url": source }],
+                                        "consumers": null,
+                                    }),
+                                );
+                            }
+                            serde_json::Value::Object(streams).to_string()
+                        }
+                    }
+                }),
             )
             .route("/api/ws", get(echo))
             // The SDP exchange the proxy is allowed to carry.
@@ -67,12 +99,19 @@ impl FakeApi {
             base: format!("http://{addr}").parse().expect("a url"),
             puts,
             put_status,
+            streams_visible,
         }
     }
 
     /// Answer stream PUTs with `status` from now on.
     pub fn set_put_status(&self, status: u16) {
         self.put_status.store(status, Ordering::SeqCst);
+    }
+
+    /// Report nothing from GET /api/streams, as a go2rtc that acked a PUT
+    /// it did not take would.
+    pub fn set_streams_visible(&self, visible: bool) {
+        self.streams_visible.store(visible, Ordering::SeqCst);
     }
 
     /// The stream PUTs received so far, as `(name, source)`.

@@ -252,6 +252,21 @@ impl Supervisor {
             .put_stream(&device.device_id, &live_source(&mint.url))
             .await
             .map_err(|err| redact(&err.to_string()))?;
+        // Live means go2rtc actually holds a producer for the stream, not
+        // that a PUT was acknowledged. Measured 2026-10-15: the producer
+        // appears when the source is set and ffmpeg starts on the first
+        // viewer, so a held producer is the strongest liveness the API
+        // exposes - frames being on screen stays the tile's own business.
+        let held = self
+            .go2rtc
+            .streams()
+            .await
+            .map_err(|err| redact(&err.to_string()))?
+            .iter()
+            .any(|stream| stream.name == device.device_id && stream.live);
+        if !held {
+            return Err("go2rtc did not take the stream".to_owned());
+        }
         self.needs_login.store(false, Ordering::SeqCst);
         Ok(())
     }
