@@ -151,6 +151,16 @@ pub fn parse_monitor_message(topic: &str, payload: &str) -> Option<UnitEvent> {
     }
 }
 
+/// The stored session, read off the runtime's worker threads: a slow file
+/// there must not stall the feed's timers, let alone tear a healthy one.
+async fn stored_session(sessions: &SessionStore) -> Result<Option<qubo::Session>, MqttError> {
+    let sessions = sessions.clone();
+    tokio::task::spawn_blocking(move || sessions.load())
+        .await
+        .map_err(|err| MqttError::Connection(format!("the session read panicked: {err}")))?
+        .map_err(MqttError::from)
+}
+
 async fn run(
     client: QuboClient,
     sessions: SessionStore,
@@ -202,7 +212,7 @@ async fn feed(
     events: &EventBus,
     config: &FeedConfig,
 ) -> Result<FeedEnd, MqttError> {
-    let Some(session) = sessions.load()? else {
+    let Some(session) = stored_session(sessions).await? else {
         return Err(MqttError::NoSession);
     };
     let units = match list_devices(client, &session).await {
@@ -295,7 +305,7 @@ async fn feed(
                     );
                     return Ok(FeedEnd::Reconnect);
                 }
-                if let Some(current) = sessions.load()?
+                if let Some(current) = stored_session(sessions).await?
                     && current.access_token != session.access_token
                 {
                     tracing::info!("the stored session changed; reconnecting the feed");
