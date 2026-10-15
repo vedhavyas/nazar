@@ -25,3 +25,5 @@ Status: designed - the approved design is `docs/design.md` (the contract the imp
 - Brainstorm -> plan -> approve -> build. Workers build; the lead reviews every PR substantively before merge.
 - No hand-rolled infrastructure where a solid tool exists (go2rtc sidecar over custom streaming glue, and so on).
 - Private repo on the personal account; no AI/process mentions in any commit, PR, or doc text.
+- Release tags (`git tag` + push, and the CI publish they trigger) are routine in this repo - no per-action approval (Ved, 2026-10-15, when the first tag unblocked the hub module).
+
