@@ -86,10 +86,12 @@ async fn streams_reports_a_producer_as_live() {
             StreamStatus {
                 name: "gate".to_owned(),
                 live: false,
+                consumers: 0,
             },
             StreamStatus {
                 name: "hall".to_owned(),
                 live: true,
+                consumers: 0,
             },
         ],
         "one status per stream, sorted by name, live when a producer is held"
