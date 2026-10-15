@@ -19,7 +19,10 @@ rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "process", "sync", "time"] }
+# Every feature this crate's code names, including the ones its tests use
+# directly (io-util for the fake broker's sockets), rather than whatever a
+# sibling feature happens to pull in.
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

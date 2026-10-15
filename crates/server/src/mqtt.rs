@@ -36,6 +36,10 @@ pub struct FeedConfig {
     /// How often a connected feed re-reads the stored session, so a fresh
     /// login reconnects onto the new token.
     pub session_check: Duration,
+    /// How often a feed with no session at all looks again. Nobody is
+    /// logged in yet, so this is a slow poll, not a two-second one: a
+    /// login is noticed within one interval either way.
+    pub idle_retry: Duration,
     pub retry_min: Duration,
     pub retry_max: Duration,
 }
@@ -49,6 +53,7 @@ impl Default for FeedConfig {
             quiet_window: Duration::from_secs(300),
             motion_window: Duration::from_secs(1800),
             session_check: Duration::from_secs(30),
+            idle_retry: Duration::from_secs(10),
             retry_min: Duration::from_secs(2),
             retry_max: Duration::from_secs(120),
         }
@@ -170,7 +175,7 @@ async fn run(
             }
             Err(err @ MqttError::NoSession) => {
                 tracing::debug!(%err, "mqtt feed idles until a login lands");
-                backoff = config.retry_min;
+                backoff = config.idle_retry;
             }
             Err(err) => {
                 tracing::warn!(%err, "mqtt feed down; reconnecting");

@@ -65,6 +65,7 @@ fn feed_config(
         quiet_window,
         motion_window,
         session_check,
+        idle_retry: Duration::from_millis(20),
         retry_min: Duration::from_millis(20),
         retry_max: Duration::from_millis(50),
     }
