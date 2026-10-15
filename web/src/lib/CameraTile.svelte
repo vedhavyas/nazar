@@ -1,12 +1,6 @@
 <script lang="ts">
   import type { Camera } from './api';
-
-  /** The vendored go2rtc player element (registered in index.html). */
-  interface VideoRtcElement extends HTMLElement {
-    src: string;
-    mode: string;
-    media: string;
-  }
+  import Player from './Player.svelte';
 
   let {
     camera,
@@ -23,14 +17,13 @@
     still?: boolean;
   } = $props();
 
-  let host = $state<HTMLDivElement | null>(null);
+  let picture = $state<HTMLDivElement | null>(null);
   let snapshot = $state<HTMLCanvasElement | null>(null);
   let attempt = $state(0);
   /** Why the picture is not moving, when it is not. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
-
-  /** How often away mode refreshes a tile's still. */
-  const STILL_EVERY_MS = 10_000;
+  /** Whether the fallback stream is carrying the picture. */
+  let fallingBack = $state(false);
 
   const STATE_WORDS: Record<Camera['state'], string> = {
     live: 'Live',
@@ -39,106 +32,17 @@
     degraded: 'Trouble',
   };
 
-  $effect(() => {
-    const stage = host;
-    // The name the server minted (`<device>-<quality>`); a bare device id
-    // is refused by the proxy, so a tile without one waits.
-    const name = stream;
-    if (!stage || !name || camera.state !== 'live' || stalled) return;
-    void attempt; // retrying rebuilds the player
+  /** How often away mode refreshes a tile's still. */
+  const STILL_EVERY_MS = 10_000;
 
-    const player = document.createElement('video-rtc') as VideoRtcElement;
-    player.className = 'player';
-    player.mode = 'webrtc';
-    player.media = 'video';
-    player.src = `/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
-    stage.appendChild(player);
-
-    // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
-    // dead stream leaves the last one. No first frame inside the window,
-    // then no advancing clock, are the two signals a person can act on.
-    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      stalled = 'start';
-    }, 12000);
-    let watching: ReturnType<typeof setInterval> | null = null;
-    let lastTime = -1;
-    let playing = false;
-    /** Where the clock stood when the tab was hidden, if it had started. */
-    let awayAt = -1;
-
-    const tick = () => {
-      const video = player.querySelector('video');
-      if (!video) return;
-      if (video.currentTime <= lastTime) {
-        stalled = 'frozen';
-        return;
-      }
-      lastTime = video.currentTime;
-    };
-    const watch = () => {
-      if (watching) return;
-      watching = setInterval(tick, 5000);
-    };
-    const onplaying = () => {
-      playing = true;
-      if (timer) clearTimeout(timer);
-      timer = null;
-      watch();
-    };
-
-    // A background tab is not a stalled picture: Chromium throttles it and
-    // may drop the peer behind its back, so the watch stands down while it
-    // cannot see, and the picture is started again on return when the clock
-    // did not follow us back - a dropped peer never re-attaches on its own.
-    const onVisibility = () => {
-      const video = player.querySelector('video');
-      if (document.hidden) {
-        awayAt = playing && video ? video.currentTime : -1;
-        if (timer) clearTimeout(timer);
-        timer = null;
-        if (watching) clearInterval(watching);
-        watching = null;
-        return;
-      }
-      const here = video ? video.currentTime : -1;
-      if (!playing || (awayAt >= 0 && here <= awayAt)) {
-        stalled = null;
-        attempt += 1;
-        onwatch(camera.id);
-        return;
-      }
-      // Still the same picture: watch it again from where it stands.
-      awayAt = -1;
-      lastTime = -1;
-      if (!playing) {
-        timer = setTimeout(() => {
-          stalled = 'start';
-        }, 12000);
-      }
-      watch();
-    };
-
-    const video = player.querySelector('video');
-    video?.addEventListener('playing', onplaying);
-    document.addEventListener('visibilitychange', onVisibility);
-
-    return () => {
-      if (timer) clearTimeout(timer);
-      if (watching) clearInterval(watching);
-      video?.removeEventListener('playing', onplaying);
-      document.removeEventListener('visibilitychange', onVisibility);
-      player.remove();
-    };
-  });
-
-  // Away mode: the tile keeps its own low stream, and shows one frame of it
+  // Away mode: the tile keeps its own stream, and shows one frame of it
   // every ten seconds rather than a live picture - no extra server work.
   $effect(() => {
     if (!still || camera.state !== 'live' || stalled) return;
     const canvas = snapshot;
     if (!canvas) return;
     const draw = () => {
-      const video = host?.querySelector('video');
+      const video = picture?.querySelector('video');
       const ctx = canvas.getContext('2d');
       if (!video || !ctx) return;
       canvas.width = video.videoWidth || canvas.width || 640;
@@ -167,8 +71,23 @@
     <span class="state" data-state={camera.state}>{STATE_WORDS[camera.state]}</span>
   </header>
 
-  {#if camera.state === 'live'}
-    <div class="stage" class:hidden={still} bind:this={host}></div>
+  {#if camera.state === 'live' && stream}
+    <div class="picture" class:hidden={still && !stalled} bind:this={picture}>
+      <Player
+        {stream}
+        {attempt}
+        muted
+        onsettled={(state) => {
+          if (state === 'hls') {
+            fallingBack = true;
+            stalled = null;
+            return;
+          }
+          fallingBack = false;
+          stalled = state;
+        }}
+      />
+    </div>
     {#if still && !stalled}
       <canvas class="still" bind:this={snapshot}></canvas>
     {/if}
@@ -178,6 +97,8 @@
     {:else if stalled === 'frozen'}
       <p class="note">The picture stopped. The camera link may have dropped.</p>
       <button class="btn" onclick={retry}>Try again</button>
+    {:else if fallingBack && !still}
+      <p class="note">WebRTC could not connect here; showing the compatibility stream.</p>
     {/if}
   {:else if camera.state === 'degraded'}
     <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
@@ -247,15 +168,8 @@
     color: var(--bad);
   }
 
-  .stage {
-    aspect-ratio: 16 / 9;
-    border-radius: 8px;
-    overflow: hidden;
-    background: #000;
-  }
-
   /* Away mode hides the live picture behind the still it feeds. */
-  .stage.hidden {
+  .picture.hidden {
     display: none;
   }
 
@@ -265,14 +179,6 @@
     aspect-ratio: 16 / 9;
     border-radius: 8px;
     background: #000;
-  }
-
-  .stage :global(video-rtc),
-  .stage :global(video-rtc video) {
-    display: block;
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
   }
 
   .note {

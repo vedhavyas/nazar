@@ -498,6 +498,75 @@ async fn the_proxy_only_reaches_the_ws_path() {
 }
 
 #[tokio::test]
+async fn the_proxy_serves_the_hls_fallback() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    let browser = client();
+    let listed = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+
+    // The master playlist, for a stream this server minted.
+    let master = browser
+        .get(format!(
+            "{}/go2rtc/api/stream.m3u8?src={DEVICE_ID}-high",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("the master playlist");
+    assert_eq!(master.status(), reqwest::StatusCode::OK);
+    let body = master.text().await.expect("a playlist");
+    assert!(
+        body.contains("api/hls/playlist.m3u8"),
+        "the fallback's playlist came through: {body}"
+    );
+
+    // And the parts it names, by their opaque session id.
+    let part = browser
+        .get(format!(
+            "{}/go2rtc/api/hls/segment.m4s?id=hls-1&n=0",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("a segment");
+    assert_eq!(
+        part.status(),
+        reqwest::StatusCode::OK,
+        "a segment with a session id is proxied"
+    );
+
+    // Everything a fallback must not reach: an id the caller made up is
+    // shaped fine but go2rtc refuses it, and a src that is not a stream
+    // this server minted never leaves here.
+    let invented = browser
+        .get(format!(
+            "{}/go2rtc/api/stream.m3u8?src=ffmpeg:rtsp://evil/x",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("an invented src");
+    assert_eq!(invented.status(), reqwest::StatusCode::NOT_FOUND);
+    let shape = browser
+        .get(format!("{}/go2rtc/api/hls/segment.m4s?id=a/b", h.base))
+        .send()
+        .await
+        .expect("a shaped id");
+    assert_eq!(shape.status(), reqwest::StatusCode::NOT_FOUND);
+    let bare = browser
+        .get(format!("{}/go2rtc/api/hls/segment.m4s", h.base))
+        .send()
+        .await
+        .expect("no id");
+    assert_eq!(bare.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn websocket_frames_are_piped_through_the_proxy() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;

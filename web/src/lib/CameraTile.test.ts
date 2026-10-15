@@ -25,6 +25,40 @@ beforeAll(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+test('a socket that cannot negotiate falls back to HLS where it plays', async () => {
+  vi.useFakeTimers();
+  // This browser plays HLS by itself: Safari, iOS, Chrome on Android.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('maybe');
+  liveTile();
+
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'no fallback before the window is out',
+  ).toBeNull();
+
+  await vi.advanceTimersByTimeAsync(12_500);
+
+  const fallback = document.querySelector('[data-testid=hls]');
+  expect(fallback, 'the compatibility stream took over').toBeTruthy();
+  expect(
+    fallback?.getAttribute('src'),
+    "pointed at this tile's own stream",
+  ).toBe('/go2rtc/api/stream.m3u8?src=cam-1-high');
+});
+
+test('without native HLS the tile offers the retry instead', async () => {
+  vi.useFakeTimers();
+  // Desktop Chromium and Firefox do not play HLS themselves.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  liveTile();
+
+  await vi.advanceTimersByTimeAsync(12_500);
+
+  expect(screen.getByText(/did not start/), 'the person gets the retry').toBeTruthy();
+  expect(document.querySelector('[data-testid=hls]'), 'and no broken player').toBeNull();
 });
 
 function liveTile() {
@@ -75,7 +109,7 @@ test('away mode shows a still over the tile it already streams', async () => {
     'the tile shows a still rather than the live picture',
   ).toBeTruthy();
   expect(
-    document.querySelector('.stage.hidden'),
+    document.querySelector('.picture.hidden'),
     'the live picture is hidden, not stopped',
   ).toBeTruthy();
   expect(

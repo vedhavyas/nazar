@@ -2,13 +2,8 @@
   import { onMount } from 'svelte';
 
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
+  import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
-
-  interface VideoRtcElement extends HTMLElement {
-    src: string;
-    mode: string;
-    media: string;
-  }
 
   let { id, onback, onlocked }: { id: string; onback: () => void; onlocked: () => void } =
     $props();
@@ -162,36 +157,7 @@
 
   // Audio is negotiated with the stream from the start and kept muted: a
   // browser only lets a gesture unmute it, and the toggle is that gesture.
-  // Nothing is re-negotiated when it flips.
-  $effect(() => {
-    const host = stage;
-    const name = stream;
-    if (!host || !name) return;
-    void attempt;
-
-    const player = document.createElement('video-rtc') as VideoRtcElement;
-    player.className = 'player';
-    player.mode = 'webrtc';
-    player.media = 'video,audio';
-    player.src = `/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
-    host.appendChild(player);
-
-    return () => player.remove();
-  });
-
-  // The video element arrives with the connection, so the mute the toggle
-  // sets has to be re-applied to whatever is on the stage.
-  $effect(() => {
-    const timer = setInterval(() => {
-      const video = stage?.querySelector('video');
-      if (!video) return;
-      if (video.muted !== !listening) {
-        video.muted = !listening;
-      }
-      video.volume = listening ? 1 : 0;
-    }, 500);
-    return () => clearInterval(timer);
-  });
+  // Nothing is re-negotiated when it flips; the player owns that.
 </script>
 
 <main class="screen">
@@ -208,7 +174,11 @@
   {/if}
 
   <PtzDrag onstep={step}>
-    <div class="stage" bind:this={stage}></div>
+    <div class="screen-stage" bind:this={stage}>
+      {#if stream}
+        <Player {stream} {attempt} muted={!listening} />
+      {/if}
+    </div>
   </PtzDrag>
 
   <div class="controls">
@@ -254,19 +224,8 @@
     font-size: var(--fs-label);
   }
 
-  .stage {
-    aspect-ratio: 16 / 9;
+  .screen-stage :global(.stage) {
     border-radius: var(--radius);
-    overflow: hidden;
-    background: #000;
-  }
-
-  .stage :global(video-rtc),
-  .stage :global(video-rtc video) {
-    display: block;
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
   }
 
   .controls {
