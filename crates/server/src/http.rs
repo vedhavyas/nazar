@@ -245,6 +245,7 @@ async fn set_pin(
         .await?
         .map_err(|err| match err {
             PinError::AlreadySet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
+            PinError::TooShort => ApiError::new(StatusCode::BAD_REQUEST, err.to_string()),
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     Ok(StatusCode::NO_CONTENT)

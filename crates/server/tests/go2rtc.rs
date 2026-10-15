@@ -11,13 +11,12 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use qubo::ServiceProvider;
 use server::config::Config;
 use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source};
-
-const ARGS_PATH: &str = "/tmp/nazar-fake-go2rtc-args.txt";
 
 #[test]
 fn live_source_references_the_config_template() {
@@ -99,7 +98,6 @@ async fn streams_reports_a_producer_as_live() {
 
 #[tokio::test]
 async fn start_writes_the_config_and_runs_the_binary_with_it() {
-    let _ = std::fs::remove_file(ARGS_PATH);
     let data_dir = temp_dir();
     let cfg = Config {
         data_dir: data_dir.clone(),
@@ -142,7 +140,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         "the configured WebRTC candidate reaches the generated config"
     );
 
-    let argv = await_args(Path::new(ARGS_PATH)).await;
+    let argv = await_args(&args_path(go2rtc.config_path())).await;
     assert_eq!(
         argv,
         vec![
@@ -153,7 +151,6 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
     );
 
     go2rtc.stop().await.expect("stop kills the fake binary");
-    let _ = std::fs::remove_file(ARGS_PATH);
 }
 
 #[tokio::test]
@@ -177,6 +174,12 @@ async fn no_webrtc_section_without_a_configured_candidate() {
     go2rtc.stop().await.expect("stop kills the fake binary");
 }
 
+/// Where the fake binary records its argv: beside its own config, so
+/// concurrent tests cannot read each other's.
+fn args_path(config_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.args", config_path.display()))
+}
+
 async fn await_args(path: &Path) -> Vec<String> {
     for _ in 0..100 {
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -191,8 +194,14 @@ fn fake_bin() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-go2rtc.sh")
 }
 
+static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
 fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nazar-go2rtc-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "nazar-go2rtc-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }

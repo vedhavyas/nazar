@@ -25,7 +25,7 @@ use server::supervisor::{Pacing, Supervisor};
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
-const PIN: &str = "2468";
+const PIN: &str = "246810";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
@@ -224,6 +224,72 @@ async fn the_gate_locks_cameras_and_only_the_right_pin_unlocks() {
 }
 
 #[tokio::test]
+async fn an_interrupted_set_leaves_the_gate_settable() {
+    let h = harness().await;
+    let browser = client();
+
+    // The shape a crash between write and rename could leave behind.
+    std::fs::write(h.data_dir.join("pin"), b"").expect("a torn pin file");
+
+    let unlock = browser
+        .post(format!("{}/api/unlock", h.base))
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("unlock");
+    assert_eq!(
+        unlock.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a torn PIN file reads as not-set, not as wrong or broken"
+    );
+
+    let set = browser
+        .post(format!("{}/api/pin", h.base))
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("set pin");
+    assert_eq!(
+        set.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the gate is settable again"
+    );
+
+    let unlock = browser
+        .post(format!("{}/api/unlock", h.base))
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("unlock");
+    assert_eq!(unlock.status(), reqwest::StatusCode::NO_CONTENT);
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn a_short_pin_is_refused() {
+    let h = harness().await;
+    let browser = client();
+
+    let short = browser
+        .post(format!("{}/api/pin", h.base))
+        .json(&json!({ "pin": "2468" }))
+        .send()
+        .await
+        .expect("short pin");
+    assert_eq!(
+        short.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a four-digit PIN is minutes of guessing"
+    );
+    assert_eq!(
+        short.json::<Value>().await.expect("json")["error"],
+        json!("the PIN needs at least 6 digits"),
+        "the reason is the server's own words"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn a_refused_session_reads_as_needs_login() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
@@ -305,7 +371,7 @@ async fn a_wrong_pin_is_refused_and_the_pin_is_first_run_only() {
 
     let response = browser
         .post(format!("{}/api/pin", h.base))
-        .json(&json!({ "pin": "9999" }))
+        .json(&json!({ "pin": "999999" }))
         .send()
         .await
         .expect("second pin");

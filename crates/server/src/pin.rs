@@ -1,9 +1,7 @@
 //! The household PIN gate: set once on first run, one unlock per browser.
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +22,17 @@ pub enum PinError {
     NotSet,
     #[error("wrong PIN")]
     Wrong,
+    #[error("the PIN needs at least {MIN_PIN_LENGTH} digits")]
+    TooShort,
+}
+
+/// Below this a short PIN is minutes of guessing, even behind a throttle.
+pub const MIN_PIN_LENGTH: usize = 6;
+
+/// The stored hash, when the file holds a parseable one.
+fn stored_hash(path: &Path) -> Option<PasswordHash> {
+    let stored = std::fs::read_to_string(path).ok()?;
+    PasswordHash::new(stored.trim()).ok()
 }
 
 /// The stored PIN, and the browser sessions that have unlocked.
@@ -41,55 +50,50 @@ impl PinGate {
         }
     }
 
-    /// Whether a PIN has been set (first run has none).
+    /// Whether a PIN has been set. A zero-length or unparseable file counts
+    /// as not set: an interrupted write must leave the gate settable again
+    /// rather than bricked.
     pub fn is_set(&self) -> bool {
-        self.path.exists()
+        stored_hash(&self.path).is_some()
     }
 
     /// Set the PIN. First run only: there is no change-PIN flow in M1.
     pub fn set(&self, pin: &str) -> Result<(), PinError> {
-        if self.is_set() {
-            return Err(PinError::AlreadySet);
+        if pin.chars().count() < MIN_PIN_LENGTH {
+            return Err(PinError::TooShort);
         }
-        // Claim the path exclusively so a racing second setter fails
-        // cleanly; the rename below replaces the empty claim atomically.
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.path)
-        {
-            Ok(claim) => drop(claim),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(PinError::AlreadySet);
-            }
-            Err(err) => return Err(err.into()),
+        // A torn file from an interrupted write is not a set PIN: clear it
+        // so the family can set one again.
+        if self.path.exists() && !self.is_set() {
+            tracing::warn!(path = %self.path.display(), "clearing an unusable PIN file");
+            std::fs::remove_file(&self.path)?;
         }
         let hash: PasswordHash = Argon2::default()
             .hash_password(pin.as_bytes())
             .map_err(|err| PinError::Hash(err.to_string()))?;
-        let hash = hash.to_string();
         // Write-then-rename, owner-only: a torn PIN file would lock the
         // family out until the volume is fixed by hand. The temp file is
-        // unique per writer, so two setters cannot tear each other's.
+        // unique per writer, and `persist_noclobber` only lands it when no
+        // PIN exists yet - the claim and the content are one step, so an
+        // interruption leaves nothing half-written at the real path.
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
-        file.write_all(hash.as_bytes())?;
+        file.write_all(hash.to_string().as_bytes())?;
         file.as_file().sync_all()?;
-        file.persist(&self.path).map_err(|err| err.error)?;
+        match file.persist_noclobber(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(PinError::AlreadySet);
+            }
+            Err(err) => return Err(err.error.into()),
+        }
         tracing::info!(path = %self.path.display(), "household PIN set");
         Ok(())
     }
 
     /// Verify `pin` and mint the browser session that unlocks the gate.
     pub fn unlock(&self, pin: &str) -> Result<String, PinError> {
-        let stored = match std::fs::read_to_string(&self.path) {
-            Ok(stored) => stored,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(PinError::NotSet),
-            Err(err) => return Err(err.into()),
-        };
-        let parsed =
-            PasswordHash::new(stored.trim()).map_err(|err| PinError::Hash(err.to_string()))?;
+        let parsed = stored_hash(&self.path).ok_or(PinError::NotSet)?;
         Argon2::default()
             .verify_password(pin.as_bytes(), &parsed)
             .map_err(|_| PinError::Wrong)?;
