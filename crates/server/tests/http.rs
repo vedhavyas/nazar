@@ -538,6 +538,17 @@ async fn websocket_frames_are_piped_through_the_proxy() {
         WsMessage::text("offer"),
         "the frame round-trips through the proxy"
     );
+
+    // go2rtc hanging up reaches the browser as a close, not a silent stall.
+    let closed = socket
+        .next()
+        .await
+        .expect("a close frame comes back")
+        .expect("without an error");
+    assert!(
+        matches!(closed, WsMessage::Close(_)),
+        "the browser side is closed when go2rtc drops: {closed:?}"
+    );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 

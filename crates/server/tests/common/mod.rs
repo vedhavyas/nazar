@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::ws::Message;
 use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -120,14 +121,14 @@ impl FakeApi {
     }
 }
 
-/// Echo every frame back, standing in for go2rtc's signalling socket.
+/// Echo one frame back then hang up, standing in for go2rtc's signalling
+/// socket at its most abrupt.
 async fn echo(ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(|mut socket| async move {
-        while let Some(Ok(message)) = socket.recv().await {
-            if socket.send(message).await.is_err() {
-                break;
-            }
+        if let Some(Ok(message)) = socket.recv().await {
+            let _ = socket.send(message).await;
         }
+        let _ = socket.send(Message::Close(None)).await;
     })
 }
 

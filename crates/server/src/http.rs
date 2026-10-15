@@ -458,19 +458,45 @@ async fn pipe(browser: WebSocket, target: String) {
         tokio::select! {
             message = browser_rx.next() => match message {
                 Some(Ok(message)) => {
-                    if upstream_tx.send(to_upstream(message)).await.is_err() {
+                    if let Err(err) = upstream_tx.send(to_upstream(message)).await {
+                        tracing::warn!(%err, %target, "browser frame could not reach go2rtc");
+                        let _ = browser_tx.send(Message::Close(None)).await;
                         break;
                     }
                 }
-                _ => break,
+                Some(Err(err)) => {
+                    tracing::warn!(%err, %target, "browser socket failed");
+                    let _ = upstream_tx
+                        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                        .await;
+                    break;
+                }
+                None => {
+                    let _ = upstream_tx
+                        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                        .await;
+                    break;
+                }
             },
             message = upstream_rx.next() => match message {
                 Some(Ok(message)) => {
-                    if browser_tx.send(to_browser(message)).await.is_err() {
+                    if let Err(err) = browser_tx.send(to_browser(message)).await {
+                        tracing::warn!(%err, %target, "go2rtc frame could not reach the browser");
+                        let _ = upstream_tx
+                            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                            .await;
                         break;
                     }
                 }
-                _ => break,
+                Some(Err(err)) => {
+                    tracing::warn!(%err, %target, "go2rtc socket failed");
+                    let _ = browser_tx.send(Message::Close(None)).await;
+                    break;
+                }
+                None => {
+                    let _ = browser_tx.send(Message::Close(None)).await;
+                    break;
+                }
             },
         }
     }
