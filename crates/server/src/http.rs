@@ -383,7 +383,7 @@ async fn camera_ptz(
     // The read and the write are one move: a second step waits its turn,
     // so its delta is added to the position the first one left behind.
     let turn = state.ptz_lock(&id);
-    let _held = turn.lock().await;
+    let held = turn.lock().await;
     let (x, y) = read_shadow(&state.qubo, &session, &device)
         .await?
         .position()
@@ -403,7 +403,7 @@ async fn camera_ptz(
         &[("horizontalVerticalPostion", target_text.as_str())],
     )
     .await?;
-    drop(_held);
+    drop(held);
 
     let landed = await_position(&state, &device, &session, target).await?;
     Ok(Json(match landed {

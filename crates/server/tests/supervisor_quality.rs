@@ -138,12 +138,20 @@ async fn the_hero_and_a_tile_are_two_streams() {
         .await
         .expect("the tile wakes");
 
-    let names: Vec<String> = h
-        .go2rtc
-        .puts()
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
+    // The mints run in each stream's own loop.
+    let mut names: Vec<String> = Vec::new();
+    for _ in 0..50 {
+        names = h
+            .go2rtc
+            .puts()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        if names.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
         names,
         vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
@@ -177,6 +185,8 @@ async fn asking_again_reuses_the_stream() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the hero wakes");
+    let up = common::eventually(|| async { h.go2rtc.puts().len() == 1 }).await;
+    assert!(up, "the first ask mints");
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
@@ -185,6 +195,7 @@ async fn asking_again_reuses_the_stream() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("and so does a third");
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(
         h.go2rtc.puts().len(),
@@ -310,13 +321,14 @@ async fn a_failing_quality_leaves_the_other_stream_alone() {
         .await
         .expect("a refused tile still registers");
 
-    assert!(
+    let hero_live = common::eventually(|| async {
         matches!(
             h.supervisor.status_for(DEVICE_ID, Quality::High).await,
             StreamState::Live { .. }
-        ),
-        "the hero is untouched by the tile's failure"
-    );
+        )
+    })
+    .await;
+    assert!(hero_live, "the hero is untouched by the tile's failure");
     assert!(
         matches!(
             h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
@@ -352,12 +364,23 @@ async fn only_a_persons_retry_skips_the_backoff() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    assert!(
+    let refused = common::eventually(|| async {
         matches!(
             h.supervisor.status_for(DEVICE_ID, Quality::High).await,
             StreamState::Degraded { .. }
-        ),
-        "a refused mint degrades the stream"
+        )
+    })
+    .await;
+    let seen = h.supervisor.status_for(DEVICE_ID, Quality::High).await;
+    assert!(
+        refused,
+        "a refused mint degrades the stream (state {seen:?}, mints {})",
+        mint_calls(&h.qubo).await
+    );
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        1,
+        "and it backs off: a failed first mint is not retried in a hot loop"
     );
 
     // A page that keeps asking (the poll) must not hammer a down camera:

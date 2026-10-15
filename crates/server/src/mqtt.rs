@@ -51,7 +51,7 @@ impl Default for FeedConfig {
             port: BROKER_PORT,
             tls: true,
             quiet_window: Duration::from_secs(300),
-            motion_window: Duration::from_secs(1800),
+            motion_window: Duration::from_mins(30),
             session_check: Duration::from_secs(30),
             idle_retry: Duration::from_secs(10),
             retry_min: Duration::from_secs(2),

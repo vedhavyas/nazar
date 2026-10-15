@@ -287,12 +287,21 @@ async fn a_stream_is_asked_for_by_quality() {
         "a tile asks for the low stream"
     );
 
-    let names: Vec<String> = h
-        .go2rtc
-        .puts()
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
+    // The mints run in each stream's own loop, so the sources land a
+    // moment after the asks.
+    let mut names: Vec<String> = Vec::new();
+    for _ in 0..50 {
+        names = h
+            .go2rtc
+            .puts()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        if names.contains(&format!("{HALL}-high")) && names.contains(&format!("{GATE}-low")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         names.contains(&format!("{HALL}-high")) && names.contains(&format!("{GATE}-low")),
         "both streams reached go2rtc: {names:?}"
