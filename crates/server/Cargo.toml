@@ -8,5 +8,16 @@ authors.workspace = true
 name = "nazar-server"
 path = "src/main.rs"
 
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "process", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+
 [lints]
 workspace = true

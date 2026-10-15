@@ -55,6 +55,8 @@ pub async fn mint_live(
         device.unit_id,
         device.device_id
     );
+    // The spelling is the app's own (qubopy client.py:396 mirrors the
+    // decompiled constant); keep it byte-exact.
     let device_type = if device.device_type.is_empty() {
         "ptzeCamera"
     } else {

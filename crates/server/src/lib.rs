@@ -2,3 +2,6 @@
 //! HTTP surface the web UI talks to.
 
 #![deny(unused_crate_dependencies)]
+
+pub mod config;
+pub mod go2rtc;

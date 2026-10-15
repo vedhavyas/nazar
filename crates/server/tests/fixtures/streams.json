@@ -1,0 +1,12 @@
+{
+  "hall": {
+    "producers": [
+      { "url": "ffmpeg:rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/3c9e1f22_CAMERA_VOD0?token=abc#input=nazar#video=h264#audio=aac" }
+    ],
+    "consumers": null
+  },
+  "gate": {
+    "producers": [],
+    "consumers": []
+  }
+}
