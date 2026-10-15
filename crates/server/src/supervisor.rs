@@ -29,8 +29,9 @@ pub struct Pacing {
     /// How often a refused session is re-discovered; the UI is already
     /// routed to login, so this is just how soon recovery is noticed.
     pub discovery_retry: Duration,
-    /// How long a tile stream may go unasked-for before it is dropped.
-    pub tile_idle: Duration,
+    /// How long a stream may go both unasked-for and unwatched before it
+    /// is dropped. A stream anyone is watching is never idle.
+    pub stream_idle: Duration,
 }
 
 impl Default for Pacing {
@@ -40,7 +41,7 @@ impl Default for Pacing {
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(5),
-            tile_idle: Duration::from_secs(120),
+            stream_idle: Duration::from_secs(120),
         }
     }
 }
@@ -278,25 +279,23 @@ impl Supervisor {
     async fn remint_loop(self, device: Device, quality: Quality, mut wait: Duration) {
         let name = stream_name(&device.device_id, quality);
         let wake = self.wake_signal(&name).await;
-        // Only tiles idle out; a hero stream lives until nobody watches the
-        // house at all, and that is the app's business, not the loop's.
-        let idle_after = match quality {
-            Quality::Low => Some(self.pacing.tile_idle),
-            Quality::High => None,
-        };
+        // Every stream idles out when nobody is watching and nobody has
+        // asked: a demoted hero's high stream must not run for ever. The
+        // consumer check keeps a watched one - a hero - alive regardless.
+        let idle = self.pacing.stream_idle;
         loop {
             // A stream with a viewer is not idle, whatever this server was
             // last asked: the viewer holds it open through go2rtc.
-            let idle_since = match idle_after {
-                Some(_) if self.watched(&name).await => None,
-                _ => self.idle_for(&name).await,
+            let idle_since = if self.watched(&name).await {
+                None
+            } else {
+                self.idle_for(&name).await
             };
-            let sleep_for = match (idle_after, idle_since) {
-                (Some(idle), Some(idle_for)) => wait.min(idle.saturating_sub(idle_for)),
+            let sleep_for = match idle_since {
+                Some(idle_for) => wait.min(idle.saturating_sub(idle_for)),
                 // Watched: wake again within a window, so a viewer who
                 // leaves is noticed without waiting out a re-mint.
-                (Some(idle), None) => wait.min(idle),
-                _ => wait,
+                None => wait.min(idle),
             };
             tokio::select! {
                 () = tokio::time::sleep(sleep_for) => {}
@@ -304,7 +303,7 @@ impl Supervisor {
                     tracing::info!(stream = %name, "remint forced by a retry");
                 }
             }
-            if let (Some(idle), Some(idle_for)) = (idle_after, idle_since)
+            if let Some(idle_for) = idle_since
                 && idle_for >= idle
             {
                 self.teardown(&name).await;
