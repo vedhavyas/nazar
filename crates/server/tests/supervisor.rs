@@ -251,6 +251,15 @@ async fn a_failing_mint_degrades_and_keeps_retrying() {
     })
     .await;
     assert!(degraded, "a mint failure degrades the stream");
+    match h.supervisor.status(DEVICE_ID).await {
+        StreamState::Degraded { reason } => {
+            assert_eq!(
+                reason, "http error: 500 Internal Server Error",
+                "a 5xx reason names the failure exactly"
+            );
+        }
+        other => panic!("expected Degraded, got {other:?}"),
+    }
 
     let retried = common::eventually(|| async { mint_count(&h.qubo).await >= 3 }).await;
     assert!(retried, "the supervisor keeps retrying");

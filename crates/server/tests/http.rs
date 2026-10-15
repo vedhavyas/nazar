@@ -437,6 +437,44 @@ async fn watching_a_camera_starts_the_stream() {
 }
 
 #[tokio::test]
+async fn the_camera_page_carries_the_degraded_reason() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+    unlock(&browser, &h.base).await;
+
+    let _ = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+
+    let page = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras")
+        .json::<Value>()
+        .await
+        .expect("json");
+    assert_eq!(page["cameras"][0]["state"], json!("degraded"));
+    assert_eq!(
+        page["cameras"][0]["reason"],
+        json!("auth error: User Token expired, Access denied"),
+        "the server's reason reaches the browser verbatim"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn login_otp_is_gated_and_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
