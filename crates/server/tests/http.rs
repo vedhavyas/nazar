@@ -193,18 +193,34 @@ async fn a_refused_session_reads_as_needs_login() {
         .expect("watch under a dead session");
     assert_eq!(watch.status(), reqwest::StatusCode::OK);
 
-    let refused = browser
-        .get(format!("{}/api/cameras", h.base))
-        .send()
-        .await
-        .expect("list under a dead session");
-    assert_eq!(refused.status(), reqwest::StatusCode::OK);
-    let page = refused.json::<Value>().await.expect("json");
-    assert_eq!(
-        page["needsLogin"],
-        json!(true),
-        "a refused session routes the UI to login"
-    );
+    // The stream's first mint is the loop's business now, so the refusal
+    // lands a moment later; the page polls until it does, as the UI does.
+    let mut page = Value::Null;
+    let mut refused = false;
+    for _ in 0..50 {
+        refused = browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("list under a dead session")
+            .json::<Value>()
+            .await
+            .expect("json")["needsLogin"]
+            == json!(true);
+        if refused {
+            page = browser
+                .get(format!("{}/api/cameras", h.base))
+                .send()
+                .await
+                .expect("list under a dead session")
+                .json::<Value>()
+                .await
+                .expect("json");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused, "a refused session routes the UI to login");
     assert_eq!(
         page["cameras"][0]["state"],
         json!("degraded"),
@@ -300,16 +316,26 @@ async fn watching_a_camera_starts_the_stream() {
         "the stream name is the device and its quality class"
     );
 
-    let page = browser
-        .get(format!("{}/api/cameras", h.base))
-        .send()
-        .await
-        .expect("cameras")
-        .json::<Value>()
-        .await
-        .expect("json");
+    // The first mint runs in the stream's own loop, so the page is polled
+    // until it lands, as a browser would.
+    let mut state = Value::Null;
+    for _ in 0..50 {
+        state = browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json")["cameras"][0]["state"]
+            .clone();
+        if state == json!("live") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
-        page["cameras"][0]["state"],
+        state,
         json!("live"),
         "the camera reports live once go2rtc holds the producer"
     );
@@ -336,14 +362,22 @@ async fn the_camera_page_carries_the_degraded_reason() {
         .await
         .expect("watch");
 
-    let page = browser
-        .get(format!("{}/api/cameras", h.base))
-        .send()
-        .await
-        .expect("cameras")
-        .json::<Value>()
-        .await
-        .expect("json");
+    // The refusal comes from the stream's own loop, a moment later.
+    let mut page = Value::Null;
+    for _ in 0..50 {
+        page = browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json");
+        if page["cameras"][0]["state"] == json!("degraded") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(page["cameras"][0]["state"], json!("degraded"));
     assert_eq!(
         page["cameras"][0]["reason"],

@@ -35,125 +35,13 @@ impl FakeApi {
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
-        let app = Router::new()
-            .route(
-                "/api/streams",
-                put({
-                    let recorded = Arc::clone(&puts);
-                    let status = Arc::clone(&put_status);
-                    move |Query(params): Query<HashMap<String, String>>| {
-                        let recorded = Arc::clone(&recorded);
-                        let status = Arc::clone(&status);
-                        async move {
-                            recorded.lock().unwrap().push((
-                                params.get("name").cloned().unwrap_or_default(),
-                                params.get("src").cloned().unwrap_or_default(),
-                            ));
-                            let code = StatusCode::from_u16(status.load(Ordering::SeqCst))
-                                .expect("a status");
-                            // A rejected PUT quotes the source back, as
-                            // go2rtc's own refusals do - token and all.
-                            let body = if code.is_success() {
-                                String::new()
-                            } else {
-                                format!(
-                                    "streams: source from insecure producer: {}",
-                                    params.get("src").cloned().unwrap_or_default()
-                                )
-                            };
-                            (code, body)
-                        }
-                    }
-                })
-                .delete({
-                    let dropped = Arc::clone(&deletes);
-                    move |Query(params): Query<HashMap<String, String>>| {
-                        let dropped = Arc::clone(&dropped);
-                        async move {
-                            dropped
-                                .lock()
-                                .unwrap()
-                                .push(params.get("src").cloned().unwrap_or_default());
-                        }
-                    }
-                })
-                .get({
-                    let recorded = Arc::clone(&puts);
-                    let visible = Arc::clone(&streams_visible);
-                    let viewers = Arc::clone(&viewers);
-                    move || {
-                        let recorded = Arc::clone(&recorded);
-                        let visible = Arc::clone(&visible);
-                        let viewers = Arc::clone(&viewers);
-                        async move {
-                            let recorded = recorded.lock().unwrap().clone();
-                            if recorded.is_empty() {
-                                return include_str!("../fixtures/streams.json").to_owned();
-                            }
-                            if !visible.load(Ordering::SeqCst) {
-                                return "{}".to_owned();
-                            }
-                            let viewers = viewers.lock().unwrap().clone();
-                            // go2rtc materializes a producer as soon as the
-                            // source is set, which is what the fixture's
-                            // unset case cannot show.
-                            let mut streams = serde_json::Map::new();
-                            for (name, source) in recorded {
-                                let watching = viewers.get(&name).copied().unwrap_or(0);
-                                // Measured shape: no viewers is `null`.
-                                let consumers = (watching > 0).then(|| {
-                                    (0..watching)
-                                        .map(|_| serde_json::json!({ "id": "viewer" }))
-                                        .collect::<Vec<_>>()
-                                });
-                                streams.insert(
-                                    name,
-                                    serde_json::json!({
-                                        "producers": [{ "url": source }],
-                                        "consumers": consumers,
-                                    }),
-                                );
-                            }
-                            serde_json::Value::Object(streams).to_string()
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/api/stream.m3u8",
-                get(|Query(params): Query<HashMap<String, String>>| async move {
-                    // go2rtc's master playlist: the media playlist is a part.
-                    match params.get("src") {
-                        Some(_) => (
-                            StatusCode::OK,
-                            "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
-                        ),
-                        None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
-                    }
-                }),
-            )
-            .route(
-                "/api/hls/playlist.m3u8",
-                get(|Query(params): Query<HashMap<String, String>>| async move {
-                    match params.get("id") {
-                        Some(_) => (
-                            StatusCode::OK,
-                            "#EXTM3U\nsegment.m4s?id=hls-1&n=0\n".to_owned(),
-                        ),
-                        None => (StatusCode::NOT_FOUND, "not found".to_owned()),
-                    }
-                }),
-            )
-            .route(
-                "/api/hls/segment.m4s",
-                get(|Query(params): Query<HashMap<String, String>>| async move {
-                    match params.get("id") {
-                        Some(_) => (StatusCode::OK, "m4s".to_owned()),
-                        None => (StatusCode::NOT_FOUND, "not found".to_owned()),
-                    }
-                }),
-            )
-            .route("/api/ws", get(echo));
+        let app = hls_routes().merge(streams_routes(
+            &puts,
+            &deletes,
+            &put_status,
+            &streams_visible,
+            &viewers,
+        ));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port");
@@ -197,6 +85,138 @@ impl FakeApi {
     pub fn deletes(&self) -> Vec<String> {
         self.deletes.lock().unwrap().clone()
     }
+}
+
+/// The streams admin surface, as go2rtc 1.9.14 answers it.
+fn streams_routes(
+    puts: &Arc<Mutex<Vec<(String, String)>>>,
+    deletes: &Arc<Mutex<Vec<String>>>,
+    put_status: &Arc<AtomicU16>,
+    streams_visible: &Arc<AtomicBool>,
+    viewers: &Arc<Mutex<HashMap<String, usize>>>,
+) -> Router {
+    Router::new().route("/api/ws", get(echo)).route(
+        "/api/streams",
+        put({
+            let recorded = Arc::clone(puts);
+            let status = Arc::clone(put_status);
+            move |Query(params): Query<HashMap<String, String>>| {
+                let recorded = Arc::clone(&recorded);
+                let status = Arc::clone(&status);
+                async move {
+                    recorded.lock().unwrap().push((
+                        params.get("name").cloned().unwrap_or_default(),
+                        params.get("src").cloned().unwrap_or_default(),
+                    ));
+                    let code =
+                        StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+                    // A rejected PUT quotes the source back, as
+                    // go2rtc's own refusals do - token and all.
+                    let body = if code.is_success() {
+                        String::new()
+                    } else {
+                        format!(
+                            "streams: source from insecure producer: {}",
+                            params.get("src").cloned().unwrap_or_default()
+                        )
+                    };
+                    (code, body)
+                }
+            }
+        })
+        .delete({
+            let dropped = Arc::clone(deletes);
+            move |Query(params): Query<HashMap<String, String>>| {
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    dropped
+                        .lock()
+                        .unwrap()
+                        .push(params.get("src").cloned().unwrap_or_default());
+                }
+            }
+        })
+        .get({
+            let recorded = Arc::clone(puts);
+            let visible = Arc::clone(streams_visible);
+            let viewers = Arc::clone(viewers);
+            move || {
+                let recorded = Arc::clone(&recorded);
+                let visible = Arc::clone(&visible);
+                let viewers = Arc::clone(&viewers);
+                async move {
+                    let recorded = recorded.lock().unwrap().clone();
+                    if recorded.is_empty() {
+                        return include_str!("../fixtures/streams.json").to_owned();
+                    }
+                    if !visible.load(Ordering::SeqCst) {
+                        return "{}".to_owned();
+                    }
+                    let viewers = viewers.lock().unwrap().clone();
+                    // go2rtc materializes a producer as soon as the
+                    // source is set, which is what the fixture's
+                    // unset case cannot show.
+                    let mut streams = serde_json::Map::new();
+                    for (name, source) in recorded {
+                        let watching = viewers.get(&name).copied().unwrap_or(0);
+                        // Measured shape: no viewers is `null`.
+                        let consumers = (watching > 0).then(|| {
+                            (0..watching)
+                                .map(|_| serde_json::json!({ "id": "viewer" }))
+                                .collect::<Vec<_>>()
+                        });
+                        streams.insert(
+                            name,
+                            serde_json::json!({
+                                "producers": [{ "url": source }],
+                                "consumers": consumers,
+                            }),
+                        );
+                    }
+                    serde_json::Value::Object(streams).to_string()
+                }
+            }
+        }),
+    )
+}
+
+/// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them.
+fn hls_routes() -> Router {
+    Router::new()
+        .route(
+            "/api/stream.m3u8",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                // go2rtc's master playlist: the media playlist is a part.
+                match params.get("src") {
+                    Some(_) => (
+                        StatusCode::OK,
+                        "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
+                    ),
+                    None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
+                }
+            }),
+        )
+        .route(
+            "/api/hls/playlist.m3u8",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                match params.get("id") {
+                    Some(_) => (
+                        StatusCode::OK,
+                        "#EXTM3U\nsegment.m4s?id=hls-1&n=0\n".to_owned(),
+                    ),
+                    None => (StatusCode::NOT_FOUND, "not found".to_owned()),
+                }
+            }),
+        )
+        .route(
+            "/api/hls/segment.m4s",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                match params.get("id") {
+                    Some(_) => (StatusCode::OK, "m4s".to_owned()),
+                    None => (StatusCode::NOT_FOUND, "not found".to_owned()),
+                }
+            }),
+        )
 }
 
 /// Echo one frame back then hang up, standing in for go2rtc's signalling

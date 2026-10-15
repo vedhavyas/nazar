@@ -236,40 +236,26 @@ impl Supervisor {
         }
         .ok_or_else(|| SupervisorError::UnknownDevice(device_id.to_owned()))?;
 
-        // A cancelled request must not strand the stream as Waking: the
-        // registration is undone unless the loop below takes it over.
-        let mut registration = Registration {
-            supervisor: self.clone(),
-            name: name.clone(),
-            armed: false,
-        };
-
-        let wait = {
+        {
             let mut state = self.state.write().await;
             if state.contains_key(&name) {
                 return Ok(state
                     .get(&name)
                     .map_or(StreamState::Offline, |tracked| tracked.state.clone()));
             }
-            state.insert(name.clone(), new_tracked());
-            drop(state);
-            registration.armed = true;
-
-            match self.mint_and_swap(&device, quality).await {
-                Ok(()) => {
-                    self.mark_live(&name).await;
-                    self.pacing.remint
-                }
-                Err(reason) => {
-                    self.mark_degraded(&name, reason).await;
-                    self.pacing.retry_base
-                }
-            }
-        };
-
+            // Registered as Waking, and the loop owns it from here: the
+            // first mint happens inside the loop, so a request that is
+            // cancelled cannot strand the stream (the loop finishes its
+            // mint and keeps the source), and a camera never reads offline
+            // while its first mint is in flight.
+            state.insert(name.clone(), new_waking());
+        }
         let supervisor = self.clone();
-        tokio::spawn(async move { supervisor.remint_loop(device, quality, wait).await });
-        registration.armed = false;
+        tokio::spawn(async move {
+            supervisor
+                .remint_loop(device, quality, Duration::ZERO)
+                .await;
+        });
         Ok(self.status_for(device_id, quality).await)
     }
 
@@ -323,7 +309,11 @@ impl Supervisor {
                     if wait >= self.pacing.remint {
                         self.pacing.retry_base
                     } else {
-                        (wait * 2).min(self.pacing.retry_max)
+                        // The first attempt waits no time at all, so the
+                        // floor matters: doubling zero is still zero.
+                        (wait * 2)
+                            .max(self.pacing.retry_base)
+                            .min(self.pacing.retry_max)
                     }
                 }
             };
@@ -439,32 +429,12 @@ fn new_tracked() -> Tracked {
     }
 }
 
-/// Undoes a registration whose `ensure` future was dropped before the
-/// re-mint loop took over.
-struct Registration {
-    supervisor: Supervisor,
-    name: String,
-    armed: bool,
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Ok(mut state) = self.supervisor.state.try_write() {
-            state.remove(&self.name);
-            return;
-        }
-        // The map is held elsewhere right now; finish the cleanup from a
-        // task rather than leaking the registration.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let supervisor = self.supervisor.clone();
-            let name = self.name.clone();
-            handle.spawn(async move {
-                supervisor.state.write().await.remove(&name);
-            });
-        }
+/// A stream that has been asked for and whose loop has not yet taken a
+/// position: the state a person sees between the tap and the first frame.
+fn new_waking() -> Tracked {
+    Tracked {
+        state: StreamState::Waking,
+        ..new_tracked()
     }
 }
 

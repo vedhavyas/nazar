@@ -132,6 +132,20 @@ async fn is_live(supervisor: &Supervisor) -> bool {
     matches!(supervisor.status(DEVICE_ID).await, StreamState::Live { .. })
 }
 
+/// The stream's state once its loop has taken a position: the first mint
+/// runs in the loop, so `Waking` is what a fresh registration reads.
+async fn settled(supervisor: &Supervisor) -> StreamState {
+    let mut state = supervisor.status(DEVICE_ID).await;
+    for _ in 0..50 {
+        if !matches!(state, StreamState::Waking) {
+            return state;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state = supervisor.status(DEVICE_ID).await;
+    }
+    state
+}
+
 #[tokio::test]
 async fn ensure_live_mints_once_and_reuses_the_stream() {
     let h = harness(pacing(Duration::from_secs(30))).await;
@@ -143,7 +157,8 @@ async fn ensure_live_mints_once_and_reuses_the_stream() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the first call starts the stream");
-    assert!(is_live(&h.supervisor).await, "the stream goes live");
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the stream goes live");
     assert_eq!(mint_count(&h.qubo).await, 1, "the first call mints once");
     assert_eq!(h.go2rtc.puts().len(), 1, "the source reached go2rtc");
     let (name, source) = h.go2rtc.puts().remove(0);
@@ -201,7 +216,8 @@ async fn an_expired_session_degrades_with_the_exact_reason_and_a_fresh_login_rec
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream starts");
-    assert!(is_live(&h.supervisor).await, "the stream goes live");
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the stream goes live");
 
     let degraded = common::eventually(|| async { !is_live(&h.supervisor).await }).await;
     assert!(degraded, "the expired session takes the stream down");
@@ -303,10 +319,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         .expect("starts");
 
     assert!(
-        matches!(
-            h.supervisor.status(DEVICE_ID).await,
-            StreamState::Degraded { .. }
-        ),
+        matches!(settled(&h.supervisor).await, StreamState::Degraded { .. }),
         "the refused mint degrades the stream"
     );
     assert!(
@@ -339,7 +352,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
 }
 
 #[tokio::test]
-async fn a_cancelled_start_does_not_strand_the_device() {
+async fn a_cancelled_request_does_not_strand_the_stream() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     mount_discovery(&h.qubo).await;
     Mock::given(method("POST"))
@@ -347,23 +360,40 @@ async fn a_cancelled_start_does_not_strand_the_device() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(mint_body("slow"))
-                .set_delay(Duration::from_secs(5)),
+                .set_delay(Duration::from_millis(300)),
         )
         .mount(&h.qubo)
         .await;
     h.supervisor.refresh_devices().await.expect("discovery");
 
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(150),
+    // The browser gives up on the request while the first mint is still in
+    // flight. The stream's loop owns that mint, so it must finish: a
+    // cancelled request never leaves a camera reading offline, and never
+    // orphans the source it started.
+    let quick = tokio::time::timeout(
+        Duration::from_millis(100),
         h.supervisor.ensure(DEVICE_ID, Quality::High, false),
     )
     .await;
-    assert!(cancelled.is_err(), "the request gave up mid-mint");
-
+    assert!(
+        quick.is_ok(),
+        "the request answers as soon as the stream is registered"
+    );
     assert_eq!(
         h.supervisor.status(DEVICE_ID).await,
-        StreamState::Offline,
-        "a cancelled start leaves no Waking registration behind"
+        StreamState::Waking,
+        "and the camera reads as starting, never as offline"
+    );
+
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(
+        live,
+        "the stream goes live once the mint the request abandoned lands"
+    );
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        1,
+        "and exactly one source reached go2rtc"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -381,7 +411,7 @@ async fn a_put_go2rtc_did_not_take_is_degraded_not_live() {
         .await
         .expect("starts");
 
-    match h.supervisor.status(DEVICE_ID).await {
+    match settled(&h.supervisor).await {
         StreamState::Degraded { reason } => {
             assert_eq!(
                 reason, "go2rtc did not take the stream",
@@ -408,7 +438,16 @@ async fn a_failed_swap_never_leaks_the_stream_token() {
         .await
         .expect("starts");
 
-    match h.supervisor.status(DEVICE_ID).await {
+    // The first mint runs in the stream's own loop.
+    let mut outcome = StreamState::Offline;
+    for _ in 0..50 {
+        outcome = h.supervisor.status(DEVICE_ID).await;
+        if matches!(outcome, StreamState::Degraded { .. }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    match outcome {
         StreamState::Degraded { reason } => {
             assert!(
                 !reason.contains("sekrit-token"),
