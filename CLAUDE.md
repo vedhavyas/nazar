@@ -1,0 +1,27 @@
+# Nazar - project instructions
+
+Private replacement for the Qubo camera app, for Ved and family. Cross-platform by design (Rust + Tauri 2 intent; desktop first, Android next, web pending the design conversation). Built on the reverse-engineered Qubo cloud API documented in `docs/`.
+
+Status: pre-brainstorm. Architecture and scope land after the design conversation; nothing in `src/` exists yet.
+
+## Layout
+
+- `docs/qubo-api-spec.md` - canonical API spec (auth, REST catalogue, MQTT, streaming, controls, P2P). Verified sections are marked; evidence statuses are honest.
+- `docs/qubo-protocol.md` - the P2P protocol reference (handshake, relay anatomy, identity model).
+- `docs/qubo-findings.md` - the chase record and final verdict (relay pairing is cloud-armed for genuine app sessions only).
+- `reference/p2p_client.py` - reference implementation of the P2P client, kept for its protocol vectors; not product code.
+
+## Hard facts from the research (do not re-derive)
+
+- Login: phone OTP sessions last 1h with NO refresh token; Google sign-in returns a refreshToken (durable path). Email is display-only on phone-created accounts.
+- Streaming: per-session RTSPS mint (`/stream-manager/.../v1/live/...`), session ~5 min, one unconsumed URL dies ~1 min; go2rtc + ffmpeg transcode works (see the spike).
+- Controls: PUT command envelope `{topic, payload:{devices:{deviceUUID, services:{<svc>:{attributes...}}}}}`; the camera ACKs everything 200 regardless - always read the shadow back.
+- MQTT: username = account userUUID, password = a live accessToken; topics `/monitor/<unit>/<device>/<svc>`, `/control/...`, `/config/<unit>`.
+- P2P: pairing is relay-initiated and the relay's forwarding is armed server-side for genuine app-session SDK sessions; a standalone client cannot trigger it. The real app's own sessions may inherit this - verify when built.
+
+## Conventions
+
+- Every commit GPG-signed (`user.signingkey 9127C198B01C47DF`, email `7549475+vedhavyas@users.noreply.github.com`).
+- Brainstorm -> plan -> approve -> build. Workers build; the lead reviews every PR substantively before merge.
+- No hand-rolled infrastructure where a solid tool exists (go2rtc sidecar over custom streaming glue, and so on).
+- Private repo on the personal account; no AI/process mentions in any commit, PR, or doc text.
