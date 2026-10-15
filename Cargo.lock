@@ -1264,12 +1264,14 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "qubo",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -5,3 +5,4 @@
 
 pub mod config;
 pub mod go2rtc;
+pub mod supervisor;

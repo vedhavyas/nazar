@@ -8,66 +8,15 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+mod common;
 
-use axum::Router;
-use axum::extract::Query;
-use axum::http::StatusCode;
-use axum::routing::put;
-use tokio::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use server::config::Config;
 use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source};
 
 const ARGS_PATH: &str = "/tmp/nazar-fake-go2rtc-args.txt";
-
-/// A fake go2rtc API recording the stream PUTs it receives.
-struct FakeApi {
-    base: reqwest::Url,
-    puts: Arc<Mutex<Vec<(String, String)>>>,
-}
-
-async fn fake_api() -> FakeApi {
-    fake_api_with_put(StatusCode::OK).await
-}
-
-async fn fake_api_with_put(status: StatusCode) -> FakeApi {
-    let puts = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&puts);
-    let app = Router::new().route(
-        "/api/streams",
-        put(move |Query(params): Query<HashMap<String, String>>| {
-            let recorded = Arc::clone(&recorded);
-            async move {
-                recorded.lock().unwrap().push((
-                    params.get("name").cloned().unwrap_or_default(),
-                    params.get("src").cloned().unwrap_or_default(),
-                ));
-                let body = if status.is_success() {
-                    String::new()
-                } else {
-                    "streams: source from insecure producer".to_owned()
-                };
-                (status, body)
-            }
-        })
-        .get(|| async { include_str!("fixtures/streams.json") }),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("an ephemeral port");
-    let addr = listener.local_addr().expect("bound address");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("the fake serves");
-    });
-    FakeApi {
-        base: format!("http://{addr}").parse().expect("a url"),
-        puts,
-    }
-}
 
 #[test]
 fn live_source_references_the_config_template() {
@@ -80,7 +29,7 @@ fn live_source_references_the_config_template() {
 
 #[tokio::test]
 async fn put_stream_sends_the_name_and_source() {
-    let api = fake_api().await;
+    let api = common::FakeApi::start().await;
     let go2rtc = Go2rtc::connect(api.base.clone());
 
     go2rtc
@@ -91,9 +40,8 @@ async fn put_stream_sends_the_name_and_source() {
         .await
         .expect("the fake accepts the stream");
 
-    let puts = api.puts.lock().unwrap().clone();
     assert_eq!(
-        puts,
+        api.puts(),
         vec![(
             "hall".to_owned(),
             "ffmpeg:rtsps://x/y#input=nazar#video=h264#audio=aac".to_owned()
@@ -104,7 +52,8 @@ async fn put_stream_sends_the_name_and_source() {
 
 #[tokio::test]
 async fn put_stream_reports_a_rejection() {
-    let api = fake_api_with_put(StatusCode::BAD_REQUEST).await;
+    let api = common::FakeApi::start().await;
+    api.set_put_status(400);
     let go2rtc = Go2rtc::connect(api.base.clone());
 
     let err = go2rtc
@@ -126,7 +75,7 @@ async fn put_stream_reports_a_rejection() {
 
 #[tokio::test]
 async fn streams_reports_a_producer_as_live() {
-    let api = fake_api().await;
+    let api = common::FakeApi::start().await;
     let go2rtc = Go2rtc::connect(api.base.clone());
 
     let streams = go2rtc.streams().await.expect("the fake answers");

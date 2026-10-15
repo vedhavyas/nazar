@@ -9,15 +9,17 @@ name = "nazar-server"
 path = "src/main.rs"
 
 [dependencies]
+qubo = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "process", "time"] }
+tokio = { workspace = true, features = ["net", "process", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
