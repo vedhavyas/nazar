@@ -29,7 +29,7 @@ Interfaces are deliberately transport-thin: any client that can speak the protoc
 
 - One image, published to GHCR from nazar's CI (public visibility - the hub pulls it without credentials; the WireGuard perimeter is the access control, and the image contains no secrets).
 - Hosting: one compose file in `hub-modules` (`static/system/docker/docker-compose-nazar.yml`), following the forge-web precedent: image ref, `EXPOSE`ed port, caddy label giving it `nazar.hub` with the hub's internal TLS, a bind-mount volume `$DATA_DIR/nazar` (Qubo session, metadata cache, settings), env declared in `config.toml` `[envs]`, labels `hub.type`/`hub.group` and Watchtower disabled for our own image, network `docker-direct` (needs public egress to Qubo's cloud and Wowza).
-- Access model: **WireGuard is the perimeter** (the hub's existing posture); each household device gets a WG profile. Nazar additionally carries its own PIN gate as defense-in-depth, because the streams are family-private.
+- Access model: **WireGuard is the perimeter** (the hub's existing posture); each household device gets a WG profile. No app-level gate (see section 4).
 - The same image can also run on the Studio later, unchanged, for home-LAN speed - the interface makes it a deployment choice, not an architecture change.
 
 ## 4. Sessions and login

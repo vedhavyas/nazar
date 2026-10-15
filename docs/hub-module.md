@@ -57,7 +57,7 @@ Only inside the container's volume: the Qubo session file that the server writes
 ## Access
 
 - Browser/extensions on the mesh: `https://nazar.hub` (caddy internal CA; root CA install recipe is in the hub README).
-- WireGuard is the perimeter; nazar adds its own PIN gate (first-run setup in the app).
+- WireGuard is the perimeter; nazar carries no app-level gate (the PIN was removed by Ved's ruling, 2026-10-15 - the mesh, not an app lock, is the access control).
 
 ## Deploy sequence (hub-modules owns it)
 
