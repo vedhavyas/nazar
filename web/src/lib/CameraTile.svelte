@@ -103,7 +103,8 @@
   {:else if camera.state === 'degraded'}
     <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
     <button class="btn" onclick={() => onwatch(camera.id)}>Try again</button>
-  {:else if camera.state === 'waking'}
+  {:else if camera.state === 'waking' || camera.state === 'live'}
+    <!-- Live but with no stream name yet: the mint is still landing. -->
     <p class="note">Starting the stream...</p>
   {:else}
     <p class="note">Not streaming.</p>
