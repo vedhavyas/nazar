@@ -2,7 +2,7 @@
 
 Private replacement for the Qubo camera app, for Ved and family. Cross-platform by design (Rust + Tauri 2 intent; desktop first, Android next, web pending the design conversation). Built on the reverse-engineered Qubo cloud API documented in `docs/`.
 
-Status: pre-brainstorm. Architecture and scope land after the design conversation; nothing in `src/` exists yet.
+Status: designed - the approved design is `docs/design.md` (the contract the implementation plan builds against). Nothing in `src/` exists yet; M1 is server + web in one image, deployed to the hub, one camera live in the browser.
 
 ## Layout
 
