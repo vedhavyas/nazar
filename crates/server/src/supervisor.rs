@@ -23,6 +23,9 @@ pub struct Pacing {
     /// The first retry delay after a failure; doubles up to `retry_max`.
     pub retry_base: Duration,
     pub retry_max: Duration,
+    /// How often a refused session is re-discovered; the UI is already
+    /// routed to login, so this is just how soon recovery is noticed.
+    pub discovery_retry: Duration,
 }
 
 impl Default for Pacing {
@@ -31,6 +34,7 @@ impl Default for Pacing {
             remint: Duration::from_secs(240),
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
+            discovery_retry: Duration::from_secs(5),
         }
     }
 }
@@ -99,7 +103,7 @@ impl Supervisor {
             .last_discovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        last.is_none_or(|last| last.elapsed() >= DISCOVERY_BACKOFF)
+        last.is_none_or(|last| last.elapsed() >= self.pacing.discovery_retry)
     }
 
     /// Whether Qubo has refused the stored session; the UI must log in.
@@ -320,10 +324,6 @@ impl Supervisor {
             .state = StreamState::Degraded { reason };
     }
 }
-
-/// How often a refused session is re-tried; the UI is already routed to
-/// login, so this is just how soon recovery is noticed.
-const DISCOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 fn new_tracked() -> Tracked {
     Tracked {

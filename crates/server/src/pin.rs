@@ -1,7 +1,9 @@
 //! The household PIN gate: set once on first run, one unlock per browser.
 
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,10 +31,14 @@ pub enum PinError {
 /// Below this a short PIN is minutes of guessing, even behind a throttle.
 pub const MIN_PIN_LENGTH: usize = 6;
 
-/// The stored hash, when the file holds a parseable one.
+/// The stored hash, when the file holds a parseable one of ours. A
+/// well-formed hash of a foreign algorithm would otherwise look "set"
+/// forever while no PIN could ever match it.
 fn stored_hash(path: &Path) -> Option<PasswordHash> {
     let stored = std::fs::read_to_string(path).ok()?;
-    PasswordHash::new(stored.trim()).ok()
+    PasswordHash::new(stored.trim())
+        .ok()
+        .filter(|hash| hash.algorithm.as_str().starts_with("argon2"))
 }
 
 /// The stored PIN, and the browser sessions that have unlocked.
@@ -59,6 +65,12 @@ impl PinGate {
 
     /// Set the PIN. First run only: there is no change-PIN flow in M1.
     pub fn set(&self, pin: &str) -> Result<(), PinError> {
+        // The cheap answer first: an existing PIN must not cost a 19 MiB
+        // hash on an unauthenticated route. `persist_noclobber` below still
+        // guards the race; this only spares the work.
+        if self.is_set() {
+            return Err(PinError::AlreadySet);
+        }
         if pin.chars().count() < MIN_PIN_LENGTH {
             return Err(PinError::TooShort);
         }
@@ -85,7 +97,31 @@ impl PinGate {
             Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(PinError::AlreadySet);
             }
-            Err(err) => return Err(err.error.into()),
+            Err(err) => match err.error.kind() {
+                // Some filesystems (FUSE, a few network mounts) cannot do
+                // the hard link noclobber needs; claim the path exclusively
+                // and rename instead.
+                std::io::ErrorKind::Unsupported
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::PermissionDenied => {
+                    match OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&self.path)
+                    {
+                        Ok(claim) => drop(claim),
+                        Err(claim_err) if claim_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(PinError::AlreadySet);
+                        }
+                        Err(claim_err) => return Err(claim_err.into()),
+                    }
+                    err.file
+                        .persist(&self.path)
+                        .map_err(|persist| persist.error)?;
+                }
+                _ => return Err(err.error.into()),
+            },
         }
         tracing::info!(path = %self.path.display(), "household PIN set");
         Ok(())

@@ -74,23 +74,11 @@ impl Throttle {
         }
     }
 
-    /// Count one attempt, or say how long the caller must wait.
+    /// Count one attempt, or say how long the caller must wait. The
+    /// per-client gate runs first: an attempt it refuses must not burn the
+    /// house-wide budget.
     fn allow(&self, key: &str) -> Result<(), Duration> {
         let now = Instant::now();
-        {
-            let mut global = self.lock_global();
-            if now >= global.until {
-                *global = Attempts {
-                    count: 0,
-                    until: now + self.window,
-                };
-            }
-            if global.count >= self.global_limit {
-                return Err(global.until - now);
-            }
-            global.count += 1;
-        }
-
         let mut attempts = self.lock_attempts();
         if attempts.len() > 64 {
             attempts.retain(|_, entry| entry.until > now);
@@ -109,12 +97,29 @@ impl Throttle {
             return Err(entry.until - now);
         }
         entry.count += 1;
+        drop(attempts);
+
+        let mut global = self.lock_global();
+        if now >= global.until {
+            *global = Attempts {
+                count: 0,
+                until: now + self.window,
+            };
+        }
+        if global.count >= self.global_limit {
+            return Err(global.until - now);
+        }
+        global.count += 1;
         Ok(())
     }
 
-    /// Forget a client's failures once it has proven itself.
+    /// Forget a client's failures once it has proven itself, and give the
+    /// house-wide budget back: a proven unlock is not a flood.
     fn clear(&self, key: &str) {
         self.lock_attempts().remove(key);
+        let mut global = self.lock_global();
+        global.count = 0;
+        global.until = Instant::now();
     }
 
     fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
@@ -464,6 +469,15 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
     // not become a source go2rtc would accept.
     let src = single_src(parts.uri.query().unwrap_or_default())
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "only ?src=<camera> is proxied"))?;
+    // The id must also be shaped like an id: a URL-shaped one must never
+    // reach go2rtc, whatever the cloud marked it as.
+    let safe = !src.is_empty()
+        && src
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !safe {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+    }
     let known = state
         .supervisor
         .devices()

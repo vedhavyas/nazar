@@ -21,6 +21,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
+    if config.trusted_proxies.is_empty() {
+        tracing::warn!(
+            "NAZAR_TRUSTED_PROXY is unset: every client behind the proxy shares one \
+             rate-limit bucket; set it to the proxy's address or subnet"
+        );
+    }
     let go2rtc = Go2rtc::start(&config).context("starting go2rtc")?;
     let qubo = QuboClient::with_device_id(
         BASE_URL.parse().context("the gateway URL parses")?,
