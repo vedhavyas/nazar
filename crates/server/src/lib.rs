@@ -7,5 +7,4 @@
 pub mod config;
 pub mod go2rtc;
 pub mod http;
-pub mod pin;
 pub mod supervisor;

@@ -1,18 +1,12 @@
-//! The HTTP surface: the JSON API, the PIN gate, the built SPA, and the
-//! go2rtc proxy the browser's WebRTC signalling rides.
+//! The HTTP surface: the JSON API, the built SPA, and the go2rtc proxy the
+//! browser's WebRTC signalling rides.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use tokio::sync::Semaphore;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts as _, Path, Request, State};
+use axum::extract::{FromRequestParts as _, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -24,8 +18,6 @@ use serde_json::{Value, json};
 
 use qubo::{QuboClient, QuboError, SessionStore, request_otp, verify_otp};
 
-use crate::config::TrustedProxies;
-use crate::pin::{PinError, PinGate};
 use crate::supervisor::{StreamState, Supervisor, SupervisorError};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
@@ -40,118 +32,6 @@ const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// The only go2rtc path the browser's player may reach: its signalling
 /// socket. Everything else go2rtc serves is an admin surface.
 const PROXY_WS_PATH: &str = "api/ws";
-
-/// A fixed-window attempt limit, keyed by client: a short PIN must not be
-/// brute-forceable, and each verify costs a 19 MiB hash. A house-wide
-/// ceiling sits beside the per-client one so rotating keys cannot buy
-/// unlimited guesses.
-struct Throttle {
-    limit: u32,
-    global_limit: u32,
-    window: Duration,
-    attempts: Mutex<HashMap<String, Attempts>>,
-    global: Mutex<Attempts>,
-    permits: Semaphore,
-}
-
-struct Attempts {
-    count: u32,
-    until: Instant,
-}
-
-impl Throttle {
-    fn new(limit: u32, global_limit: u32, window: Duration, concurrent: usize) -> Self {
-        Self {
-            limit,
-            global_limit,
-            window,
-            attempts: Mutex::new(HashMap::new()),
-            global: Mutex::new(Attempts {
-                count: 0,
-                until: Instant::now(),
-            }),
-            permits: Semaphore::new(concurrent),
-        }
-    }
-
-    /// Count one attempt, or say how long the caller must wait. The
-    /// per-client gate runs first: an attempt it refuses must not burn the
-    /// house-wide budget.
-    fn allow(&self, key: &str) -> Result<(), Duration> {
-        let now = Instant::now();
-        let mut attempts = self.lock_attempts();
-        if attempts.len() > 64 {
-            attempts.retain(|_, entry| entry.until > now);
-        }
-        let entry = attempts.entry(key.to_owned()).or_insert(Attempts {
-            count: 0,
-            until: now + self.window,
-        });
-        if now >= entry.until {
-            *entry = Attempts {
-                count: 0,
-                until: now + self.window,
-            };
-        }
-        if entry.count >= self.limit {
-            return Err(entry.until - now);
-        }
-        entry.count += 1;
-        drop(attempts);
-
-        let mut global = self.lock_global();
-        if now >= global.until {
-            *global = Attempts {
-                count: 0,
-                until: now + self.window,
-            };
-        }
-        if global.count >= self.global_limit {
-            return Err(global.until - now);
-        }
-        global.count += 1;
-        Ok(())
-    }
-
-    /// Forget a client's failures once it has proven itself, and give the
-    /// house-wide budget back: a proven unlock is not a flood.
-    fn clear(&self, key: &str) {
-        self.lock_attempts().remove(key);
-        let mut global = self.lock_global();
-        global.count = 0;
-        global.until = Instant::now();
-    }
-
-    fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
-        self.attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn lock_global(&self) -> std::sync::MutexGuard<'_, Attempts> {
-        self.global
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// The client the rate limiter counts against: the first `X-Forwarded-For`
-/// hop, but only when the transport peer is a configured proxy - otherwise
-/// anyone reaching the server directly could pick their own bucket by
-/// setting the header. A stranger peer keys as itself.
-fn client_key(headers: &HeaderMap, peer: IpAddr, trusted: &TrustedProxies) -> String {
-    if trusted.trusts(peer)
-        && let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        return forwarded.to_owned();
-    }
-    peer.to_string()
-}
 
 /// The WebSocket client wants a `ws://` URL; the API base is `http://`.
 fn ws_target(target: &str) -> String {
@@ -175,15 +55,9 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
-    pub pin: PinGate,
     /// go2rtc's API base the proxy forwards to.
     pub go2rtc_api: String,
-    /// Whose `X-Forwarded-For` the throttle believes.
-    pub trusted_proxies: TrustedProxies,
-    /// Off only for local http runs; deployment is TLS-only.
-    pub secure_cookies: bool,
     http: reqwest::Client,
-    throttle: Arc<Throttle>,
 }
 
 /// What the app is wired to: the deployment's parts, in one literal.
@@ -191,10 +65,7 @@ pub struct Wiring {
     pub sessions: SessionStore,
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
-    pub pin: PinGate,
     pub go2rtc_api: String,
-    pub trusted_proxies: TrustedProxies,
-    pub secure_cookies: bool,
 }
 
 impl AppState {
@@ -204,10 +75,7 @@ impl AppState {
             sessions: wiring.sessions,
             qubo: wiring.qubo,
             supervisor: wiring.supervisor,
-            pin: wiring.pin,
             go2rtc_api: wiring.go2rtc_api,
-            trusted_proxies: wiring.trusted_proxies,
-            secure_cookies: wiring.secure_cookies,
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -217,7 +85,6 @@ impl AppState {
                     tracing::warn!(%err, "proxy client fell back to defaults");
                     reqwest::Client::new()
                 }),
-            throttle: Arc::new(Throttle::new(5, 30, Duration::from_secs(60), 2)),
         }
     }
 }
@@ -234,10 +101,6 @@ impl ApiError {
             status,
             message: message.into(),
         }
-    }
-
-    fn locked() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "locked")
     }
 }
 
@@ -276,8 +139,6 @@ impl From<SupervisorError> for ApiError {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/pin", post(set_pin))
-        .route("/api/unlock", post(unlock))
         .route("/api/login/otp", post(login_otp))
         .route("/api/login/verify", post(login_verify))
         .route("/api/cameras", get(cameras))
@@ -292,79 +153,14 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 #[derive(Deserialize)]
-struct PinRequest {
-    pin: String,
-}
-
-async fn set_pin(
-    State(state): State<AppState>,
-    Json(body): Json<PinRequest>,
-) -> Result<StatusCode, ApiError> {
-    let gate = state.pin.clone();
-    blocking(move || gate.set(&body.pin))
-        .await?
-        .map_err(|err| match err {
-            PinError::AlreadySet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
-            PinError::TooShort => ApiError::new(StatusCode::BAD_REQUEST, err.to_string()),
-            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn unlock(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<PinRequest>,
-) -> Result<Response, ApiError> {
-    let client = client_key(&headers, peer.ip(), &state.trusted_proxies);
-    if let Err(wait) = state.throttle.allow(&client) {
-        tracing::warn!(client = %client, "unlock refused: too many tries");
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("too many tries; wait {}s", wait.as_secs().max(1)),
-        ));
-    }
-    let _verify = state.throttle.permits.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "the server is busy unlocking; try again",
-        )
-    })?;
-
-    let gate = state.pin.clone();
-    let token = blocking(move || gate.unlock(&body.pin))
-        .await?
-        .map_err(|err| match err {
-            // No PIN exists yet: the UI turns this into its first-run form.
-            PinError::NotSet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
-            PinError::Wrong => {
-                tracing::warn!(client = %client, "unlock refused: wrong PIN");
-                ApiError::new(StatusCode::UNAUTHORIZED, err.to_string())
-            }
-            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
-    state.throttle.clear(&client);
-    Ok(with_session_cookie(
-        StatusCode::NO_CONTENT,
-        &token,
-        state.secure_cookies,
-    ))
-}
-
-#[derive(Deserialize)]
 struct OtpRequest {
     phone: String,
 }
 
-/// Gated like the rest: a locked peer must not be able to burn the
-/// 60-minute resend window or send SMS under the household's number.
 async fn login_otp(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<OtpRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_unlocked(&state, &headers)?;
     request_otp(&state.qubo, &body.phone).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -375,14 +171,10 @@ struct VerifyRequest {
     code: String,
 }
 
-/// A browser must be unlocked before it may log the server in: the PIN is
-/// the device gate, and the OTP alone does not grant one.
 async fn login_verify(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<VerifyRequest>,
-) -> Result<Response, ApiError> {
-    require_unlocked(&state, &headers)?;
+) -> Result<StatusCode, ApiError> {
     let session = verify_otp(&state.qubo, &body.phone, &body.code).await?;
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
@@ -391,18 +183,10 @@ async fn login_verify(
     if let Err(err) = state.supervisor.refresh_devices().await {
         tracing::warn!(%err, "device discovery after login failed");
     }
-    Ok(with_session_cookie(
-        StatusCode::NO_CONTENT,
-        &state.pin.mint_session(),
-        state.secure_cookies,
-    ))
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn cameras(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    require_unlocked(&state, &headers)?;
+async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     ensure_devices(&state).await?;
 
     let mut cameras = Vec::new();
@@ -428,10 +212,8 @@ async fn cameras(
 
 async fn camera_live(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    require_unlocked(&state, &headers)?;
     ensure_devices(&state).await?;
     state.supervisor.ensure_live(&id).await?;
     Ok(Json(json!({ "stream": id })))
@@ -456,7 +238,6 @@ async fn ensure_devices(state: &AppState) -> Result<(), ApiError> {
 /// Forward `/go2rtc/*` to go2rtc's loopback API, HTTP and WebSocket alike.
 async fn proxy(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
-    require_unlocked(&state, &parts.headers)?;
 
     let rest = parts.uri.path().trim_start_matches("/go2rtc/").to_owned();
     if rest != PROXY_WS_PATH {
@@ -681,14 +462,6 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-fn with_session_cookie(status: StatusCode, token: &str, secure: bool) -> Response {
-    // Secure only when caddy terminated TLS: a plain-http local run would
-    // otherwise have its cookie dropped by the browser.
-    let secure = if secure { "; Secure" } else { "" };
-    let cookie = format!("nazar_session={token}; Path=/; HttpOnly; SameSite=Lax{secure}");
-    ([(header::SET_COOKIE, cookie)], status).into_response()
-}
-
 /// The one `src` value in a raw query, or nothing.
 fn single_src(query: &str) -> Option<String> {
     let mut found: Option<String> = None;
@@ -707,27 +480,12 @@ fn single_src(query: &str) -> Option<String> {
     found
 }
 
-/// Run blocking work (Argon2 hashing, fsyncs) off the runtime's worker
-/// threads so an unlock attempt cannot stall every other request.
+/// Run blocking work (fsyncs) off the runtime's worker threads so a
+/// session write cannot stall every other request.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
-}
-
-fn require_unlocked(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    match session_token(headers) {
-        Some(token) if state.pin.is_unlocked(&token) => Ok(()),
-        _ => Err(ApiError::locked()),
-    }
-}
-
-fn session_token(headers: &HeaderMap) -> Option<String> {
-    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookies
-        .split(';')
-        .find_map(|part| part.trim().strip_prefix("nazar_session="))
-        .map(str::to_owned)
 }

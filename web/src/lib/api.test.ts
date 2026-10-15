@@ -24,16 +24,16 @@ test('a successful call answers the parsed body', async () => {
 });
 
 test("a failed call carries the server's error verbatim", async () => {
-  stubFetch(401, JSON.stringify({ error: 'wrong PIN' }));
+  stubFetch(401, JSON.stringify({ error: 'the code is wrong' }));
 
-  const failure = await api.unlock('0000').then(
+  const failure = await api.verifyOtp('9876543210', '000000').then(
     () => null,
     (error: unknown) => error,
   );
 
   expect(failure, 'the call rejects').toBeInstanceOf(ApiError);
   expect((failure as ApiError).status, 'the status is kept').toBe(401);
-  expect((failure as ApiError).message, 'the reason is verbatim').toBe('wrong PIN');
+  expect((failure as ApiError).message, 'the reason is verbatim').toBe('the code is wrong');
 });
 
 test('a failed call without the envelope falls back to the status line', async () => {
@@ -50,13 +50,15 @@ test('a failed call without the envelope falls back to the status line', async (
 test('every call asks for same-origin credentials and the documented shape', async () => {
   const fetchMock = stubFetch(204, '');
 
-  await api.unlock('2468');
+  await api.verifyOtp('9876543210', '123456');
 
   const [path, init] = fetchMock.mock.calls[0];
-  expect(path, 'the route').toBe('/api/unlock');
+  expect(path, 'the route').toBe('/api/login/verify');
   expect(init?.method, 'the method').toBe('POST');
-  expect(init?.credentials, 'the HttpOnly cookie rides along').toBe('same-origin');
-  expect(init?.body, 'the body').toBe(JSON.stringify({ pin: '2468' }));
+  expect(init?.credentials, 'the session cookie rides along').toBe('same-origin');
+  expect(init?.body, 'the body').toBe(
+    JSON.stringify({ phone: '9876543210', code: '123456' }),
+  );
 });
 
 test('watching a camera calls its live route', async () => {

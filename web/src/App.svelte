@@ -5,9 +5,8 @@
   import { reachable, watchHealth } from './lib/health';
   import Home from './routes/Home.svelte';
   import Login from './routes/Login.svelte';
-  import Unlock from './routes/Unlock.svelte';
 
-  type Screen = 'checking' | 'unlock' | 'login' | 'home';
+  type Screen = 'checking' | 'login' | 'home';
 
   let screen = $state<Screen>('checking');
 
@@ -17,20 +16,11 @@
     return stop;
   });
 
-  /** An unlocked, logged-in server answers the camera list straight away. */
+  /** A stored session answers the camera list; anything else is login. */
   async function boot() {
     try {
-      await api.cameras();
-      screen = 'home';
-    } catch {
-      screen = 'unlock';
-    }
-  }
-
-  async function afterUnlock() {
-    try {
-      await api.cameras();
-      screen = 'home';
+      const page = await api.cameras();
+      screen = page.needsLogin ? 'login' : 'home';
     } catch {
       screen = 'login';
     }
@@ -45,8 +35,6 @@
   <main class="gate">
     <p class="quiet">Looking for the server...</p>
   </main>
-{:else if screen === 'unlock'}
-  <Unlock onunlocked={afterUnlock} />
 {:else if screen === 'login'}
   <Login onloggedin={() => (screen = 'home')} />
 {:else}

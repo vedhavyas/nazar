@@ -1,4 +1,4 @@
-//! HTTP surface tests: the gate, the API, the go2rtc proxy and the SPA.
+//! HTTP surface tests: the API, the go2rtc proxy and the SPA.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -17,16 +17,13 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
-use server::config::TrustedProxies;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
-use server::pin::PinGate;
 use server::supervisor::{Pacing, Supervisor};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
-const PIN: &str = "246810";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
@@ -42,18 +39,6 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    harness_with(false).await
-}
-
-async fn harness_opts(secure_cookies: bool, trusted_proxies: TrustedProxies) -> Harness {
-    harness_with_trust(secure_cookies, trusted_proxies).await
-}
-
-async fn harness_with(secure_cookies: bool) -> Harness {
-    harness_with_trust(secure_cookies, TrustedProxies::parse("127.0.0.1/8")).await
-}
-
-async fn harness_with_trust(secure_cookies: bool, trusted_proxies: TrustedProxies) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = std::env::temp_dir().join(format!(
@@ -89,22 +74,14 @@ async fn harness_with_trust(secure_cookies: bool, trusted_proxies: TrustedProxie
             sessions,
             qubo: client,
             supervisor,
-            pin: PinGate::new(&data_dir),
             go2rtc_api: go2rtc.base.to_string(),
-            trusted_proxies,
-            secure_cookies,
         },
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let base = format!("http://{}", listener.local_addr().expect("the address"));
     tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .expect("serves");
+        axum::serve(listener, app(state)).await.expect("serves");
     });
     Harness {
         base,
@@ -114,43 +91,7 @@ async fn harness_with_trust(secure_cookies: bool, trusted_proxies: TrustedProxie
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .cookie_store(true)
-        .build()
-        .expect("a client")
-}
-
-/// First run: set the PIN, unlock, and hand back the `Set-Cookie` value.
-async fn unlock(client: &reqwest::Client, base: &str) -> String {
-    let response = client
-        .post(format!("{base}/api/pin"))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("set pin");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::NO_CONTENT,
-        "first run sets the PIN"
-    );
-    let response = client
-        .post(format!("{base}/api/unlock"))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::NO_CONTENT,
-        "the right PIN unlocks"
-    );
-    response
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .expect("a session cookie is set")
-        .to_str()
-        .expect("a header value")
-        .to_owned()
+    reqwest::Client::builder().build().expect("a client")
 }
 
 async fn mount_discovery(server: &MockServer) {
@@ -194,132 +135,10 @@ async fn health_is_open_and_carries_the_version() {
 }
 
 #[tokio::test]
-async fn the_gate_locks_cameras_and_only_the_right_pin_unlocks() {
-    let h = harness().await;
-    let client = client();
-
-    let response = client
-        .get(format!("{}/api/cameras", h.base))
-        .send()
-        .await
-        .expect("locked cameras");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "cameras are gated"
-    );
-
-    let response = client
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock before any pin exists");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::CONFLICT,
-        "unlock tells the UI that no PIN is set yet"
-    );
-
-    mount_discovery(&h.qubo).await;
-    let cookie = unlock(&client, &h.base).await;
-    assert!(
-        cookie.starts_with("nazar_session=")
-            && cookie.contains("HttpOnly")
-            && cookie.contains("SameSite=Lax"),
-        "unlock hands out a HttpOnly, SameSite=Lax session cookie: {cookie}"
-    );
-
-    let response = client
-        .get(format!("{}/api/cameras", h.base))
-        .send()
-        .await
-        .expect("unlocked cameras");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let cameras = response.json::<Value>().await.expect("json");
-    assert_eq!(
-        cameras,
-        json!({
-            "cameras": [{ "id": DEVICE_ID, "name": "Hall", "state": "offline", "reason": null }],
-            "needsLogin": false,
-        }),
-        "the camera page carries the list and the login flag"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn an_interrupted_set_leaves_the_gate_settable() {
-    let h = harness().await;
-    let browser = client();
-
-    // The shape a crash between write and rename could leave behind.
-    std::fs::write(h.data_dir.join("pin"), b"").expect("a torn pin file");
-
-    let unlock = browser
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock");
-    assert_eq!(
-        unlock.status(),
-        reqwest::StatusCode::CONFLICT,
-        "a torn PIN file reads as not-set, not as wrong or broken"
-    );
-
-    let set = browser
-        .post(format!("{}/api/pin", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("set pin");
-    assert_eq!(
-        set.status(),
-        reqwest::StatusCode::NO_CONTENT,
-        "the gate is settable again"
-    );
-
-    let unlock = browser
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock");
-    assert_eq!(unlock.status(), reqwest::StatusCode::NO_CONTENT);
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn a_short_pin_is_refused() {
-    let h = harness().await;
-    let browser = client();
-
-    let short = browser
-        .post(format!("{}/api/pin", h.base))
-        .json(&json!({ "pin": "2468" }))
-        .send()
-        .await
-        .expect("short pin");
-    assert_eq!(
-        short.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "a four-digit PIN is minutes of guessing"
-    );
-    assert_eq!(
-        short.json::<Value>().await.expect("json")["error"],
-        json!("the PIN needs at least 6 digits"),
-        "the reason is the server's own words"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
 async fn a_refused_session_reads_as_needs_login() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
     let browser = client();
-    unlock(&browser, &h.base).await;
 
     let listed = browser
         .get(format!("{}/api/cameras", h.base))
@@ -389,79 +208,6 @@ async fn a_refused_session_reads_as_needs_login() {
 }
 
 #[tokio::test]
-async fn a_wrong_pin_is_refused_and_the_pin_is_first_run_only() {
-    let h = harness().await;
-    let browser = client();
-    unlock(&browser, &h.base).await;
-
-    let response = browser
-        .post(format!("{}/api/pin", h.base))
-        .json(&json!({ "pin": "999999" }))
-        .send()
-        .await
-        .expect("second pin");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::CONFLICT,
-        "the PIN cannot be overwritten in M1"
-    );
-    assert_eq!(
-        response.json::<Value>().await.expect("json")["error"],
-        json!("a PIN is already set"),
-        "the UI shows the server's words"
-    );
-
-    let fresh = client();
-    let response = fresh
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": "9999" }))
-        .send()
-        .await
-        .expect("wrong pin");
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "a wrong PIN is refused"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn the_unlock_throttle_caps_attempts_per_client() {
-    let h = harness().await;
-    let browser = client();
-    unlock(&browser, &h.base).await;
-
-    // The helper's unlock cleared the window, so five wrong PINs stay
-    // inside the limit and the sixth try is the one refused.
-    for attempt in 1..=5 {
-        let response = browser
-            .post(format!("{}/api/unlock", h.base))
-            .json(&json!({ "pin": "0000" }))
-            .send()
-            .await
-            .expect("wrong pin");
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED,
-            "wrong pin {attempt} is refused as wrong, not as a flood"
-        );
-    }
-    let flooded = browser
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": "0000" }))
-        .send()
-        .await
-        .expect("sixth try");
-    assert_eq!(
-        flooded.status(),
-        reqwest::StatusCode::TOO_MANY_REQUESTS,
-        "the sixth try in the window is rate-limited"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
 async fn watching_a_camera_starts_the_stream() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
@@ -480,19 +226,7 @@ async fn watching_a_camera_starts_the_stream() {
         .await;
     let browser = client();
 
-    let locked = client()
-        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
-        .send()
-        .await
-        .expect("locked watch");
-    assert_eq!(
-        locked.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "watching is gated too"
-    );
-
-    // The first gated call discovers the account's cameras.
-    unlock(&browser, &h.base).await;
+    // The first call discovers the account's cameras.
     let unknown = browser
         .post(format!("{}/api/cameras/no-such-camera/live", h.base))
         .send()
@@ -545,7 +279,6 @@ async fn the_camera_page_carries_the_degraded_reason() {
         .mount(&h.qubo)
         .await;
     let browser = client();
-    unlock(&browser, &h.base).await;
 
     let _ = browser
         .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
@@ -571,151 +304,15 @@ async fn the_camera_page_carries_the_degraded_reason() {
 }
 
 #[tokio::test]
-async fn the_throttle_counts_each_forwarded_client_separately() {
-    let h = harness().await;
-    unlock(&client(), &h.base).await;
-
-    // One client floods its own bucket through the trusted proxy.
-    let flooding = client();
-    for attempt in 1..=5 {
-        let response = flooding
-            .post(format!("{}/api/unlock", h.base))
-            .header("x-forwarded-for", "10.9.9.9")
-            .json(&json!({ "pin": "000000" }))
-            .send()
-            .await
-            .expect("wrong pin");
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED,
-            "attempt {attempt} inside the bucket is merely wrong"
-        );
-    }
-    let capped = flooding
-        .post(format!("{}/api/unlock", h.base))
-        .header("x-forwarded-for", "10.9.9.9")
-        .json(&json!({ "pin": "000000" }))
-        .send()
-        .await
-        .expect("sixth attempt");
-    assert_eq!(
-        capped.status(),
-        reqwest::StatusCode::TOO_MANY_REQUESTS,
-        "the flooding client is capped"
-    );
-
-    // A different forwarded client keeps its own bucket.
-    let other = client();
-    let allowed = other
-        .post(format!("{}/api/unlock", h.base))
-        .header("x-forwarded-for", "10.9.9.10")
-        .json(&json!({ "pin": "000000" }))
-        .send()
-        .await
-        .expect("another client");
-    assert_eq!(
-        allowed.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "another client's own bucket is untouched"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn an_untrusted_peer_cannot_pick_its_own_bucket() {
-    let h = harness_opts(false, TrustedProxies::default()).await;
-    unlock(&client(), &h.base).await;
-
-    // The peer is not a trusted proxy, so X-Forwarded-For is ignored and
-    // every attempt lands in the one bucket the peer owns.
-    let flooding = client();
-    for attempt in 1..=5 {
-        let response = flooding
-            .post(format!("{}/api/unlock", h.base))
-            .header("x-forwarded-for", format!("10.1.1.{attempt}"))
-            .json(&json!({ "pin": "000000" }))
-            .send()
-            .await
-            .expect("wrong pin");
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED,
-            "attempt {attempt} inside the shared bucket is merely wrong"
-        );
-    }
-    let capped = flooding
-        .post(format!("{}/api/unlock", h.base))
-        .header("x-forwarded-for", "10.1.1.99")
-        .json(&json!({ "pin": "000000" }))
-        .send()
-        .await
-        .expect("fresh header value");
-    assert_eq!(
-        capped.status(),
-        reqwest::StatusCode::TOO_MANY_REQUESTS,
-        "a fresh header value buys nothing when the peer is untrusted"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn the_house_wide_ceiling_caps_rotating_keys() {
-    let h = harness().await;
-    unlock(&client(), &h.base).await;
-
-    let flooding = client();
-    let mut capped_at = None;
-    for attempt in 1..=40 {
-        let response = flooding
-            .post(format!("{}/api/unlock", h.base))
-            .header("x-forwarded-for", format!("10.2.0.{attempt}"))
-            .json(&json!({ "pin": "000000" }))
-            .send()
-            .await
-            .expect("rotating key");
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            capped_at = Some(attempt);
-            break;
-        }
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED,
-            "attempt {attempt} has its own untouched bucket"
-        );
-    }
-    assert_eq!(
-        capped_at,
-        Some(31),
-        "the 31st rotating attempt hits the house-wide 30/60s ceiling"
-    );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
-}
-
-#[tokio::test]
-async fn login_otp_is_gated_and_forwards_to_the_gateway() {
+async fn login_otp_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
-        .and(path(
-            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login",
-        ))
+        .and(path(OTP_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"uuid":"login-1"}"#))
         .mount(&h.qubo)
         .await;
     let browser = client();
 
-    let locked = browser
-        .post(format!("{}/api/login/otp", h.base))
-        .json(&json!({ "phone": "9876543210" }))
-        .send()
-        .await
-        .expect("locked otp");
-    assert_eq!(
-        locked.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "a locked peer cannot burn the resend window under the household number"
-    );
-
-    unlock(&browser, &h.base).await;
     let response = browser
         .post(format!("{}/api/login/otp", h.base))
         .json(&json!({ "phone": "9876543210" }))
@@ -725,7 +322,7 @@ async fn login_otp_is_gated_and_forwards_to_the_gateway() {
     assert_eq!(
         response.status(),
         reqwest::StatusCode::NO_CONTENT,
-        "an unlocked browser forwards the request"
+        "the request forwards"
     );
     let requests = h.qubo.received_requests().await.expect("recorded requests");
     let otp = requests
@@ -741,20 +338,16 @@ async fn login_otp_is_gated_and_forwards_to_the_gateway() {
 }
 
 #[tokio::test]
-async fn verify_requires_the_unlock_and_saves_the_session() {
+async fn verify_saves_the_session() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
     Mock::given(method("POST"))
-        .and(path(
-            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login",
-        ))
+        .and(path(OTP_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"uuid":"login-1"}"#))
         .mount(&h.qubo)
         .await;
     Mock::given(method("POST"))
-        .and(path(
-            VERIFY_PATH,
-        ))
+        .and(path(VERIFY_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             json!([{ "accessToken": "token-live", "uuid": "user-uuid-1", "email": "family@example.com" }])
                 .to_string(),
@@ -763,19 +356,6 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
         .await;
 
     let client = client();
-    let locked = client
-        .post(format!("{}/api/login/verify", h.base))
-        .json(&json!({ "phone": "9876543210", "code": "123456" }))
-        .send()
-        .await
-        .expect("locked verify");
-    assert_eq!(
-        locked.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "the OTP alone does not get past the gate"
-    );
-
-    unlock(&client, &h.base).await;
     let otp = client
         .post(format!("{}/api/login/otp", h.base))
         .json(&json!({ "phone": "9876543210" }))
@@ -799,26 +379,6 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
 }
 
 #[tokio::test]
-async fn the_cookie_is_secure_by_default_and_opt_out_for_local_runs() {
-    let secure = harness_with(true).await;
-    let browser = client();
-    let cookie = unlock(&browser, &secure.base).await;
-    assert!(
-        cookie.contains("Secure") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"),
-        "deployment hands out a Secure, HttpOnly, SameSite=Lax cookie: {cookie}"
-    );
-    let _ = std::fs::remove_dir_all(&secure.data_dir);
-
-    let local = harness().await;
-    let cookie = unlock(&client(), &local.base).await;
-    assert!(
-        !cookie.contains("Secure"),
-        "the local opt-out keeps the cookie usable over http: {cookie}"
-    );
-    let _ = std::fs::remove_dir_all(&local.data_dir);
-}
-
-#[tokio::test]
 async fn a_gateway_auth_failure_reads_as_unauthorized() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
@@ -839,7 +399,6 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
         .await;
 
     let browser = client();
-    unlock(&browser, &h.base).await;
     let otp = browser
         .post(format!("{}/api/login/otp", h.base))
         .json(&json!({ "phone": "9876543210" }))
@@ -857,7 +416,7 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
     assert_eq!(
         refused.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "a gateway auth failure re-locks the browser"
+        "a gateway auth failure reads as unauthorized"
     );
     assert_eq!(
         refused.json::<Value>().await.expect("json")["error"],
@@ -868,22 +427,9 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
 }
 
 #[tokio::test]
-async fn the_proxy_reaches_go2rtc_through_the_gate() {
+async fn the_proxy_only_reaches_the_ws_path() {
     let h = harness().await;
     let client = client();
-
-    let locked = client
-        .get(format!("{}/go2rtc/api/streams", h.base))
-        .send()
-        .await
-        .expect("locked proxy");
-    assert_eq!(
-        locked.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "the proxy is gated"
-    );
-
-    unlock(&client, &h.base).await;
 
     // go2rtc's admin surface stays out of the browser's reach.
     let admin = client
@@ -933,12 +479,6 @@ async fn websocket_frames_are_piped_through_the_proxy() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
     let browser = client();
-    let cookie = unlock(&browser, &h.base).await;
-    let pair = cookie
-        .split(';')
-        .next()
-        .expect("the cookie pair")
-        .to_owned();
     // The proxy only forwards a camera this server already knows.
     let listed = browser
         .get(format!("{}/api/cameras", h.base))
@@ -951,10 +491,7 @@ async fn websocket_frames_are_piped_through_the_proxy() {
         "{}/go2rtc/api/ws?src={DEVICE_ID}",
         h.base.replace("http://", "ws://")
     );
-    let mut request = url.into_client_request().expect("a ws request");
-    request
-        .headers_mut()
-        .insert("cookie", pair.parse().expect("a cookie header"));
+    let request = url.into_client_request().expect("a ws request");
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("the proxy accepts the socket");

@@ -9,7 +9,6 @@ authors = ["Vedhavyas Singareddi <7549475+vedhavyas@users.noreply.github.com>"]
 
 [workspace.dependencies]
 anyhow = "1"
-argon2 = "0.6"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 qubo = { path = "crates/qubo" }

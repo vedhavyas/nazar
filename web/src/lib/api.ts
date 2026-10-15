@@ -59,8 +59,6 @@ function post(path: string, body: unknown): Promise<void> {
 
 export const api = {
   health: () => call<{ ok: boolean; version: string }>('/api/health'),
-  setPin: (pin: string) => post('/api/pin', { pin }),
-  unlock: (pin: string) => post('/api/unlock', { pin }),
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
   verifyOtp: (phone: string, code: string) => post('/api/login/verify', { phone, code }),
   cameras: () => call<Cameras>('/api/cameras'),

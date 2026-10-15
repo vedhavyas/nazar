@@ -5,7 +5,6 @@ use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
-use server::pin::PinGate;
 use server::supervisor::{Pacing, Supervisor};
 use tracing_subscriber::EnvFilter;
 
@@ -21,12 +20,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
-    if config.trusted_proxies.is_empty() {
-        tracing::warn!(
-            "NAZAR_TRUSTED_PROXY is unset: every client behind the proxy shares one \
-             rate-limit bucket; set it to the proxy's address or subnet"
-        );
-    }
     let go2rtc = Go2rtc::start(&config).context("starting go2rtc")?;
     let qubo = QuboClient::with_device_id(
         BASE_URL.parse().context("the gateway URL parses")?,
@@ -55,10 +48,7 @@ async fn main() -> anyhow::Result<()> {
             sessions,
             qubo,
             supervisor,
-            pin: PinGate::new(&config.data_dir),
             go2rtc_api: server::go2rtc::API_BASE.to_owned(),
-            trusted_proxies: config.trusted_proxies.clone(),
-            secure_cookies: !config.insecure_cookie,
         },
     );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT))
@@ -68,11 +58,6 @@ async fn main() -> anyhow::Result<()> {
         "nazar listening on {}",
         listener.local_addr().context("the local address")?
     );
-    axum::serve(
-        listener,
-        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .context("serving")?;
+    axum::serve(listener, app(state)).await.context("serving")?;
     Ok(())
 }

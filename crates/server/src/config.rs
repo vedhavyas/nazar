@@ -2,7 +2,6 @@
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
@@ -11,8 +10,7 @@ use qubo::ServiceProvider;
 /// Everything the server needs from its environment.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Durable state: the Qubo session, the PIN, the generated go2rtc
-    /// config.
+    /// Durable state: the Qubo session and the generated go2rtc config.
     pub data_dir: PathBuf,
     /// The go2rtc binary to run.
     pub go2rtc_bin: PathBuf,
@@ -23,17 +21,12 @@ pub struct Config {
     /// One WebRTC candidate viewers can reach, `ip:port`. Empty means
     /// go2rtc's own discovery, which finds container-internal addresses.
     pub webrtc_candidates: Option<String>,
-    /// Whose `X-Forwarded-For` the rate limiter believes.
-    pub trusted_proxies: TrustedProxies,
-    /// Keeps the session cookie off plain http for local runs only.
-    pub insecure_cookie: bool,
 }
 
 impl Config {
     /// Read the environment: `DATA_DIR` (default `/data`), `GO2RTC_BIN`
     /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`,
-    /// `NAZAR_WEBRTC_CANDIDATES`, `NAZAR_TRUSTED_PROXY` (ips or v4 CIDRs,
-    /// comma-separated), `NAZAR_INSECURE_COOKIE=1` for local http runs.
+    /// `NAZAR_WEBRTC_CANDIDATES`.
     pub fn from_env() -> Self {
         Self {
             data_dir: var("DATA_DIR").unwrap_or_else(|| "/data".to_owned()).into(),
@@ -46,9 +39,6 @@ impl Config {
             service_provider: var("QUBO_SP")
                 .map_or_else(ServiceProvider::default, ServiceProvider::new),
             webrtc_candidates: var("NAZAR_WEBRTC_CANDIDATES"),
-            trusted_proxies: var("NAZAR_TRUSTED_PROXY")
-                .map_or_else(TrustedProxies::default, |spec| TrustedProxies::parse(&spec)),
-            insecure_cookie: var("NAZAR_INSECURE_COOKIE").is_some_and(|value| value == "1"),
         }
     }
 
@@ -80,56 +70,4 @@ impl Config {
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// The addresses whose `X-Forwarded-For` is believed: caddy's, in
-/// deployment. Anything not in here keys the rate limiter by its transport
-/// peer, so a peer that can reach the server directly cannot rotate its
-/// own bucket.
-#[derive(Debug, Clone, Default)]
-pub struct TrustedProxies {
-    exact: Vec<IpAddr>,
-    v4_nets: Vec<(u32, u32)>,
-}
-
-impl TrustedProxies {
-    pub fn parse(spec: &str) -> Self {
-        let mut proxies = Self::default();
-        for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            match entry.split_once('/') {
-                Some((base, bits)) => {
-                    if let (Ok(IpAddr::V4(net)), Ok(bits)) = (base.parse(), bits.parse::<u32>())
-                        && bits <= 32
-                        && bits > 0
-                    {
-                        let mask = u32::MAX << (32 - bits);
-                        proxies.v4_nets.push((u32::from(net) & mask, mask));
-                    }
-                }
-                None => {
-                    if let Ok(ip) = entry.parse() {
-                        proxies.exact.push(ip);
-                    }
-                }
-            }
-        }
-        proxies
-    }
-
-    pub fn trusts(&self, peer: IpAddr) -> bool {
-        if self.exact.contains(&peer) {
-            return true;
-        }
-        match peer {
-            IpAddr::V4(peer) => {
-                let peer = u32::from(peer);
-                self.v4_nets.iter().any(|(net, mask)| (peer & mask) == *net)
-            }
-            IpAddr::V6(_) => false,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.v4_nets.is_empty()
-    }
 }
