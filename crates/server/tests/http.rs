@@ -366,6 +366,77 @@ async fn the_unlock_throttle_caps_attempts_per_client() {
 }
 
 #[tokio::test]
+async fn watching_a_camera_starts_the_stream() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}_CAMERA_VOD0?token=m1"),
+                    "sessionId": "session-1",
+                })
+                .to_string(),
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+
+    let locked = client()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("locked watch");
+    assert_eq!(
+        locked.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "watching is gated too"
+    );
+
+    // The first gated call discovers the account's cameras.
+    unlock(&browser, &h.base).await;
+    let unknown = browser
+        .post(format!("{}/api/cameras/no-such-camera/live", h.base))
+        .send()
+        .await
+        .expect("unknown camera");
+    assert_eq!(
+        unknown.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "an unknown camera is not found, not a panic"
+    );
+
+    let started = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+    assert_eq!(started.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        started.json::<Value>().await.expect("json"),
+        json!({ "stream": DEVICE_ID }),
+        "the stream name is the device id"
+    );
+
+    let page = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras")
+        .json::<Value>()
+        .await
+        .expect("json");
+    assert_eq!(
+        page["cameras"][0]["state"],
+        json!("live"),
+        "the camera reports live once go2rtc holds the producer"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn login_otp_is_gated_and_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
