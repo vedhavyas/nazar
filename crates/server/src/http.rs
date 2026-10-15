@@ -38,9 +38,17 @@ struct Spa;
 /// bigger is a browser mistake, not a stream.
 const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// The only go2rtc path the browser's player may reach: its signalling
-/// socket. Everything else go2rtc serves is an admin surface.
+/// The go2rtc paths the browser's player may reach: its signalling socket,
+/// and the HLS fallback's parts (design §5). Everything else go2rtc serves
+/// is an admin surface.
 const PROXY_WS_PATH: &str = "api/ws";
+const PROXY_HLS_MASTER: &str = "api/stream.m3u8";
+const PROXY_HLS_PARTS: [&str; 4] = [
+    "api/hls/playlist.m3u8",
+    "api/hls/segment.ts",
+    "api/hls/segment.m4s",
+    "api/hls/init.mp4",
+];
 
 /// The WebSocket client wants a `ws://` URL; the API base is `http://`.
 fn ws_target(target: &str) -> String {
@@ -520,43 +528,63 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
     let (mut parts, body) = request.into_parts();
 
     let rest = parts.uri.path().trim_start_matches("/go2rtc/").to_owned();
-    if rest != PROXY_WS_PATH {
+    let query = parts.uri.query().unwrap_or_default();
+    let base = state.go2rtc_api.trim_end_matches('/').to_owned();
+    // HLS's parts carry an opaque session id that only a master playlist
+    // can create: they read, they never name a source, so an id that is
+    // shaped like an id is all they need.
+    let target = if PROXY_HLS_PARTS.contains(&rest.as_str()) {
+        let id = single_param(query, "id")
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "only ?id=<session> is proxied"))?;
+        let safe = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !safe {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
+        }
+        format!("{base}/{rest}?id={id}")
+    } else if rest == PROXY_WS_PATH || rest == PROXY_HLS_MASTER {
+        // go2rtc patches (or creates) streams from a `src`, so the query is
+        // rebuilt rather than forwarded: exactly one src, and only a stream
+        // this server already minted. Everything else the caller sent is
+        // dropped, and the value is never percent-decoded - `ffmpeg%3A...`
+        // must not become a source go2rtc would accept.
+        let src = single_src(query)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "only ?src=<camera> is proxied"))?;
+        // The id must also be shaped like an id: a URL-shaped one must never
+        // reach go2rtc, whatever the cloud marked it as.
+        let safe = !src.is_empty()
+            && src
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+        if !safe {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+        }
+        // A stream is a camera plus its quality class, and only those two.
+        let Some((camera, quality)) = src.rsplit_once('-') else {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+        };
+        if !matches!(quality, "high" | "low") {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+        }
+        let known = state
+            .supervisor
+            .devices()
+            .await
+            .iter()
+            .any(|device| device.device_id == camera);
+        if !known {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+        }
+        if rest == PROXY_WS_PATH {
+            format!("{base}/api/ws?src={src}")
+        } else {
+            format!("{base}/api/stream.m3u8?src={src}")
+        }
+    } else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
-    }
-    // go2rtc patches (or creates) streams from api/ws's `src`, so the query
-    // is rebuilt rather than forwarded: exactly one src, and only a camera
-    // this server already knows. Everything else the caller sent is
-    // dropped, and the value is never percent-decoded - `ffmpeg%3A...` must
-    // not become a source go2rtc would accept.
-    let src = single_src(parts.uri.query().unwrap_or_default())
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "only ?src=<camera> is proxied"))?;
-    // The id must also be shaped like an id: a URL-shaped one must never
-    // reach go2rtc, whatever the cloud marked it as.
-    let safe = !src.is_empty()
-        && src
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
-    if !safe {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-    }
-    // A stream is a camera plus its quality class, and only those two.
-    let Some((camera, quality)) = src.rsplit_once('-') else {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
     };
-    if !matches!(quality, "high" | "low") {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-    }
-    let known = state
-        .supervisor
-        .devices()
-        .await
-        .iter()
-        .any(|device| device.device_id == camera);
-    if !known {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-    }
-    let base = state.go2rtc_api.trim_end_matches('/');
-    let target = format!("{base}/api/ws?src={src}");
 
     if is_websocket(&parts.headers) {
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -751,12 +779,17 @@ fn mime_for(path: &str) -> &'static str {
 
 /// The one `src` value in a raw query, or nothing.
 fn single_src(query: &str) -> Option<String> {
+    single_param(query, "src")
+}
+
+/// The one `name` value in a raw query, or nothing when it repeats.
+fn single_param(query: &str, wanted: &str) -> Option<String> {
     let mut found: Option<String> = None;
     for pair in query.split('&') {
         let Some((name, value)) = pair.split_once('=') else {
             continue;
         };
-        if name != "src" {
+        if name != wanted {
             continue;
         }
         if found.is_some() {

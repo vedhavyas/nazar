@@ -119,6 +119,40 @@ impl FakeApi {
                     }
                 }),
             )
+            .route(
+                "/api/stream.m3u8",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    // go2rtc's master playlist: the media playlist is a part.
+                    match params.get("src") {
+                        Some(_) => (
+                            StatusCode::OK,
+                            "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
+                        ),
+                        None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
+                    }
+                }),
+            )
+            .route(
+                "/api/hls/playlist.m3u8",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    match params.get("id") {
+                        Some(_) => (
+                            StatusCode::OK,
+                            "#EXTM3U\nsegment.m4s?id=hls-1&n=0\n".to_owned(),
+                        ),
+                        None => (StatusCode::NOT_FOUND, "not found".to_owned()),
+                    }
+                }),
+            )
+            .route(
+                "/api/hls/segment.m4s",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    match params.get("id") {
+                        Some(_) => (StatusCode::OK, "m4s".to_owned()),
+                        None => (StatusCode::NOT_FOUND, "not found".to_owned()),
+                    }
+                }),
+            )
             .route("/api/ws", get(echo));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
