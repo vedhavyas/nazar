@@ -481,3 +481,72 @@ fn redact(text: &str) -> String {
     out.push_str(rest);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    //! The idle teardown's decision window, which no integration test can
+    //! land in: the loop's look and its teardown are microseconds apart.
+    //! Here the window is opened by hand, between the two calls.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    /// A supervisor that answers nothing: the test path makes no call it
+    /// would have to fake.
+    fn quiet_supervisor() -> Supervisor {
+        Supervisor::new(
+            QuboClient::new(
+                "http://127.0.0.1:9".parse().expect("a url"),
+                qubo::ServiceProvider::default(),
+            ),
+            SessionStore::new(std::env::temp_dir().join("nazar-guard-test.json")),
+            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")),
+            Pacing::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_teardown_stands_down_for_a_request_that_landed_meanwhile() {
+        let supervisor = quiet_supervisor();
+        let name = stream_name("cam", Quality::Low);
+        let seen = Instant::now();
+        supervisor.state.write().await.insert(
+            name.clone(),
+            Tracked {
+                state: StreamState::Live { since: seen },
+                wake: Arc::new(Notify::new()),
+                last_request: seen,
+            },
+        );
+
+        // The person asks again while the loop is deciding.
+        supervisor
+            .state
+            .write()
+            .await
+            .get_mut(&name)
+            .expect("the entry")
+            .last_request = seen + Duration::from_millis(5);
+
+        assert!(
+            !supervisor.teardown_if_idle(&name, seen).await,
+            "a request that landed in the window stands the teardown down"
+        );
+        assert!(
+            supervisor.state.read().await.contains_key(&name),
+            "and the stream survives it"
+        );
+
+        // Nothing new since: the same decision drops the stream.
+        let settled = supervisor.last_request_at(&name).await.expect("the entry");
+        assert!(
+            supervisor.teardown_if_idle(&name, settled).await,
+            "a stream with no new request is dropped"
+        );
+        assert!(
+            !supervisor.state.read().await.contains_key(&name),
+            "and forgotten"
+        );
+    }
+}
