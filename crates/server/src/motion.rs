@@ -20,6 +20,9 @@ pub fn follow(
     order: Arc<Mutex<MotionOrder>>,
     supervisor: &Supervisor,
 ) -> tokio::task::JoinHandle<()> {
+    // Subscribed here, not inside the task: a broadcast channel only
+    // delivers what arrives after the subscription, and the first bursts
+    // of a boot must not be lost to a scheduling race.
     let mut events = events.subscribe();
     let supervisor = supervisor.clone();
     tokio::spawn(async move {
