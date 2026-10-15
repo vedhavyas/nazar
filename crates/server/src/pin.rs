@@ -51,6 +51,20 @@ impl PinGate {
         if self.is_set() {
             return Err(PinError::AlreadySet);
         }
+        // Claim the path exclusively so a racing second setter fails
+        // cleanly; the rename below replaces the empty claim atomically.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.path)
+        {
+            Ok(claim) => drop(claim),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(PinError::AlreadySet);
+            }
+            Err(err) => return Err(err.into()),
+        }
         let hash: PasswordHash = Argon2::default()
             .hash_password(pin.as_bytes())
             .map_err(|err| PinError::Hash(err.to_string()))?;
@@ -68,6 +82,7 @@ impl PinGate {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, &self.path)?;
+        tracing::info!(path = %self.path.display(), "household PIN set");
         Ok(())
     }
 
