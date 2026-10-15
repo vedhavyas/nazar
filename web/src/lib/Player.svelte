@@ -28,8 +28,64 @@
   /** How often an advancing clock is looked for once the picture starts. */
   const WATCH_EVERY_MS = 5_000;
 
+  /** What hls.js exposes once its script is on the page. */
+  interface HlsJs {
+    isSupported?: () => boolean;
+    loadSource: (source: string) => void;
+    attachMedia: (video: HTMLVideoElement) => void;
+    destroy: () => void;
+  }
+
   let host = $state<HTMLDivElement | null>(null);
   let fallback = $state(false);
+  /** The browser plays HLS itself; nothing needs loading. */
+  let native = $state(true);
+  let picture = $state<HTMLVideoElement | null>(null);
+
+  let loading: Promise<void> | null = null;
+
+  /** Fetch the vendored player only when it is needed: a browser that
+   * plays HLS itself, or a WebRTC path that works, never loads it. */
+  function loadHlsJs(): Promise<void> {
+    if (hlsJs()) return Promise.resolve();
+    loading ??= new Promise<void>((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/hls.min.js';
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('the hls player did not load'));
+      document.head.appendChild(script);
+    }).catch((err: unknown) => {
+      // A failed fetch is not remembered: the retry may fetch it again.
+      loading = null;
+      throw err;
+    });
+    return loading;
+  }
+
+  function hlsJs(): HlsJs | undefined {
+    return (globalThis as { Hls?: HlsJs }).Hls;
+  }
+
+  /** Give the picture to the fallback: native HLS where the browser has it,
+   * the vendored player where it does not. Returns whether one took it. */
+  async function engageFallback(): Promise<boolean> {
+    if (playsHls()) {
+      native = true;
+      fallback = true;
+      return true;
+    }
+    try {
+      await loadHlsJs();
+    } catch {
+      return false;
+    }
+    if (!hlsJs()?.isSupported?.()) {
+      return false;
+    }
+    native = false;
+    fallback = true;
+    return true;
+  }
 
   /** Safari, iOS and Chrome-on-Android play HLS themselves; desktop
    * Chromium and Firefox do not, and there the retry is the fallback. */
@@ -56,14 +112,12 @@
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
     // dead stream leaves the last one. No first frame inside the window,
     // then no advancing clock, are the two signals a person can act on.
-    const timer = setTimeout(() => {
-      if (playsHls()) {
-        fallback = true;
-        onsettled?.('hls');
-        return;
-      }
-      onsettled?.('start');
-    }, START_WINDOW_MS);
+    const stall = (state: 'start' | 'frozen') => {
+      void engageFallback().then((taken) => {
+        onsettled?.(taken ? 'hls' : state);
+      });
+    };
+    const timer = setTimeout(() => stall('start'), START_WINDOW_MS);
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
     const onplaying = () => {
@@ -73,12 +127,9 @@
         const video = player.querySelector('video');
         if (!video) return;
         if (video.currentTime <= lastTime) {
-          if (playsHls()) {
-            fallback = true;
-            onsettled?.('hls');
-            return;
-          }
-          onsettled?.('frozen');
+          if (watching) clearInterval(watching);
+          watching = null;
+          stall('frozen');
           return;
         }
         lastTime = video.currentTime;
@@ -109,6 +160,19 @@
     return () => clearInterval(timer);
   });
 
+  // The vendored player carries HLS where the browser cannot: it needs the
+  // element and its media attached by hand.
+  $effect(() => {
+    const element = picture;
+    const name = stream;
+    if (!fallback || native || !element || !name) return;
+    const Hls = hlsJs();
+    if (!Hls) return;
+    Hls.loadSource(`/go2rtc/api/stream.m3u8?src=${encodeURIComponent(name)}`);
+    Hls.attachMedia(element);
+    return () => Hls.destroy();
+  });
+
   // A new attempt (or a fallback reversal) starts the socket over.
   $effect(() => {
     void attempt;
@@ -122,7 +186,8 @@
   <video
     class="hls"
     data-testid="hls"
-    src="/go2rtc/api/stream.m3u8?src={encodeURIComponent(stream)}"
+    bind:this={picture}
+    src={native ? `/go2rtc/api/stream.m3u8?src=${encodeURIComponent(stream)}` : undefined}
     controls
     autoplay
     playsinline

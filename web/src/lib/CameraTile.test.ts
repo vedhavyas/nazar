@@ -26,6 +26,11 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  // The player script lands in <head>, which cleanup does not empty.
+  for (const script of document.querySelectorAll('script[src="/hls.min.js"]')) {
+    script.remove();
+  }
 });
 
 test('a socket that cannot negotiate falls back to HLS where it plays', async () => {
@@ -49,15 +54,56 @@ test('a socket that cannot negotiate falls back to HLS where it plays', async ()
   ).toBe('/go2rtc/api/stream.m3u8?src=cam-1-high');
 });
 
-test('without native HLS the tile offers the retry instead', async () => {
+test('a browser without native HLS gets the vendored player', async () => {
   vi.useFakeTimers();
-  // Desktop Chromium and Firefox do not play HLS themselves.
+  // Desktop Chromium plays no HLS itself, but hls.js carries it.
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const loaded: string[] = [];
+  const attached: string[] = [];
+  vi.stubGlobal('Hls', {
+    isSupported: () => true,
+    loadSource: (source: string) => loaded.push(source),
+    attachMedia: (video: HTMLVideoElement) => attached.push(video.tagName),
+    destroy: () => {},
+  });
   liveTile();
 
   await vi.advanceTimersByTimeAsync(12_500);
+  await vi.waitFor(() => expect(loaded.length).toBe(1));
 
-  expect(screen.getByText(/did not start/), 'the person gets the retry').toBeTruthy();
+  expect(
+    loaded[0],
+    "the vendored player was pointed at the tile's stream",
+  ).toBe('/go2rtc/api/stream.m3u8?src=cam-1-high');
+  expect(attached[0], 'and given the element to play into').toBe('VIDEO');
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'the fallback is what is shown',
+  ).toBeTruthy();
+  expect(screen.queryByText(/did not start/), 'no retry note').toBeNull();
+});
+
+/** Fail the vendored player's fetch, as a browser that cannot reach it
+ * would: the retry path is what is left. */
+async function failVendoredPlayer(note: RegExp = /did not start/) {
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  const script = scripts.item(scripts.length - 1);
+  expect(script, 'the player is only fetched when it is needed').toBeTruthy();
+  script?.dispatchEvent(new Event('error'));
+  await vi.waitFor(() => {
+    expect(screen.getByText(note), 'the person gets the retry').toBeTruthy();
+  });
+}
+
+test('a browser with neither native HLS nor hls.js offers the retry', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  vi.stubGlobal('Hls', undefined);
+  liveTile();
+
+  await vi.advanceTimersByTimeAsync(12_500);
+  await failVendoredPlayer();
+
   expect(document.querySelector('[data-testid=hls]'), 'and no broken player').toBeNull();
 });
 
@@ -132,11 +178,13 @@ async function videoOf(): Promise<HTMLVideoElement> {
 
 test('a picture that never starts offers a retry', async () => {
   vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
   const { onwatch } = liveTile();
 
   expect(screen.queryByText(/did not start/), 'nothing is claimed too early').toBeNull();
 
   await vi.advanceTimersByTimeAsync(12000);
+  await failVendoredPlayer();
   const note = screen.getByText(/did not start/);
   expect(note, 'no first frame inside the window is surfaced').toBeTruthy();
 
@@ -173,6 +221,7 @@ test('a second playing event does not double the watch', async () => {
 
 test('a frozen picture asks for a retry', async () => {
   vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
   const { onwatch } = liveTile();
   const video = await videoOf();
 
@@ -182,7 +231,11 @@ test('a frozen picture asks for a retry', async () => {
   expect(screen.queryByText(/stopped/), 'one advancing sample is not a freeze').toBeNull();
 
   await vi.advanceTimersByTimeAsync(10000);
-  expect(screen.getByText(/stopped/), 'a stalled clock is surfaced').toBeTruthy();
+  await failVendoredPlayer(/stopped/);
+  expect(
+    screen.getByText(/stopped/),
+    'a stalled clock is surfaced once the fallback cannot take it',
+  ).toBeTruthy();
 
   screen.getByText('Try again').click();
   expect(onwatch, 'the retry asks for a fresh stream').toHaveBeenCalledWith('cam-1');
