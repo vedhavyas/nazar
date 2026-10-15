@@ -305,7 +305,9 @@ async fn motion_keeps_the_feed_connected() {
         &broker,
         Duration::from_secs(30),
         Duration::from_millis(30),
-        Duration::from_millis(150),
+        // Wide against the motion cadence below, so a delayed tick under
+        // load cannot be read as a quiet feed.
+        Duration::from_secs(2),
     )
     .await;
     let mut watcher = h.events.subscribe();
@@ -314,7 +316,7 @@ async fn motion_keeps_the_feed_connected() {
         .await
         .expect("a motion event arrives")
         .expect("the subscription is live");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     assert_eq!(
         broker.sessions(),

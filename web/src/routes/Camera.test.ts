@@ -103,7 +103,9 @@ test('a dragged move waits its turn, and only the latest one queues', async () =
     }),
   );
   open();
-  await vi.waitFor(() => expect(document.querySelector('video-rtc')).toBeTruthy());
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is up').toBeTruthy(),
+  );
 
   const surface = screen.getByTestId('ptz-surface');
   // Three drag windows while the first move is still waiting on the
@@ -122,12 +124,18 @@ test('a dragged move waits its turn, and only the latest one queues', async () =
   expect(calls[0], 'the first window, in the camera signs').toContain('"dx":-60');
 
   releases[0]();
-  await vi.waitFor(() => expect(calls.length).toBe(2));
+  await vi.waitFor(() =>
+    expect(calls.length, 'the queued window is sent next').toBe(2),
+  );
   expect(calls[1], 'the second window queues, not replaces').toContain('"dx":-60');
   releases[1]();
-  await vi.waitFor(() => expect(calls.length).toBe(3));
+  await vi.waitFor(() =>
+    expect(calls.length, 'and the third after it').toBe(3),
+  );
   releases[2]();
-  await vi.waitFor(() => expect(screen.getByText(/at 0,0/)).toBeTruthy());
+  await vi.waitFor(() =>
+    expect(screen.getByText(/at 0,0/), 'the camera answers the last one').toBeTruthy(),
+  );
 
   const moved = calls.reduce((sum, body) => sum + Number(JSON.parse(body).dx), 0);
   expect(
