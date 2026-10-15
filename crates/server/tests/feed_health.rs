@@ -52,12 +52,18 @@ fn session(token: &str) -> Session {
 
 /// The feed pointed at the test's broker, with the windows squeezed so a
 /// test lives in milliseconds.
-fn feed_config(port: u16, quiet_window: Duration, session_check: Duration) -> FeedConfig {
+fn feed_config(
+    port: u16,
+    quiet_window: Duration,
+    session_check: Duration,
+    motion_window: Duration,
+) -> FeedConfig {
     FeedConfig {
         host: "127.0.0.1".to_owned(),
         port,
         tls: false,
         quiet_window,
+        motion_window,
         session_check,
         retry_min: Duration::from_millis(20),
         retry_max: Duration::from_millis(50),
@@ -68,6 +74,7 @@ async fn harness(
     broker: &common::mqtt::FakeBroker,
     quiet_window: Duration,
     session_check: Duration,
+    motion_window: Duration,
 ) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
@@ -101,7 +108,7 @@ async fn harness(
         },
     );
     let events = EventBus::new();
-    let config = feed_config(broker.port(), quiet_window, session_check);
+    let config = feed_config(broker.port(), quiet_window, session_check, motion_window);
     let _feed = MqttService::start(
         client,
         sessions.clone(),
@@ -133,6 +140,7 @@ async fn a_silent_feed_reconnects_no_faster_than_its_window() {
         &broker,
         Duration::from_millis(120),
         Duration::from_millis(30),
+        Duration::from_secs(30),
     )
     .await;
 
@@ -161,6 +169,7 @@ async fn a_chatty_feed_is_left_alone() {
         &broker,
         Duration::from_millis(200),
         Duration::from_millis(30),
+        Duration::from_secs(30),
     )
     .await;
     let mut watcher = h.events.subscribe();
@@ -189,7 +198,13 @@ async fn a_chatty_feed_is_left_alone() {
 #[tokio::test]
 async fn a_fresh_login_reconnects_the_feed() {
     let broker = common::mqtt::FakeBroker::chatty(Duration::from_millis(40)).await;
-    let h = harness(&broker, Duration::from_secs(30), Duration::from_millis(40)).await;
+    let h = harness(
+        &broker,
+        Duration::from_secs(30),
+        Duration::from_millis(40),
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(
         common::eventually(|| async { broker.sessions() == 1 }).await,
         "the feed connects once"
@@ -215,12 +230,86 @@ async fn a_fresh_login_reconnects_the_feed() {
 }
 
 #[tokio::test]
+async fn a_refused_subscription_reconnects_the_feed() {
+    // The quiet window is long, so only the broker's refusal can move it.
+    let broker = common::mqtt::FakeBroker::refusing().await;
+    let _h = harness(
+        &broker,
+        Duration::from_secs(30),
+        Duration::from_millis(30),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let reconnected = common::eventually(|| async { broker.sessions() >= 2 }).await;
+    assert!(
+        reconnected,
+        "a subscription the broker refuses is not a quiet house: the feed reconnects"
+    );
+}
+
+#[tokio::test]
+async fn a_feed_with_no_motion_reconnects_on_its_own_clock() {
+    // Heartbeats keep arriving, so nothing looks quiet - but no motion ever
+    // does, which is what a silently dead motion subscription looks like.
+    let broker = common::mqtt::FakeBroker::chatty(Duration::from_millis(40)).await;
+    let _h = harness(
+        &broker,
+        Duration::from_secs(30),
+        Duration::from_millis(30),
+        Duration::from_millis(150),
+    )
+    .await;
+
+    // Waited for tightly: well inside the window the feed was given, so a
+    // window that does not fire at all cannot pass this.
+    let mut reconnected = false;
+    for _ in 0..30 {
+        if broker.sessions() >= 2 {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reconnected,
+        "a feed that has heard no motion for its own window reconnects"
+    );
+}
+
+#[tokio::test]
+async fn motion_keeps_the_feed_connected() {
+    let broker = common::mqtt::FakeBroker::moving(Duration::from_millis(40)).await;
+    let h = harness(
+        &broker,
+        Duration::from_secs(30),
+        Duration::from_millis(30),
+        Duration::from_millis(150),
+    )
+    .await;
+    let mut watcher = h.events.subscribe();
+
+    tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+        .await
+        .expect("a motion event arrives")
+        .expect("the subscription is live");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        broker.sessions(),
+        1,
+        "motion is liveness: the feed stays on its connection"
+    );
+}
+
+#[tokio::test]
 async fn an_auth_refused_reconnect_raises_the_login_flag() {
     let broker = common::mqtt::FakeBroker::silent().await;
     let h = harness(
         &broker,
         Duration::from_millis(120),
         Duration::from_millis(30),
+        Duration::from_secs(30),
     )
     .await;
     assert!(

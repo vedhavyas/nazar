@@ -140,10 +140,7 @@ impl FakeApi {
     /// Report `count` viewers on the stream, as go2rtc does while a browser
     /// holds it open.
     pub fn set_viewers(&self, name: &str, count: usize) {
-        self.viewers
-            .lock()
-            .unwrap()
-            .insert(name.to_owned(), count);
+        self.viewers.lock().unwrap().insert(name.to_owned(), count);
     }
 
     /// Answer stream PUTs with `status` from now on.
