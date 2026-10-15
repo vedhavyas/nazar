@@ -7,10 +7,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, live_source};
 
@@ -54,6 +55,13 @@ pub enum SupervisorError {
     Qubo(#[from] qubo::QuboError),
 }
 
+/// A camera the supervisor is following: its state and the signal that
+/// forces an immediate retry.
+struct Tracked {
+    state: StreamState,
+    wake: Arc<Notify>,
+}
+
 /// The streams the server is keeping alive.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -61,8 +69,11 @@ pub struct Supervisor {
     sessions: SessionStore,
     go2rtc: Arc<Go2rtc>,
     pacing: Pacing,
-    state: Arc<RwLock<HashMap<String, StreamState>>>,
+    state: Arc<RwLock<HashMap<String, Tracked>>>,
     devices: Arc<RwLock<Vec<Device>>>,
+    /// Set when Qubo turns the session away; `/api/cameras` carries it so
+    /// the UI can route back to login instead of holding a dead screen.
+    needs_login: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -74,7 +85,13 @@ impl Supervisor {
             pacing,
             state: Arc::new(RwLock::new(HashMap::new())),
             devices: Arc::new(RwLock::new(Vec::new())),
+            needs_login: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether Qubo has refused the stored session; the UI must log in.
+    pub fn needs_login(&self) -> bool {
+        self.needs_login.load(Ordering::SeqCst)
     }
 
     /// Discover the account's devices and remember them.
@@ -83,7 +100,14 @@ impl Supervisor {
             code: None,
             message: "no Qubo session; log in".to_owned(),
         })?;
-        let devices = list_devices(&self.qubo, &session).await?;
+        let devices = match list_devices(&self.qubo, &session).await {
+            Ok(devices) => devices,
+            Err(err) => {
+                self.settle_auth(&err);
+                return Err(err.into());
+            }
+        };
+        self.needs_login.store(false, Ordering::SeqCst);
         *self.devices.write().await = devices.clone();
         Ok(devices)
     }
@@ -99,8 +123,15 @@ impl Supervisor {
             .read()
             .await
             .get(device_id)
-            .cloned()
+            .map(|tracked| tracked.state.clone())
             .unwrap_or(StreamState::Offline)
+    }
+
+    /// Remember a refused session so the UI can send the browser to login.
+    fn settle_auth(&self, err: &qubo::QuboError) {
+        if matches!(err, qubo::QuboError::Auth { .. }) {
+            self.needs_login.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Ensure the camera's stream is running: mint, hand the source to
@@ -110,7 +141,12 @@ impl Supervisor {
     pub async fn ensure_live(&self, device_id: &str) -> Result<(), SupervisorError> {
         {
             let state = self.state.read().await;
-            if state.contains_key(device_id) {
+            if let Some(tracked) = state.get(device_id) {
+                // A manual retry forces the loop's next attempt now instead
+                // of leaving the person waiting out the backoff.
+                if matches!(tracked.state, StreamState::Degraded { .. }) {
+                    tracked.wake.notify_one();
+                }
                 return Ok(());
             }
         }
@@ -128,7 +164,13 @@ impl Supervisor {
             if state.contains_key(device_id) {
                 return Ok(());
             }
-            state.insert(device_id.to_owned(), StreamState::Waking);
+            state.insert(
+                device_id.to_owned(),
+                Tracked {
+                    state: StreamState::Waking,
+                    wake: Arc::new(Notify::new()),
+                },
+            );
             drop(state);
 
             match self.mint_and_swap(&device).await {
@@ -155,8 +197,14 @@ impl Supervisor {
     }
 
     async fn remint_loop(self, device: Device, mut wait: Duration) {
+        let wake = self.wake_signal(&device.device_id).await;
         loop {
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = wake.notified() => {
+                    tracing::info!(device = %device.device_id, "remint forced by a retry");
+                }
+            }
             wait = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     self.mark_live(&device.device_id).await;
@@ -183,25 +231,42 @@ impl Supervisor {
             .load()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "no Qubo session; log in".to_owned())?;
-        let mint = mint_live(&self.qubo, &session, device, Quality::High)
-            .await
-            .map_err(|err| err.to_string())?;
+        let mint = match mint_live(&self.qubo, &session, device, Quality::High).await {
+            Ok(mint) => mint,
+            Err(err) => {
+                self.settle_auth(&err);
+                return Err(redact(&err.to_string()));
+            }
+        };
         self.go2rtc
             .put_stream(&device.device_id, &live_source(&mint.url))
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| redact(&err.to_string()))?;
+        self.needs_login.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The tracked entry's wake handle, created if the entry is missing.
+    async fn wake_signal(&self, device_id: &str) -> Arc<Notify> {
+        self.state
+            .write()
+            .await
+            .entry(device_id.to_owned())
+            .or_insert_with(new_tracked)
+            .wake
+            .clone()
     }
 
     /// `Live` keeps its original `since` through successful re-mints.
     async fn mark_live(&self, device_id: &str) {
         let mut state = self.state.write().await;
-        if !matches!(state.get(device_id), Some(StreamState::Live { .. })) {
-            state.insert(
-                device_id.to_owned(),
-                StreamState::Live {
-                    since: Instant::now(),
-                },
-            );
+        let entry = state
+            .entry(device_id.to_owned())
+            .or_insert_with(new_tracked);
+        if !matches!(entry.state, StreamState::Live { .. }) {
+            entry.state = StreamState::Live {
+                since: Instant::now(),
+            };
         }
     }
 
@@ -209,6 +274,33 @@ impl Supervisor {
         self.state
             .write()
             .await
-            .insert(device_id.to_owned(), StreamState::Degraded { reason });
+            .entry(device_id.to_owned())
+            .or_insert_with(new_tracked)
+            .state = StreamState::Degraded { reason };
     }
+}
+
+fn new_tracked() -> Tracked {
+    Tracked {
+        state: StreamState::Offline,
+        wake: Arc::new(Notify::new()),
+    }
+}
+
+/// Minted URLs carry a session token and errors echo the URL they failed
+/// on; nothing with a token attached reaches logs or the browser's reason.
+fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("token=") {
+        out.push_str(&rest[..start]);
+        out.push_str("token=<redacted>");
+        let after = &rest[start + "token=".len()..];
+        let end = after
+            .find(['&', ' ', '"', '\'', ')', ']', '\\'])
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }

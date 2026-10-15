@@ -240,7 +240,10 @@ async fn cameras(
             "reason": reason,
         }));
     }
-    Ok(Json(json!(cameras)))
+    Ok(Json(json!({
+        "cameras": cameras,
+        "needsLogin": state.supervisor.needs_login(),
+    })))
 }
 
 async fn camera_live(
@@ -255,10 +258,16 @@ async fn camera_live(
 }
 
 /// Discovery is lazy: the first gated call after boot or login fills the
-/// supervisor's camera list.
+/// supervisor's camera list, and a session Qubo has refused is re-tried so
+/// recovery is noticed. An auth failure here is not the request's error -
+/// the `needsLogin` flag carries it and the UI routes to login.
 async fn ensure_devices(state: &AppState) -> Result<(), ApiError> {
-    if state.supervisor.devices().await.is_empty() {
-        state.supervisor.refresh_devices().await?;
+    if state.supervisor.devices().await.is_empty() || state.supervisor.needs_login() {
+        if let Err(err) = state.supervisor.refresh_devices().await
+            && !state.supervisor.needs_login()
+        {
+            return Err(err.into());
+        }
     }
     Ok(())
 }

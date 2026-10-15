@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
@@ -26,6 +26,9 @@ const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 const PIN: &str = "2468";
+const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
+const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
+const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -128,13 +131,13 @@ async fn unlock(client: &reqwest::Client, base: &str) -> String {
 async fn mount_discovery(server: &MockServer) {
     mount_json(
         server,
-        "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units",
+        UNITS_PATH,
         json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
     )
     .await;
     mount_json(
         server,
-        "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices",
+        DEVICES_PATH,
         json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" }] })
             .to_string(),
     )
@@ -211,8 +214,85 @@ async fn the_gate_locks_cameras_and_only_the_right_pin_unlocks() {
     let cameras = response.json::<Value>().await.expect("json");
     assert_eq!(
         cameras,
-        json!([{ "id": DEVICE_ID, "name": "Hall", "state": "offline", "reason": null }]),
-        "the camera list carries id, name and state"
+        json!({
+            "cameras": [{ "id": DEVICE_ID, "name": "Hall", "state": "offline", "reason": null }],
+            "needsLogin": false,
+        }),
+        "the camera page carries the list and the login flag"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn a_refused_session_reads_as_needs_login() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    let browser = client();
+    unlock(&browser, &h.base).await;
+
+    let listed = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("first list");
+    assert_eq!(
+        listed.json::<Value>().await.expect("json")["needsLogin"],
+        json!(false),
+        "a healthy session does not ask for a login"
+    );
+
+    // The stored session dies; discovery and mint both refuse it.
+    SessionStore::new(h.data_dir.join("session.json"))
+        .save(&qubo::Session {
+            access_token: "token-dead".to_owned(),
+            uuid: "user-uuid-1".to_owned(),
+            email: None,
+        })
+        .expect("swap the session");
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-dead"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .with_priority(1)
+            .mount(&h.qubo)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    let watch = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch under a dead session");
+    assert_eq!(watch.status(), reqwest::StatusCode::OK);
+
+    let refused = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("list under a dead session");
+    assert_eq!(refused.status(), reqwest::StatusCode::OK);
+    let page = refused.json::<Value>().await.expect("json");
+    assert_eq!(
+        page["needsLogin"],
+        json!(true),
+        "a refused session routes the UI to login"
+    );
+    assert_eq!(
+        page["cameras"][0]["state"],
+        json!("degraded"),
+        "the last known camera survives the refused refresh"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

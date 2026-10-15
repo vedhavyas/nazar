@@ -263,6 +263,52 @@ async fn a_failing_mint_degrades_and_keeps_retrying() {
 }
 
 #[tokio::test]
+async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
+    // Long pacing: only the wake signal can deliver a re-mint this fast.
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    mint_mock(401, include_str!("fixtures/error_auth_002.json"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        ),
+        "the refused mint degrades the stream"
+    );
+    assert!(
+        h.supervisor.needs_login(),
+        "the refusal is remembered so the UI can route to login"
+    );
+
+    SessionStore::new(&h.sessions_path)
+        .save(&session("token-new"))
+        .expect("a fresh session");
+    mint_mock(200, &mint_body("second"))
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor.ensure_live(DEVICE_ID).await.expect("retry");
+    let recovered = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(
+        recovered,
+        "Try again re-mints immediately instead of waiting out the backoff"
+    );
+    assert!(
+        !h.supervisor.needs_login(),
+        "a healthy mint clears the login flag"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+#[tokio::test]
 async fn vod_is_reserved_for_m3() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     let err = h

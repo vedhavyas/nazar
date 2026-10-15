@@ -12,8 +12,14 @@
 
   async function refresh() {
     try {
-      cameras = await api.cameras();
+      const page = await api.cameras();
+      cameras = page.cameras;
       error = '';
+      // Qubo refused the session: only a fresh login revives the streams.
+      if (page.needsLogin) {
+        onlocked();
+        return;
+      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         onlocked();
