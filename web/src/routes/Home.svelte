@@ -11,6 +11,8 @@
   let cameras = $state<Camera[]>([]);
   /** The stream each camera was granted, by device id. */
   let streams = $state<Record<string, string>>({});
+  /** The quality each of those streams is, so a role change can be told. */
+  let qualities = $state<Record<string, Quality>>({});
   let error = $state('');
   let loaded = $state(false);
 
@@ -29,7 +31,7 @@
         return;
       }
       await house.refresh();
-      void startStreams();
+      await syncStreams();
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         onlocked();
@@ -41,11 +43,17 @@
     }
   }
 
-  /** The hero streams high, the tiles low; anything already live is left. */
-  async function startStreams() {
+  /**
+   * The hero streams high, the tiles low. A camera whose role changed is
+   * asked again at its new quality; a stream already of the right class,
+   * and still on the server, is left alone.
+   */
+  async function syncStreams() {
     for (const tile of house.tiles) {
-      if (tile.camera.state === 'live' || tile.camera.state === 'waking') continue;
-      await watch(tile.camera.id, tile.hero ? 'high' : 'low');
+      const want: Quality = tile.hero ? 'high' : 'low';
+      const settled = tile.camera.state !== 'offline' && qualities[tile.camera.id] === want;
+      if (settled) continue;
+      await watch(tile.camera.id, want);
     }
   }
 
@@ -53,6 +61,7 @@
     try {
       const started = await api.watch(id, quality);
       streams = { ...streams, [id]: started.stream };
+      qualities = { ...qualities, [id]: quality };
       cameras = cameras.map((camera) =>
         camera.id === id ? { ...camera, state: 'waking', reason: null } : camera,
       );

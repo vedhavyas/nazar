@@ -103,7 +103,7 @@ async fn harness() -> Harness {
             retry_base: Duration::from_millis(50),
             retry_max: Duration::from_millis(200),
             discovery_retry: Duration::from_secs(30),
-            tile_idle: Duration::from_secs(120),
+            stream_idle: Duration::from_secs(120),
         },
     );
     let events = EventBus::new();

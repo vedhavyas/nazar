@@ -34,17 +34,17 @@ struct Harness {
 
 /// Pacing for the quality tests: re-mints and retries are far away, so
 /// anything that happens is the idle rule's doing.
-fn pacing(tile_idle: Duration) -> Pacing {
+fn pacing(stream_idle: Duration) -> Pacing {
     Pacing {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
         discovery_retry: Duration::from_secs(30),
-        tile_idle,
+        stream_idle,
     }
 }
 
-async fn harness(tile_idle: Duration) -> Harness {
+async fn harness(stream_idle: Duration) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     mount_discovery(&qubo).await;
@@ -62,7 +62,7 @@ async fn harness(tile_idle: Duration) -> Harness {
         client,
         store,
         Go2rtc::connect(go2rtc.base.clone()),
-        pacing(tile_idle),
+        pacing(stream_idle),
     );
     supervisor.refresh_devices().await.expect("discovery");
     Harness {
