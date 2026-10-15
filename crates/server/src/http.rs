@@ -1,6 +1,7 @@
 //! The HTTP surface: the JSON API, the built SPA, and the go2rtc proxy the
 //! browser's WebRTC signalling rides.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,9 @@ pub struct AppState {
     pub events: EventBus,
     /// The hero decision, fed by the event bus.
     pub motion: Arc<Mutex<MotionOrder>>,
+    /// One lock per camera: a step is a read-modify-write, and two of them
+    /// racing read the same base and lose one another's move.
+    ptz_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     http: reqwest::Client,
 }
 
@@ -110,6 +114,7 @@ impl AppState {
             control: ControlTiming::default(),
             events: wiring.events,
             motion: wiring.motion,
+            ptz_locks: Arc::new(Mutex::new(HashMap::new())),
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -120,6 +125,18 @@ impl AppState {
                     reqwest::Client::new()
                 }),
         }
+    }
+}
+
+impl AppState {
+    /// The camera's step lock, created on first use.
+    fn ptz_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.ptz_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -350,6 +367,10 @@ async fn camera_ptz(
         ));
     }
     let (device, session) = control_target(&state, &id).await?;
+    // The read and the write are one move: a second step waits its turn,
+    // so its delta is added to the position the first one left behind.
+    let turn = state.ptz_lock(&id);
+    let _held = turn.lock().await;
     let (x, y) = read_shadow(&state.qubo, &session, &device)
         .await?
         .position()
@@ -369,6 +390,7 @@ async fn camera_ptz(
         &[("horizontalVerticalPostion", target_text.as_str())],
     )
     .await?;
+    drop(_held);
 
     let landed = await_position(&state, &device, &session, target).await?;
     Ok(Json(match landed {

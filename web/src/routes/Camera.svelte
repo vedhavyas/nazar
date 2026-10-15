@@ -103,7 +103,17 @@
     }
   }
 
+  /** A drag emits steps faster than the camera answers; one move is in
+   * flight at a time, and only the latest waiting step survives. */
+  let moving = false;
+  let waiting: { dx: number; dy: number } | null = null;
+
   async function step(dx: number, dy: number) {
+    if (moving) {
+      waiting = { dx, dy };
+      return;
+    }
+    moving = true;
     try {
       const result = await api.ptz(id, dx, dy);
       move = result.position ? `at ${result.position.x},${result.position.y}` : '';
@@ -112,6 +122,13 @@
       }
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
+    } finally {
+      moving = false;
+    }
+    const next = waiting;
+    waiting = null;
+    if (next) {
+      void step(next.dx, next.dy);
     }
   }
 

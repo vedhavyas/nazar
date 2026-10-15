@@ -257,6 +257,73 @@ async fn a_move_the_camera_never_takes_is_not_ok() {
 }
 
 #[tokio::test]
+async fn two_steps_at_once_do_not_lose_one_another() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+
+    // A camera that reports where it actually is: the shadow reflects the
+    // last write, as the real one does. A mock with canned answers cannot
+    // tell a lost update from an applied one.
+    let position = Arc::new(Mutex::new((0_i64, 0_i64)));
+    Mock::given(method("GET"))
+        .and(path(SHADOW_PATH))
+        .respond_with({
+            let position = Arc::clone(&position);
+            move |_request: &Request| {
+                let at = *position.lock().expect("the camera");
+                // A real shadow read is not instant; the delay is what
+                // makes two steps actually overlap when nothing serializes
+                // them.
+                ResponseTemplate::new(200)
+                    .set_body_string(shadow(&format!("{},{}", at.0, at.1), "enable"))
+                    .set_delay(Duration::from_millis(100))
+            }
+        })
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(COMMAND_PATH))
+        .respond_with({
+            let position = Arc::clone(&position);
+            move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("the command body");
+                let target = body["payload"]["devices"]["services"]["panTiltControl"]["attributes"]
+                    ["horizontalVerticalPostion"]
+                    .as_str()
+                    .expect("a target");
+                let (x, y) = target.split_once(',').expect("x,y");
+                *position.lock().expect("the camera") =
+                    (x.parse().expect("x"), y.parse().expect("y"));
+                ResponseTemplate::new(200).set_body_string("SUCCESS_UM_006")
+            }
+        })
+        .mount(&h.qubo)
+        .await;
+
+    // Two browsers, two connections: one client would queue the second
+    // request behind the first and the race could never show.
+    let first = client()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 10, "dy": 0 }))
+        .send();
+    let second = client()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 10, "dy": 0 }))
+        .send();
+    let (first, second) = tokio::join!(first, second);
+    for response in [first, second] {
+        let body: Value = response.expect("the call").json().await.expect("json");
+        assert_eq!(body["ok"], json!(true), "each step was applied: {body}");
+    }
+
+    assert_eq!(
+        *position.lock().expect("the camera"),
+        (20, 0),
+        "the second step added to what the first left behind, not to the same base"
+    );
+}
+
+#[tokio::test]
 async fn a_step_beyond_the_cap_is_refused() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
