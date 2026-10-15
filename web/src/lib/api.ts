@@ -34,6 +34,20 @@ export interface MotionHero {
   hero: string | null;
 }
 
+/** A move's outcome: the camera's own shadow, never its ack. */
+export interface PtzResult {
+  ok: boolean;
+  reason?: string;
+  position: { x: number; y: number } | null;
+}
+
+/** A privacy write's outcome, read back from the shadow. */
+export interface PrivacyResult {
+  ok: boolean;
+  reason?: string;
+  privacy: boolean | null;
+}
+
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -73,4 +87,13 @@ export const api = {
   watch: (id: string, quality: Quality = 'high') =>
     call<{ stream: string }>(`/api/cameras/${id}/live?quality=${quality}`, { method: 'POST' }),
   hero: () => call<MotionHero>('/api/motion/hero'),
+  ptz: (id: string, dx: number, dy: number) =>
+    call<PtzResult>(`/api/cameras/${id}/ptz`, { method: 'POST', body: JSON.stringify({ dx, dy }) }),
+  privacy: (id: string, on: boolean) =>
+    call<PrivacyResult>(`/api/cameras/${id}/privacy`, {
+      method: 'POST',
+      body: JSON.stringify({ on }),
+    }),
+  privacyState: (id: string) =>
+    call<{ privacy: boolean | null }>(`/api/cameras/${id}/privacy`),
 };

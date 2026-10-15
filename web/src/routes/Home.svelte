@@ -6,7 +6,7 @@
   import Settings from '../lib/Settings.svelte';
   import { createHero } from '../lib/useHero.svelte';
 
-  let { onlocked }: { onlocked: () => void } = $props();
+  let { onlocked, onopen }: { onlocked: () => void; onopen: (id: string) => void } = $props();
 
   let cameras = $state<Camera[]>([]);
   let error = $state('');
@@ -108,7 +108,7 @@
   <div class="house">
     {#each house.tiles as tile (tile.camera.id)}
       <div class:hero={tile.hero}>
-        <CameraTile camera={tile.camera} onwatch={retile} still={tile.still} />
+        <CameraTile camera={tile.camera} onwatch={retile} onopen={onopen} still={tile.still} />
       </div>
     {/each}
   </div>

@@ -362,6 +362,51 @@ async fn a_camera_that_never_reports_privacy_is_unknown_not_off() {
 }
 
 #[tokio::test]
+async fn the_lens_state_reads_from_the_shadow() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    mount_control(&h.qubo, vec![shadow("10,10", "disable")]).await;
+
+    let response = client()
+        .get(format!("{}/api/cameras/{DEVICE_ID}/privacy", h.base))
+        .send()
+        .await
+        .expect("the call");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("json"),
+        json!({ "privacy": true }),
+        "what the camera reports is what the screen shows on arrival"
+    );
+}
+
+#[tokio::test]
+async fn a_camera_silent_about_its_lens_reads_unknown() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("GET"))
+        .and(path(SHADOW_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"services":[{"service":"panTiltControl","attributes":{"horizontalVerticalPostion":{"value":"0,0"}}}]}"#,
+        ))
+        .mount(&h.qubo)
+        .await;
+
+    let response = client()
+        .get(format!("{}/api/cameras/{DEVICE_ID}/privacy", h.base))
+        .send()
+        .await
+        .expect("the call");
+
+    assert_eq!(
+        response.json::<Value>().await.expect("json"),
+        json!({ "privacy": null }),
+        "silence is not a lens state"
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_camera_is_not_found() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
