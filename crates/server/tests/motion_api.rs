@@ -193,6 +193,52 @@ async fn the_hero_is_the_camera_that_moved() {
 }
 
 #[tokio::test]
+async fn the_hero_follows_motion_after_a_burst_past_the_bus() {
+    let h = harness().await;
+    let browser = client();
+    let listed = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+
+    // A burst the follower cannot drain (its bus holds 256): it must come
+    // back and keep electing, not die on the first overflow.
+    for _ in 0..400 {
+        h.events.publish(UnitEvent::Liveness {
+            device_id: HALL.to_owned(),
+            online: true,
+        });
+    }
+    h.events.publish(UnitEvent::Motion {
+        device_id: GATE.to_owned(),
+    });
+
+    let mut hero = None;
+    for _ in 0..50 {
+        let body: Value = browser
+            .get(format!("{}/api/motion/hero", h.base))
+            .send()
+            .await
+            .expect("hero")
+            .json()
+            .await
+            .expect("json");
+        if body["hero"] == json!(GATE) {
+            hero = Some(body);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        hero,
+        Some(json!({ "hero": GATE })),
+        "motion after an overflow still elects"
+    );
+}
+
+#[tokio::test]
 async fn a_stream_is_asked_for_by_quality() {
     let h = harness().await;
     let browser = client();
