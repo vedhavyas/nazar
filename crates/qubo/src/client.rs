@@ -63,8 +63,16 @@ pub struct QuboClient {
     base: Url,
     sp: ServiceProvider,
     device_id: String,
-    /// The login session id the OTP flow carries from request to verify.
-    pending_login: Arc<Mutex<Option<String>>>,
+    /// The login session the OTP flow carries from request to verify.
+    pending_login: Arc<Mutex<Option<PendingLogin>>>,
+}
+
+/// The gateway's login session and the number it was issued for; verify
+/// refuses anything else, so two browsers cannot cross their codes.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingLogin {
+    pub(crate) uuid: String,
+    pub(crate) phone: String,
 }
 
 impl QuboClient {
@@ -79,11 +87,14 @@ impl QuboClient {
         }
     }
 
-    pub(crate) fn set_pending_login(&self, uuid: &str) {
-        *self.lock_pending() = Some(uuid.to_owned());
+    pub(crate) fn set_pending_login(&self, uuid: &str, phone: &str) {
+        *self.lock_pending() = Some(PendingLogin {
+            uuid: uuid.to_owned(),
+            phone: phone.to_owned(),
+        });
     }
 
-    pub(crate) fn pending_login(&self) -> Option<String> {
+    pub(crate) fn pending_login(&self) -> Option<PendingLogin> {
         self.lock_pending().clone()
     }
 
@@ -91,7 +102,7 @@ impl QuboClient {
         *self.lock_pending() = None;
     }
 
-    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<PendingLogin>> {
         self.pending_login
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -285,10 +285,14 @@ struct OtpRequest {
     phone: String,
 }
 
+/// Gated like the rest: a locked peer must not be able to burn the
+/// 60-minute resend window or send SMS under the household's number.
 async fn login_otp(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<OtpRequest>,
 ) -> Result<StatusCode, ApiError> {
+    require_unlocked(&state, &headers)?;
     request_otp(&state.qubo, &body.phone).await?;
     Ok(StatusCode::NO_CONTENT)
 }

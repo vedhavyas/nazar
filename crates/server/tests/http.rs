@@ -366,7 +366,7 @@ async fn the_unlock_throttle_caps_attempts_per_client() {
 }
 
 #[tokio::test]
-async fn login_otp_forwards_to_the_gateway() {
+async fn login_otp_is_gated_and_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
         .and(path(
@@ -375,8 +375,22 @@ async fn login_otp_forwards_to_the_gateway() {
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"uuid":"login-1"}"#))
         .mount(&h.qubo)
         .await;
+    let browser = client();
 
-    let response = client()
+    let locked = browser
+        .post(format!("{}/api/login/otp", h.base))
+        .json(&json!({ "phone": "9876543210" }))
+        .send()
+        .await
+        .expect("locked otp");
+    assert_eq!(
+        locked.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a locked peer cannot burn the resend window under the household number"
+    );
+
+    unlock(&browser, &h.base).await;
+    let response = browser
         .post(format!("{}/api/login/otp", h.base))
         .json(&json!({ "phone": "9876543210" }))
         .send()
@@ -385,7 +399,7 @@ async fn login_otp_forwards_to_the_gateway() {
     assert_eq!(
         response.status(),
         reqwest::StatusCode::NO_CONTENT,
-        "the OTP request is open and forwards"
+        "an unlocked browser forwards the request"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

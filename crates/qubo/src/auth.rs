@@ -52,7 +52,7 @@ pub async fn request_otp(client: &QuboClient, phone: &str) -> Result<(), QuboErr
     });
     let response = client.post_json(&path, &body, None).await?;
     let request: OtpRequestResponse = serde_json::from_value(response)?;
-    client.set_pending_login(&request.uuid);
+    client.set_pending_login(&request.uuid, phone);
     Ok(())
 }
 
@@ -63,10 +63,19 @@ pub async fn verify_otp(
     phone: &str,
     code: &str,
 ) -> Result<Session, QuboError> {
-    let login_uuid = client.pending_login().ok_or(QuboError::Auth {
+    let pending = client.pending_login().ok_or(QuboError::Auth {
         code: None,
         message: "no OTP was requested for this client".to_owned(),
     })?;
+    if pending.phone != phone {
+        return Err(QuboError::Auth {
+            code: None,
+            message: format!(
+                "the pending code was sent to {}; request one for {phone}",
+                pending.phone
+            ),
+        });
+    }
 
     let path = format!(
         "/sms/api/v1/sp/{}/user/phone/verify",
@@ -77,7 +86,7 @@ pub async fn verify_otp(
         "isdCode": ISD_CODE,
         "otp": code,
         "deviceAttribute": DEVICE_ATTRIBUTE,
-        "uuid": login_uuid,
+        "uuid": pending.uuid,
     });
     let response = client.post_json(&path, &body, None).await?;
 

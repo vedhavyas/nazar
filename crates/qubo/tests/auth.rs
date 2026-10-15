@@ -160,6 +160,48 @@ async fn verify_accepts_a_single_profile_object() {
 }
 
 #[tokio::test]
+async fn verify_refuses_a_different_phone_than_the_pending_code() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        REQUEST_PATH,
+        200,
+        include_str!("fixtures/otp_request.json"),
+    )
+    .await;
+    mount_json(
+        &server,
+        VERIFY_PATH,
+        200,
+        include_str!("fixtures/otp_verify.json"),
+    )
+    .await;
+
+    let client = client_for(&server);
+    request_otp(&client, "9876543210")
+        .await
+        .expect("request ok");
+
+    let err = verify_otp(&client, "9000000000", "123456")
+        .await
+        .expect_err("a different number cannot spend the code");
+    match err {
+        QuboError::Auth { message, .. } => {
+            assert!(
+                message.contains("9876543210") && message.contains("9000000000"),
+                "the refusal names both numbers: {message}"
+            );
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
+
+    let session = verify_otp(&client, "9876543210", "123456")
+        .await
+        .expect("the code still works for its own number");
+    assert_eq!(session.uuid, profile_uuid(), "the right number logs in");
+}
+
+#[tokio::test]
 async fn a_wrong_code_preserves_the_api_code() {
     let server = MockServer::start().await;
     mount_json(
