@@ -10,11 +10,14 @@
 
   let {
     camera,
+    stream,
     onwatch,
     onopen,
     still = false,
   }: {
     camera: Camera;
+    /** The go2rtc stream name the server minted for this tile. */
+    stream?: string;
     onwatch: (id: string) => void;
     onopen?: (id: string) => void;
     still?: boolean;
@@ -38,14 +41,17 @@
 
   $effect(() => {
     const stage = host;
-    if (!stage || camera.state !== 'live' || stalled) return;
+    // The name the server minted (`<device>-<quality>`); a bare device id
+    // is refused by the proxy, so a tile without one waits.
+    const name = stream;
+    if (!stage || !name || camera.state !== 'live' || stalled) return;
     void attempt; // retrying rebuilds the player
 
     const player = document.createElement('video-rtc') as VideoRtcElement;
     player.className = 'player';
     player.mode = 'webrtc';
     player.media = 'video';
-    player.src = `/go2rtc/api/ws?src=${encodeURIComponent(camera.id)}`;
+    player.src = `/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
     stage.appendChild(player);
 
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
