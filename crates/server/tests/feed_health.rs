@@ -76,6 +76,11 @@ async fn harness(
     session_check: Duration,
     motion_window: Duration,
 ) -> Harness {
+    let config = feed_config(broker.port(), quiet_window, session_check, motion_window);
+    harness_with(broker, config).await
+}
+
+async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     mount_json(
@@ -108,7 +113,6 @@ async fn harness(
         },
     );
     let events = EventBus::new();
-    let config = feed_config(broker.port(), quiet_window, session_check, motion_window);
     let _feed = MqttService::start(
         client,
         sessions.clone(),
@@ -299,6 +303,31 @@ async fn motion_keeps_the_feed_connected() {
         broker.sessions(),
         1,
         "motion is liveness: the feed stays on its connection"
+    );
+}
+
+#[tokio::test]
+async fn a_blip_after_a_healthy_stretch_keeps_the_fast_retry() {
+    // Every connection hears one heartbeat and is then dropped: each cycle
+    // was healthy, so the feed must keep coming back at the minimum delay,
+    // not climb towards the maximum.
+    let broker = common::mqtt::FakeBroker::shaky(Duration::from_millis(20)).await;
+    let config = FeedConfig {
+        retry_max: Duration::from_secs(5),
+        ..feed_config(
+            broker.port(),
+            Duration::from_secs(30),
+            Duration::from_millis(30),
+            Duration::from_secs(30),
+        )
+    };
+    let _h = harness_with(&broker, config).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        broker.sessions() >= 8,
+        "a healthy-then-dropped feed retries at the minimum delay (saw {})",
+        broker.sessions()
     );
 }
 

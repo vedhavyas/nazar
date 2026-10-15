@@ -33,6 +33,11 @@ pub enum Mode {
     /// A subscription refusal (0x80), as a broker with a dead session
     /// answers.
     Refusing,
+    /// A subscription accepted, then the connection dropped.
+    Dropping,
+    /// One heartbeat, a pause to let it land, then the connection dropped:
+    /// a feed that was healthy and then lost the broker.
+    Shaky(Duration),
 }
 
 impl FakeBroker {
@@ -55,6 +60,18 @@ impl FakeBroker {
     /// Start a broker that refuses every subscription.
     pub async fn refusing() -> Self {
         Self::start(Mode::Refusing).await
+    }
+
+    /// Start a broker that takes a subscription and then drops the
+    /// connection, as a broker restarting under a healthy feed does.
+    pub async fn dropping() -> Self {
+        Self::start(Mode::Dropping).await
+    }
+
+    /// Start a broker that delivers one heartbeat and then drops the
+    /// connection: every cycle was briefly healthy.
+    pub async fn shaky(pause: Duration) -> Self {
+        Self::start(Mode::Shaky(pause)).await
     }
 
     async fn start(mode: Mode) -> Self {
@@ -131,6 +148,21 @@ async fn serve(mut socket: TcpStream, mode: Mode, sessions: Arc<AtomicUsize>) {
                 ack.extend_from_slice(&id.to_be_bytes());
                 ack.extend_from_slice(&codes);
                 if socket.write_all(&ack).await.is_err() {
+                    return;
+                }
+                if matches!(mode, Mode::Dropping) {
+                    return;
+                }
+                if let Mode::Shaky(pause) = mode {
+                    let (topic, payload) = heartbeat();
+                    if socket
+                        .write_all(&publish_frame(&topic, &payload))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(pause).await;
                     return;
                 }
                 if let Some(every) = match mode {

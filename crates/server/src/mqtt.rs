@@ -64,6 +64,18 @@ pub enum UnitEvent {
     Liveness { device_id: String, online: bool },
 }
 
+/// How a feed cycle ended, which is what the backoff reads.
+#[derive(Debug, Clone, Copy)]
+enum FeedEnd {
+    /// Deliberate: the session moved, the house went quiet, or the broker
+    /// refused the subscription. Straight back on, no backoff.
+    Reconnect,
+    /// The connection failed, with `healthy` saying whether it ever
+    /// reached the broker: a blip after a good stretch is not a reason to
+    /// start backing off from the maximum.
+    Lost { healthy: bool },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
     #[error("no stored session yet")]
@@ -146,7 +158,16 @@ async fn run(
         match feed(&client, &sessions, &supervisor, &events, &config).await {
             // A deliberate reconnect (the session moved, or the house went
             // quiet): straight back on, no backoff.
-            Ok(()) => continue,
+            Ok(FeedEnd::Reconnect) => continue,
+            Ok(FeedEnd::Lost { healthy: true }) => {
+                tracing::warn!("the mqtt feed dropped after a healthy stretch; reconnecting");
+                backoff = config.retry_min;
+            }
+            Ok(FeedEnd::Lost { healthy: false }) => {
+                eprintln!("DIAG lost unhealthy");
+                tracing::warn!("the mqtt feed could not connect");
+                backoff = (backoff * 2).min(config.retry_max);
+            }
             Err(err @ MqttError::NoSession) => {
                 tracing::debug!(%err, "mqtt feed idles until a login lands");
                 backoff = config.retry_min;
@@ -175,7 +196,7 @@ async fn feed(
     supervisor: &Supervisor,
     events: &EventBus,
     config: &FeedConfig,
-) -> Result<(), MqttError> {
+) -> Result<FeedEnd, MqttError> {
     let Some(session) = sessions.load()? else {
         return Err(MqttError::NoSession);
     };
@@ -211,11 +232,13 @@ async fn feed(
 
     let mut last_heard = Instant::now();
     let mut last_motion = Instant::now();
+    let mut healthy = false;
     let mut check = tokio::time::interval(config.session_check);
     loop {
         tokio::select! {
             polled = stream.poll() => match polled {
                 Ok(Event::Incoming(Incoming::Publish(message))) => {
+                    healthy = true;
                     last_heard = Instant::now();
                     let Ok(payload) = std::str::from_utf8(&message.payload) else {
                         continue;
@@ -231,16 +254,20 @@ async fn feed(
                 // said no, and only a fresh connect (and the REST check
                 // behind it) can tell an expired session from a refusual.
                 Ok(Event::Incoming(Incoming::SubAck(ack))) => {
+                    healthy = true;
                     let refused = ack.return_codes.iter().any(|code| {
                         !matches!(code, rumqttc::SubscribeReasonCode::Success(_))
                     });
                     if refused {
                         tracing::warn!(?ack, "the broker refused a subscription; reconnecting");
-                        return Ok(());
+                        return Ok(FeedEnd::Reconnect);
                     }
                 }
                 Ok(_) => {}
-                Err(err) => return Err(MqttError::Connection(err.to_string())),
+                Err(err) => {
+                    tracing::warn!(%err, "the broker connection failed");
+                    return Ok(FeedEnd::Lost { healthy });
+                }
             },
             _ = check.tick() => {
                 if last_heard.elapsed() >= config.quiet_window {
@@ -248,7 +275,7 @@ async fn feed(
                         quiet = %last_heard.elapsed().as_secs(),
                         "the monitor feed has gone quiet; reconnecting"
                     );
-                    return Ok(());
+                    return Ok(FeedEnd::Reconnect);
                 }
                 // Heartbeats can keep arriving while the motion
                 // subscription is silently dead, so motion is timed on its
@@ -258,13 +285,13 @@ async fn feed(
                         quiet = %last_motion.elapsed().as_secs(),
                         "no motion for a long while; reconnecting to be sure"
                     );
-                    return Ok(());
+                    return Ok(FeedEnd::Reconnect);
                 }
                 if let Some(current) = sessions.load()?
                     && current.access_token != session.access_token
                 {
                     tracing::info!("the stored session changed; reconnecting the feed");
-                    return Ok(());
+                    return Ok(FeedEnd::Reconnect);
                 }
             }
         }
