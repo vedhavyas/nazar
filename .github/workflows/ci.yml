@@ -29,7 +29,7 @@ jobs:
       - run: cargo nextest run --workspace --no-tests=pass
 
   web:
-    name: npm run build
+    name: npm test and build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +39,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm --prefix web ci
+      - run: npm --prefix web test
       - run: npm --prefix web run build
 
   image:

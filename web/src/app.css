@@ -1,0 +1,141 @@
+/* nazar: a house at night, one light on. The picture is the only bright
+   thing; everything else stays quiet and monochrome. */
+
+:root {
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --bg: #0d1013;
+  --surface: #15191e;
+  --line: #242b33;
+  --text: #e9ebee;
+  --muted: #97a1ab;
+  --accent: #e8a33d;
+  --bad: #e5484d;
+
+  --radius: 12px;
+  --fs-title: 22px;
+  --fs-body: 15.5px;
+  --fs-label: 13px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+/* The gate screens: one column, one decision. */
+.gate {
+  max-width: 360px;
+  margin: 0 auto;
+  padding: 12vh 24px 48px;
+}
+
+.gate h1 {
+  font-size: var(--fs-title);
+}
+
+.gate .lede {
+  margin: 8px 0 28px;
+  color: var(--muted);
+}
+
+label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+
+input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+input.mono {
+  font-family: var(--mono);
+  letter-spacing: 0.12em;
+}
+
+input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn {
+  padding: 12px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.btn.go {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 620;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.error {
+  margin: 12px 0 0;
+  color: var(--bad);
+}
+
+.quiet {
+  color: var(--muted);
+}
+
+.banner {
+  margin: 0;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

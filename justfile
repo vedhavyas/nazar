@@ -9,9 +9,16 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run the Rust test suites; builds the SPA first, since the server embeds it.
-test: build-web
+# Run every test suite; builds the SPA first, since the server embeds it.
+test: build-web test-rust test-web
+
+# Run the Rust test suites.
+test-rust:
     cargo nextest run --workspace --no-tests=pass
+
+# Run the web test suites.
+test-web:
+    npm --prefix web test
 
 # Build the SPA into web/dist.
 build-web:
@@ -25,6 +32,7 @@ build: build-web
 # Run the server locally; state lands in ./.data (DATA_DIR and the binary
 # paths all take environment overrides; just checks PATH otherwise).
 run: build-web
+    mkdir -p {{justfile_directory()}}/.data
     DATA_DIR={{justfile_directory()}}/.data cargo run -p server
 
 # Build the container image.

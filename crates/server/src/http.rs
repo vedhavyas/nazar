@@ -169,9 +169,9 @@ async fn unlock(
     Json(body): Json<PinRequest>,
 ) -> Result<Response, ApiError> {
     let token = state.pin.unlock(&body.pin).map_err(|err| match err {
-        PinError::Wrong | PinError::NotSet => {
-            ApiError::new(StatusCode::UNAUTHORIZED, err.to_string())
-        }
+        // No PIN exists yet: the UI turns this into its first-run form.
+        PinError::NotSet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
+        PinError::Wrong => ApiError::new(StatusCode::UNAUTHORIZED, err.to_string()),
         other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(with_session_cookie(StatusCode::NO_CONTENT, &token))

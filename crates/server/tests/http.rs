@@ -189,8 +189,8 @@ async fn the_gate_locks_cameras_and_only_the_right_pin_unlocks() {
         .expect("unlock before any pin exists");
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "unlock refuses while no PIN is set"
+        reqwest::StatusCode::CONFLICT,
+        "unlock tells the UI that no PIN is set yet"
     );
 
     mount_discovery(&h.qubo).await;
