@@ -217,7 +217,10 @@ async fn feed(
     options.set_credentials(session.uuid.clone(), session.access_token.clone());
     options.set_keep_alive(KEEP_ALIVE);
     options.set_transport(if config.tls {
-        Transport::Tls(TlsConfiguration::default())
+        // The platform's own TLS: rumqttc's rustls path pins a webpki line
+        // with unpatched advisories, and the platform store is what the
+        // broker's public certificate verifies against.
+        Transport::Tls(TlsConfiguration::Native)
     } else {
         Transport::Tcp
     });

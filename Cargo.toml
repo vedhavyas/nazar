@@ -13,7 +13,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 qubo = { path = "crates/qubo" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+# native-tls, not rustls: rumqttc 0.25 pins rustls-webpki 0.102, which
+# carries four live RUSTSEC advisories with no patched 0.102 release.
+rumqttc = { version = "0.25", default-features = false, features = ["use-native-tls"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
