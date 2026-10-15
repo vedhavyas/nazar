@@ -331,6 +331,41 @@ async fn a_wrong_pin_is_refused_and_the_pin_is_first_run_only() {
 }
 
 #[tokio::test]
+async fn the_unlock_throttle_caps_attempts_per_client() {
+    let h = harness().await;
+    let browser = client();
+    unlock(&browser, &h.base).await;
+
+    // The helper's unlock cleared the window, so five wrong PINs stay
+    // inside the limit and the sixth try is the one refused.
+    for attempt in 1..=5 {
+        let response = browser
+            .post(format!("{}/api/unlock", h.base))
+            .json(&json!({ "pin": "0000" }))
+            .send()
+            .await
+            .expect("wrong pin");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "wrong pin {attempt} is refused as wrong, not as a flood"
+        );
+    }
+    let flooded = browser
+        .post(format!("{}/api/unlock", h.base))
+        .json(&json!({ "pin": "0000" }))
+        .send()
+        .await
+        .expect("sixth try");
+    assert_eq!(
+        flooded.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the sixth try in the window is rate-limited"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn login_otp_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))

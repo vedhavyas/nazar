@@ -1,8 +1,13 @@
 //! The HTTP surface: the JSON API, the PIN gate, the built SPA, and the
 //! go2rtc proxy the browser's WebRTC signalling rides.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -33,6 +38,79 @@ const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// The go2rtc paths the browser's player may reach through the proxy.
 const ALLOWED_PROXY_PATHS: [&str; 2] = ["api/ws", "api/webrtc"];
 
+/// A fixed-window attempt limit, keyed by client: a short PIN must not be
+/// brute-forceable, and each verify costs a 19 MiB hash.
+struct Throttle {
+    limit: u32,
+    window: Duration,
+    attempts: Mutex<HashMap<String, Attempts>>,
+    permits: Semaphore,
+}
+
+struct Attempts {
+    count: u32,
+    until: Instant,
+}
+
+impl Throttle {
+    fn new(limit: u32, window: Duration, concurrent: usize) -> Self {
+        Self {
+            limit,
+            window,
+            attempts: Mutex::new(HashMap::new()),
+            permits: Semaphore::new(concurrent),
+        }
+    }
+
+    /// Count one attempt, or say how long the client must wait.
+    fn allow(&self, key: &str) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts.len() > 64 {
+            attempts.retain(|_, entry| entry.until > now);
+        }
+        let entry = attempts.entry(key.to_owned()).or_insert(Attempts {
+            count: 0,
+            until: now + self.window,
+        });
+        if now >= entry.until {
+            *entry = Attempts {
+                count: 0,
+                until: now + self.window,
+            };
+        }
+        if entry.count >= self.limit {
+            return Err(entry.until - now);
+        }
+        entry.count += 1;
+        Ok(())
+    }
+
+    /// Forget a client's failures once it has proven itself.
+    fn clear(&self, key: &str) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+}
+
+/// The client behind caddy: the first `X-Forwarded-For` hop, else one
+/// shared bucket (a mesh peer talking to the server directly is inside the
+/// perimeter already).
+fn client_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// The WebSocket client wants a `ws://` URL; the API base is `http://`.
 fn ws_target(target: &str) -> String {
     match target.strip_prefix("http") {
@@ -59,6 +137,7 @@ pub struct AppState {
     /// go2rtc's API base the proxy forwards to.
     pub go2rtc_api: String,
     http: reqwest::Client,
+    throttle: Arc<Throttle>,
 }
 
 impl AppState {
@@ -78,6 +157,7 @@ impl AppState {
             pin,
             go2rtc_api: go2rtc_api.into(),
             http: reqwest::Client::new(),
+            throttle: Arc::new(Throttle::new(5, Duration::from_secs(60), 2)),
         }
     }
 }
@@ -169,14 +249,34 @@ async fn set_pin(
 
 async fn unlock(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<PinRequest>,
 ) -> Result<Response, ApiError> {
+    let client = client_key(&headers);
+    if let Err(wait) = state.throttle.allow(&client) {
+        tracing::warn!(client = %client, "unlock refused: too many tries");
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many tries; wait {}s", wait.as_secs().max(1)),
+        ));
+    }
+    let _verify = state.throttle.permits.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "the server is busy unlocking; try again",
+        )
+    })?;
+
     let token = state.pin.unlock(&body.pin).map_err(|err| match err {
         // No PIN exists yet: the UI turns this into its first-run form.
         PinError::NotSet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
-        PinError::Wrong => ApiError::new(StatusCode::UNAUTHORIZED, err.to_string()),
+        PinError::Wrong => {
+            tracing::warn!(client = %client, "unlock refused: wrong PIN");
+            ApiError::new(StatusCode::UNAUTHORIZED, err.to_string())
+        }
         other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
+    state.throttle.clear(&client);
     Ok(with_session_cookie(StatusCode::NO_CONTENT, &token))
 }
 
