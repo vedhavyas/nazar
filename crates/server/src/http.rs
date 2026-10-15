@@ -380,12 +380,11 @@ async fn camera_live(
 /// recovery is noticed. An auth failure here is not the request's error -
 /// the `needsLogin` flag carries it and the UI routes to login.
 async fn ensure_devices(state: &AppState) -> Result<(), ApiError> {
-    if state.supervisor.devices().await.is_empty() || state.supervisor.needs_login() {
-        if let Err(err) = state.supervisor.refresh_devices().await
-            && !state.supervisor.needs_login()
-        {
-            return Err(err.into());
-        }
+    if (state.supervisor.devices().await.is_empty() || state.supervisor.needs_login())
+        && let Err(err) = state.supervisor.refresh_devices().await
+        && !state.supervisor.needs_login()
+    {
+        return Err(err.into());
     }
     Ok(())
 }

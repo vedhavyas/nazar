@@ -123,8 +123,7 @@ impl Supervisor {
             .read()
             .await
             .get(device_id)
-            .map(|tracked| tracked.state.clone())
-            .unwrap_or(StreamState::Offline)
+            .map_or(StreamState::Offline, |tracked| tracked.state.clone())
     }
 
     /// Remember a refused session so the UI can send the browser to login.
