@@ -283,7 +283,11 @@ async fn unlock(
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     state.throttle.clear(&client);
-    Ok(with_session_cookie(StatusCode::NO_CONTENT, &token))
+    Ok(with_session_cookie(
+        StatusCode::NO_CONTENT,
+        &token,
+        is_secure(&headers),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -328,6 +332,7 @@ async fn login_verify(
     Ok(with_session_cookie(
         StatusCode::NO_CONTENT,
         &state.pin.mint_session(),
+        is_secure(&headers),
     ))
 }
 
@@ -592,9 +597,20 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-fn with_session_cookie(status: StatusCode, token: &str) -> Response {
-    let cookie = format!("nazar_session={token}; Path=/; HttpOnly; SameSite=Lax");
+fn with_session_cookie(status: StatusCode, token: &str, secure: bool) -> Response {
+    // Secure only when caddy terminated TLS: a plain-http local run would
+    // otherwise have its cookie dropped by the browser.
+    let secure = if secure { "; Secure" } else { "" };
+    let cookie = format!("nazar_session={token}; Path=/; HttpOnly; SameSite=Lax{secure}");
     ([(header::SET_COOKIE, cookie)], status).into_response()
+}
+
+/// Whether the request reached us over TLS, as caddy reports it.
+fn is_secure(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
 }
 
 /// Run blocking work (Argon2 hashing, fsyncs) off the runtime's worker

@@ -572,6 +572,57 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
 }
 
 #[tokio::test]
+async fn the_cookie_is_secure_only_behind_tls() {
+    let h = harness().await;
+    let client = client();
+
+    let local = client
+        .post(format!("{}/api/pin", h.base))
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("set pin");
+    assert_eq!(local.status(), reqwest::StatusCode::NO_CONTENT);
+    let plain = client
+        .post(format!("{}/api/unlock", h.base))
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("unlock");
+    let plain_cookie = plain
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("a cookie")
+        .to_str()
+        .expect("a header value")
+        .to_owned();
+    assert!(
+        !plain_cookie.contains("Secure"),
+        "a plain-http run must keep a usable cookie: {plain_cookie}"
+    );
+
+    let behind_tls = client
+        .post(format!("{}/api/unlock", h.base))
+        .header("x-forwarded-proto", "https")
+        .json(&json!({ "pin": PIN }))
+        .send()
+        .await
+        .expect("unlock behind caddy");
+    let secure_cookie = behind_tls
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("a cookie")
+        .to_str()
+        .expect("a header value")
+        .to_owned();
+    assert!(
+        secure_cookie.contains("Secure") && secure_cookie.contains("HttpOnly"),
+        "behind TLS the cookie is Secure and HttpOnly: {secure_cookie}"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn a_gateway_auth_failure_reads_as_unauthorized() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
