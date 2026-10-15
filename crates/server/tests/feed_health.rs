@@ -236,20 +236,36 @@ async fn a_fresh_login_reconnects_the_feed() {
 
 #[tokio::test]
 async fn a_refused_subscription_reconnects_the_feed() {
-    // The quiet window is long, so only the broker's refusal can move it.
+    // The quiet window is long, so only the broker's refusal can move it,
+    // and the retry ceiling is far away so a bypass of the backoff shows as
+    // a burst of sessions.
     let broker = common::mqtt::FakeBroker::refusing().await;
-    let _h = harness(
-        &broker,
-        Duration::from_secs(30),
-        Duration::from_millis(30),
-        Duration::from_secs(30),
-    )
-    .await;
+    let config = FeedConfig {
+        retry_max: Duration::from_secs(5),
+        ..feed_config(
+            broker.port(),
+            Duration::from_secs(30),
+            Duration::from_millis(30),
+            Duration::from_secs(30),
+        )
+    };
+    let _h = harness_with(&broker, config).await;
 
     let reconnected = common::eventually(|| async { broker.sessions() >= 2 }).await;
     assert!(
         reconnected,
         "a subscription the broker refuses is not a quiet house: the feed reconnects"
+    );
+
+    // ...and it reconnects on the backoff, not in a hot loop: each attempt
+    // costs a REST call and a handshake, and a broker that keeps refusing
+    // must not be hammered. With retry_max at five seconds, a burst of
+    // attempts here would mean the refusal bypassed the backoff.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        broker.sessions() <= 8,
+        "a refusal is retried on the backoff, not in a hot loop (saw {})",
+        broker.sessions()
     );
 }
 
