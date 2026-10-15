@@ -294,8 +294,8 @@ impl Supervisor {
             }
             if let Some(idle_for) = idle_since
                 && idle_for >= idle
+                && self.teardown_if_idle(&name, idle_for).await
             {
-                self.teardown(&name).await;
                 return;
             }
             wait = match self.mint_and_swap(&device, quality).await {
@@ -357,6 +357,19 @@ impl Supervisor {
         }
         self.needs_login.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Drop the stream only if the entry this loop decided about is still
+    /// the entry that is there: a request that landed while the loop was
+    /// deciding belongs to somebody who is watching, and must not have its
+    /// stream deleted under it.
+    async fn teardown_if_idle(&self, name: &str, seen: Duration) -> bool {
+        if self.idle_for(name).await != Some(seen) {
+            tracing::debug!(stream = name, "a request landed; the stream is not idle");
+            return false;
+        }
+        self.teardown(name).await;
+        true
     }
 
     /// Drop a stream nobody asked for: go2rtc's copy and the tracked
