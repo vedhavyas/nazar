@@ -1,11 +1,14 @@
 //! Nazar's server binary.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Context as _;
 use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
 use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
+use server::motion::MotionOrder;
 use server::mqtt::{FeedConfig, MqttService};
 use server::supervisor::{Pacing, Supervisor};
 use tracing_subscriber::EnvFilter;
@@ -31,11 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
     let events = EventBus::new();
+    let motion = Arc::new(Mutex::new(MotionOrder::new()));
+    let _motion = server::motion::follow(&events, Arc::clone(&motion));
     let _mqtt = MqttService::start(
         qubo.clone(),
         sessions.clone(),
         supervisor.clone(),
-        events,
+        events.clone(),
         FeedConfig::default(),
     );
 
@@ -59,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
             qubo,
             supervisor,
             go2rtc_api: server::go2rtc::API_BASE.to_owned(),
+            events,
+            motion,
         },
     );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT))

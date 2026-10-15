@@ -36,6 +36,34 @@ function liveTile() {
   return { onwatch };
 }
 
+test('away mode shows a still over the tile it already streams', async () => {
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+    onwatch,
+    still: true,
+  });
+
+  expect(
+    document.querySelector('canvas.still'),
+    'the tile shows a still rather than the live picture',
+  ).toBeTruthy();
+  expect(
+    document.querySelector('.stage.hidden'),
+    'the live picture is hidden, not stopped',
+  ).toBeTruthy();
+  expect(
+    document.querySelector('video-rtc'),
+    'the tile keeps its own stream: the still comes from it, with no server work added',
+  ).toBeTruthy();
+});
+
+test('a live tile carries no still', () => {
+  liveTile();
+
+  expect(document.querySelector('canvas.still')).toBeNull();
+});
+
 async function videoOf(): Promise<HTMLVideoElement> {
   const video = document.querySelector('video-rtc video');
   expect(video, 'the player grew a video').toBeTruthy();

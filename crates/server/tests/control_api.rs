@@ -5,14 +5,16 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, ControlTiming, Wiring, app};
+use server::motion::MotionOrder;
 use server::supervisor::{Pacing, Supervisor};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
@@ -74,6 +76,8 @@ async fn harness() -> Harness {
             qubo: client,
             supervisor,
             go2rtc_api: go2rtc.base.to_string(),
+            events: EventBus::new(),
+            motion: Arc::new(Mutex::new(MotionOrder::new())),
         },
     );
     // The poll window is a knob so a write that never lands does not cost

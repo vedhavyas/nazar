@@ -6,6 +6,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -17,8 +18,10 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
+use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
+use server::motion::MotionOrder;
 use server::supervisor::{Pacing, Supervisor};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
@@ -76,6 +79,8 @@ async fn harness() -> Harness {
             qubo: client,
             supervisor,
             go2rtc_api: go2rtc.base.to_string(),
+            events: EventBus::new(),
+            motion: Arc::new(Mutex::new(MotionOrder::new())),
         },
     );
 

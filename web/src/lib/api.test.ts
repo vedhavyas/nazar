@@ -67,5 +67,12 @@ test('watching a camera calls its live route', async () => {
   const watch = await api.watch('cam-1');
 
   expect(watch.stream, 'the stream name comes back').toBe('cam-1');
-  expect(fetchMock.mock.calls[0][0], 'the route').toBe('/api/cameras/cam-1/live');
+  expect(fetchMock.mock.calls[0][0], 'the route, high by default').toBe(
+    '/api/cameras/cam-1/live?quality=high',
+  );
+
+  await api.watch('cam-1', 'low');
+  expect(fetchMock.mock.calls[1][0], 'a tile asks for the low stream').toBe(
+    '/api/cameras/cam-1/live?quality=low',
+  );
 });

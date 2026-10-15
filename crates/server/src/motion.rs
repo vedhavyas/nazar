@@ -1,7 +1,28 @@
 //! Which camera holds the hero tile.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::events::EventBus;
+use crate::mqtt::UnitEvent;
+
+/// Record every motion the bus carries, against the arrival clock the
+/// hysteresis reads: the server owns the hero decision, so the browser
+/// never has to order cameras itself.
+pub fn follow(events: &EventBus, order: Arc<Mutex<MotionOrder>>) -> tokio::task::JoinHandle<()> {
+    let mut events = events.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if let UnitEvent::Motion { device_id } = event {
+                order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .motion(&device_id, Instant::now());
+            }
+        }
+    })
+}
 
 /// How much more recent a challenger must be than the incumbent, and how
 /// long the hero is held, before the tile may change hands. Motion arrives
