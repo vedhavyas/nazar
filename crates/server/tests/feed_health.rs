@@ -316,7 +316,10 @@ async fn motion_keeps_the_feed_connected() {
         .await
         .expect("a motion event arrives")
         .expect("the subscription is live");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Past the window itself, not just into it: the motion stream has to
+    // hold the feed open for longer than the window it would otherwise
+    // trip.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
 
     assert_eq!(
         broker.sessions(),
