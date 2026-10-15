@@ -47,7 +47,7 @@ test('a failed call without the envelope falls back to the status line', async (
   expect(failure.message, 'a non-envelope body still yields a reason').toContain('502');
 });
 
-test('every call asks for same-origin credentials and the documented shape', async () => {
+test('every call sends the documented shape', async () => {
   const fetchMock = stubFetch(204, '');
 
   await api.verifyOtp('9876543210', '123456');
@@ -55,7 +55,7 @@ test('every call asks for same-origin credentials and the documented shape', asy
   const [path, init] = fetchMock.mock.calls[0];
   expect(path, 'the route').toBe('/api/login/verify');
   expect(init?.method, 'the method').toBe('POST');
-  expect(init?.credentials, 'the session cookie rides along').toBe('same-origin');
+  expect(init?.credentials, 'there is no cookie to carry').toBeUndefined();
   expect(init?.body, 'the body').toBe(
     JSON.stringify({ phone: '9876543210', code: '123456' }),
   );
