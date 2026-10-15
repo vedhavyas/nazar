@@ -170,6 +170,20 @@ test('a live tile carries no still', () => {
   expect(document.querySelector('canvas.still')).toBeNull();
 });
 
+test('a live tile waiting on its stream name says so', () => {
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+    onwatch,
+  });
+
+  expect(
+    screen.getByText(/Starting the stream/),
+    'the window before the mint lands reads as starting, not as not streaming',
+  ).toBeTruthy();
+  expect(screen.queryByText(/Not streaming/), 'never as a dead camera').toBeNull();
+});
+
 async function videoOf(): Promise<HTMLVideoElement> {
   const video = document.querySelector('video-rtc video');
   expect(video, 'the player grew a video').toBeTruthy();
