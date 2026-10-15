@@ -82,6 +82,10 @@ async fn list_devices_reads_the_real_device_schema() {
             device.unit_id, UNIT,
             "the unit the device was listed under is carried"
         );
+        assert_eq!(
+            device.entity_id, raw["entityUUID"],
+            "the entity the device was listed under is carried"
+        );
     }
 }
 
@@ -123,6 +127,10 @@ async fn list_devices_deduplicates_and_skips_records_without_an_id() {
     assert_eq!(
         devices[1].name, "Qubo d00000",
         "a nameless device gets a placeholder name"
+    );
+    assert_eq!(
+        devices[1].entity_id, "default",
+        "a device listed without an entity falls back to the documented placeholder"
     );
 }
 

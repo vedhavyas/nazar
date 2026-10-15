@@ -1,0 +1,22 @@
+{
+  "services": [
+    {
+      "service": "panTiltControl",
+      "attributes": { "horizontalVerticalPostion": { "value": "10,-20" } },
+      "instanceId": 0
+    },
+    {
+      "service": "cameraFunction",
+      "attributes": { "state": "disable" }
+    },
+    {
+      "service": "wifiSettings",
+      "attributes": {
+        "SSIDName": { "value": "HomeWifi" },
+        "signalStrength": { "value": -55 }
+      },
+      "instanceId": 0
+    }
+  ],
+  "timestamp": 1791974501206
+}

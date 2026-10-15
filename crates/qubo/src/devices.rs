@@ -15,6 +15,7 @@ pub struct Device {
     pub name: String,
     pub device_type: String,
     pub unit_id: String,
+    pub entity_id: String,
 }
 
 /// Every device under every unit of the account, one entry per device.
@@ -113,11 +114,16 @@ fn device_of(value: &Value, unit_id: &str) -> Option<Device> {
     let name = string_of(value, &["deviceName", "name"])
         .unwrap_or_else(|| format!("Qubo {}", device_id.get(..6).unwrap_or(&device_id)));
     let device_type = string_of(value, &["deviceType", "type"]).unwrap_or_default();
+    // Shadow and command paths carry the entity; the placeholder is the
+    // reference client's fallback for a listing that omits it.
+    let entity_id =
+        string_of(value, &["entityUUID", "entityId"]).unwrap_or_else(|| "default".to_owned());
     Some(Device {
         device_id,
         name,
         device_type,
         unit_id: unit_id.to_owned(),
+        entity_id,
     })
 }
 

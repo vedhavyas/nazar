@@ -154,6 +154,19 @@ impl QuboClient {
         self.send(Method::POST, path, query, Some(body), auth).await
     }
 
+    /// PUT a JSON `body` and ignore the body it answers with. Device
+    /// commands ack every shape alike, so the ack is not worth parsing.
+    pub async fn put_ack(
+        &self,
+        path: &str,
+        body: &Value,
+        auth: Option<&Session>,
+    ) -> Result<(), QuboError> {
+        self.send_raw(Method::PUT, path, &[], Some(body), auth)
+            .await
+            .map(drop)
+    }
+
     async fn send(
         &self,
         method: Method,
@@ -162,6 +175,21 @@ impl QuboClient {
         body: Option<&Value>,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
+        let text = self.send_raw(method, path, query, body, auth).await?;
+        if text.trim().is_empty() {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    async fn send_raw(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        auth: Option<&Session>,
+    ) -> Result<String, QuboError> {
         let url = self.url_for(path, query)?;
         let mut request = self
             .http
@@ -189,10 +217,7 @@ impl QuboClient {
         tracing::debug!(status = status.as_u16(), path, "qubo response");
 
         if status.is_success() {
-            if text.trim().is_empty() {
-                return Ok(Value::Object(serde_json::Map::new()));
-            }
-            return Ok(serde_json::from_str(&text)?);
+            return Ok(text);
         }
         Err(error_for_status(status, &text))
     }
