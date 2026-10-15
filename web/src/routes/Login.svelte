@@ -43,7 +43,7 @@
     {#if step === 'phone'}
       The cameras live behind the family's Qubo account. Nazar will text a code to your phone.
     {:else}
-      Enter the code we sent to {phone}.
+      Nazar sent a code to {phone}. Type it here.
     {/if}
   </p>
 
