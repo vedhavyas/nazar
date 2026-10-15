@@ -23,11 +23,6 @@ services:
       RUST_LOG: info
       QUBO_SP: d10e4bfb0153496e8e8bb955f7ebe413
       NAZAR_WEBRTC_CANDIDATES: 198.51.100.1:8555
-      # Caddy's exact address: with this set, unlock throttling keys on the real
-      # client IP. Leave it empty and every viewer shares one bucket (any peer
-      # could lock the household out of unlock with 5 tries/min). Never trust a
-      # whole subnet here.
-      NAZAR_TRUSTED_PROXY: "198.51.100.4"
     volumes:
       - $DATA_DIR/nazar:/data
     networks:
