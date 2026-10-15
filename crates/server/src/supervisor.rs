@@ -280,6 +280,7 @@ impl Supervisor {
             } else {
                 self.idle_for(&name).await
             };
+            let seen_at = self.last_request_at(&name).await;
             let sleep_for = match idle_since {
                 Some(idle_for) => wait.min(idle.saturating_sub(idle_for)),
                 // Watched: wake again within a window, so a viewer who
@@ -292,9 +293,9 @@ impl Supervisor {
                     tracing::info!(stream = %name, "remint forced by a retry");
                 }
             }
-            if let Some(idle_for) = idle_since
+            if let (Some(idle_for), Some(seen_at)) = (idle_since, seen_at)
                 && idle_for >= idle
-                && self.teardown_if_idle(&name, idle_for).await
+                && self.teardown_if_idle(&name, seen_at).await
             {
                 return;
             }
@@ -362,14 +363,24 @@ impl Supervisor {
     /// Drop the stream only if the entry this loop decided about is still
     /// the entry that is there: a request that landed while the loop was
     /// deciding belongs to somebody who is watching, and must not have its
-    /// stream deleted under it.
-    async fn teardown_if_idle(&self, name: &str, seen: Duration) -> bool {
-        if self.idle_for(name).await != Some(seen) {
+    /// stream deleted under it. The last request is the entry's identity -
+    /// an elapsed duration just keeps growing and can never be compared.
+    async fn teardown_if_idle(&self, name: &str, seen_at: Instant) -> bool {
+        if self.last_request_at(name).await != Some(seen_at) {
             tracing::debug!(stream = name, "a request landed; the stream is not idle");
             return false;
         }
         self.teardown(name).await;
         true
+    }
+
+    /// When the stream was last asked for, if it is still known.
+    async fn last_request_at(&self, name: &str) -> Option<Instant> {
+        self.state
+            .read()
+            .await
+            .get(name)
+            .map(|tracked| tracked.last_request)
     }
 
     /// Drop a stream nobody asked for: go2rtc's copy and the tracked
