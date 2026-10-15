@@ -31,15 +31,41 @@ function liveTile() {
   const onwatch = vi.fn();
   render(CameraTile, {
     camera: { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+    stream: 'cam-1-high',
     onwatch,
   });
   return { onwatch };
 }
 
+test('the player asks for the stream the server minted', async () => {
+  liveTile();
+
+  const player = document.querySelector('video-rtc');
+  expect(player, 'a live tile holds a player').toBeTruthy();
+  expect(
+    (player as HTMLElement & { src?: string }).src,
+    'the source is the minted <device>-<quality> name, never a bare device id',
+  ).toBe('/go2rtc/api/ws?src=cam-1-high');
+});
+
+test('a tile with no minted stream yet holds no player', () => {
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+    onwatch,
+  });
+
+  expect(
+    document.querySelector('video-rtc'),
+    'nothing is asked for until the server has named the stream',
+  ).toBeNull();
+});
+
 test('away mode shows a still over the tile it already streams', async () => {
   const onwatch = vi.fn();
   render(CameraTile, {
     camera: { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+    stream: 'cam-1-low',
     onwatch,
     still: true,
   });

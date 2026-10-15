@@ -9,6 +9,8 @@
   let { onlocked, onopen }: { onlocked: () => void; onopen: (id: string) => void } = $props();
 
   let cameras = $state<Camera[]>([]);
+  /** The stream each camera was granted, by device id. */
+  let streams = $state<Record<string, string>>({});
   let error = $state('');
   let loaded = $state(false);
 
@@ -49,7 +51,8 @@
 
   async function watch(id: string, quality: Quality) {
     try {
-      await api.watch(id, quality);
+      const started = await api.watch(id, quality);
+      streams = { ...streams, [id]: started.stream };
       cameras = cameras.map((camera) =>
         camera.id === id ? { ...camera, state: 'waking', reason: null } : camera,
       );
@@ -108,7 +111,13 @@
   <div class="house">
     {#each house.tiles as tile (tile.camera.id)}
       <div class:hero={tile.hero}>
-        <CameraTile camera={tile.camera} onwatch={retile} onopen={onopen} still={tile.still} />
+        <CameraTile
+          camera={tile.camera}
+          stream={streams[tile.camera.id]}
+          onwatch={retile}
+          onopen={onopen}
+          still={tile.still}
+        />
       </div>
     {/each}
   </div>
