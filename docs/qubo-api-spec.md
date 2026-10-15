@@ -179,7 +179,7 @@ Classes in `qubopy/exceptions.py` (all inherit `QuboError`):
 
 HTTP mapping inside `QuboClient.request` (qubopy/client.py:102-132): 401 with a refresh token -> refresh and retry once; 401/403 otherwise -> `QuboAuthError`; any other non-200/201/204 -> `QuboCommandError`; 204 or empty body -> `{}`.
 
-Server error body shapes: the code only logs them (debug, first 200 chars). One server error code is known by name: `ERR_AUTH_002` ("Invalid/Expired Token"), matched in the CLI's error handler (qubopy/cli.py:161-166) and mapped to a "session expired" message with phone re-login guidance. The rest of the server's error envelope is UNKNOWN.
+Server error body shapes: the code only logs them (debug, first 200 chars); the envelope itself was captured live 2026-10-15: `{"code": "...", "message": ["..."]}` - `message` is an ARRAY of strings (confirmed in three independent sites: a live 401, and the app's own OTP error handling twice). Named codes: `ERR_AUTH_002` ("Invalid/Expired Token"; also matched in qubopy/cli.py:161-166), `ERR_OTP_001` (wrong OTP; decompile `Y4.java:1850`), `ERR_SM_057` (OTP resend rate limit; observed live 2026-10-13, reported window "try after 15 minutes"). The full code catalogue remains open.
 
 ## 4. REST endpoint catalog
 
