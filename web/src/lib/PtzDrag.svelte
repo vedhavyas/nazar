@@ -1,7 +1,12 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
+
   /** Drag to pan. A step goes out once per window at most: a finger emits
    * tens of moves a second and the camera does not want them all. */
-  let { onstep }: { onstep: (dx: number, dy: number) => void } = $props();
+  let {
+    onstep,
+    children,
+  }: { onstep: (dx: number, dy: number) => void; children?: Snippet } = $props();
 
   /** The camera's axes run opposite the screen's (spike, hardware-proven):
    * a leftward drag is a positive x step, an upward drag a positive y. */
@@ -93,19 +98,25 @@
   }
 </script>
 
+<!-- A pan/tilt surface has no matching ARIA widget: `application` is the
+     honest role for a region that owns the arrow keys and the pointer, and
+     the two rules below flag exactly that. The keyboard path is real. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
   class="pad"
   class:dragging
   data-testid="ptz-surface"
-  tabindex="0"
+  role="application"
   aria-label="Drag the picture, or use the arrow keys, to pan and tilt"
+  tabindex="0"
   onpointerdown={onpointerdown}
   onpointermove={onpointermove}
   onpointerup={onpointerup}
   onpointercancel={onpointerup}
   onkeydown={onkeydown}
 >
-  <slot />
+  {@render children?.()}
   {#if hint}
     <span class="arrow" data-testid="ptz-arrow">{hint}</span>
   {/if}
