@@ -257,6 +257,46 @@ async fn a_move_the_camera_never_takes_is_not_ok() {
 }
 
 #[tokio::test]
+async fn a_step_beyond_the_cap_is_refused() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    mount_control(&h.qubo, vec![shadow("10,10", "enable")]).await;
+
+    let response = client()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 100_000, "dy": 0 }))
+        .send()
+        .await
+        .expect("the call");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["error"],
+        json!("a step is at most 60 units"),
+        "the refusal says what the limit is"
+    );
+    assert!(
+        command_bodies(&h.qubo).await.is_empty(),
+        "nothing reaches the camera"
+    );
+
+    // One at the cap still goes through.
+    let at_cap = client()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 60, "dy": 0 }))
+        .send()
+        .await
+        .expect("the call");
+    assert_eq!(at_cap.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        command_bodies(&h.qubo).await.len(),
+        1,
+        "a step at the cap is a step"
+    );
+}
+
+#[tokio::test]
 async fn a_camera_without_a_reported_position_cannot_be_stepped() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
