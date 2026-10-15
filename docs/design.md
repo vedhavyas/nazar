@@ -16,7 +16,7 @@ Success: open `nazar.hub` (or the desktop/Android app) from anywhere on the mesh
   - The one family Qubo account session (durable login; section 4).
   - MQTT subscription to the unit (`/monitor`, `/control`, `/config`) - the live event source.
   - Stream machinery per camera: the proven pipeline - per-session mint (5-minute sessions, automatic re-mint) feeding go2rtc, which transcodes HEVC (browsers cannot play it) to H.264 and passes audio (AAC 16 kHz mono) through.
-  - Delivery to clients: **WebRTC primary**, carried over direct candidates on the WireGuard address (`NAZAR_WEBRTC_CANDIDATES`; media port 8555 bound to the WG interface - decision 2026-10-15, direct beats a relay on a mesh where every viewer is a WG peer). The hub's coturn (`webrtc.ice_servers`) stands as the documented fallback if a client cannot reach the direct candidate. HLS remains the compatibility fallback, owned by M2's player task.
+  - Delivery to clients: **WebRTC primary**, carried over direct candidates - the hub deployment advertises the container's pinned static-network address (`NAZAR_WEBRTC_CANDIDATES`, verified peer-reachable over WG; host-port binds are not, measured 2026-10-15). The hub's coturn (`webrtc.ice_servers`) stands as the documented fallback if a client cannot reach the direct candidate. HLS remains the compatibility fallback, owned by M2's player task.
   - Recording playback: cloud-allocated VOD sessions (section 6).
   - Notification fan-out to connected clients over the client protocol.
   - The P2P engine (the extracted reference client), running in parallel and flag-gated; it becomes the fast lane and carries talkback the moment it proves itself in our own app (section 7).
