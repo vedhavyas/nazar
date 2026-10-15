@@ -22,9 +22,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     let go2rtc = Go2rtc::start(&config).context("starting go2rtc")?;
-    let qubo = QuboClient::new(
+    let qubo = QuboClient::with_device_id(
         BASE_URL.parse().context("the gateway URL parses")?,
         config.service_provider.clone(),
+        config.device_id(),
     );
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());

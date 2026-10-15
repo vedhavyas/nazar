@@ -78,11 +78,17 @@ pub(crate) struct PendingLogin {
 impl QuboClient {
     /// Build a client carrying a fresh `Source-Device-Id`.
     pub fn new(base: Url, sp: ServiceProvider) -> Self {
+        Self::with_device_id(base, sp, Uuid::new_v4().to_string())
+    }
+
+    /// Build a client with the caller's persisted `Source-Device-Id`, so
+    /// restarts do not add device rows to the account.
+    pub fn with_device_id(base: Url, sp: ServiceProvider, device_id: String) -> Self {
         Self {
             http: reqwest::Client::new(),
             base,
             sp,
-            device_id: Uuid::new_v4().to_string(),
+            device_id,
             pending_login: Arc::new(Mutex::new(None)),
         }
     }
