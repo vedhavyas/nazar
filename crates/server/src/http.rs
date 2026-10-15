@@ -257,6 +257,11 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
 
     let mut cameras = Vec::new();
     for device in state.supervisor.devices().await {
+        // The account carries more than cameras: purifiers and the app's
+        // own row would render as useless offline tiles.
+        if !device.is_camera() {
+            continue;
+        }
         let (name, reason) = match state.supervisor.status(&device.device_id).await {
             StreamState::Offline => ("offline", None),
             StreamState::Waking => ("waking", None),

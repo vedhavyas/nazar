@@ -18,6 +18,16 @@ pub struct Device {
     pub entity_id: String,
 }
 
+impl Device {
+    /// Whether this is one of the camera families. The model prefixes are
+    /// the reference client's (HCP, HCO, HCD: `qubopy/devices/camera.py`);
+    /// a listing that does not say what a device is keeps it, because
+    /// hiding a camera is far worse than showing a purifier.
+    pub fn is_camera(&self) -> bool {
+        self.device_type.is_empty() || self.device_type.starts_with("HC")
+    }
+}
+
 /// Every device under every unit of the account, one entry per device.
 pub async fn list_devices(
     client: &QuboClient,
