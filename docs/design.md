@@ -37,6 +37,7 @@ Interfaces are deliberately transport-thin: any client that can speak the protoc
 - The server holds ONE Qubo account session for the family.
 - **Durable login is the target**: the Google path returns a refresh token (unlike the phone-OTP path, which expires hourly with no refresh). The server mints the Google ID token using the app's own OAuth client id, extracted from the APK - this is the standard private-client approach and is the one experiment that must succeed early (section 9). Until it does, the server's login screen takes a phone OTP code (typed once; works today).
 - Client access: the WireGuard mesh IS the perimeter (the hub's model) - no app-level gate. Ved's ruling, 2026-10-15: the PIN was my defense-in-depth addition and he removed it; the perimeter, not an app lock, is the access control. Devices are identified for presence and per-device preferences.
+- Login-route abuse is bounded by the perimeter, not a server throttle (decision 2026-10-16, after the gate removal took the rate limiter with it): anything that reaches the port is a mesh peer, so the OTP routes stay unthrottled by design, and that decision is recorded rather than silently inherited.
 
 ## 5. Live viewing
 
