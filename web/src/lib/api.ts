@@ -84,8 +84,11 @@ export const api = {
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
   verifyOtp: (phone: string, code: string) => post('/api/login/verify', { phone, code }),
   cameras: () => call<Cameras>('/api/cameras'),
-  watch: (id: string, quality: Quality = 'high') =>
-    call<{ stream: string }>(`/api/cameras/${id}/live?quality=${quality}`, { method: 'POST' }),
+  watch: (id: string, quality: Quality = 'high', retry = false) =>
+    call<{ stream: string }>(
+      `/api/cameras/${id}/live?quality=${quality}${retry ? '&retry=1' : ''}`,
+      { method: 'POST' },
+    ),
   hero: () => call<MotionHero>('/api/motion/hero'),
   ptz: (id: string, dx: number, dy: number) =>
     call<PtzResult>(`/api/cameras/${id}/ptz`, { method: 'POST', body: JSON.stringify({ dx, dy }) }),

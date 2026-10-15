@@ -88,13 +88,15 @@ fn mint_body(quality: &str) -> String {
     .to_string()
 }
 
-async fn mount_mint(server: &MockServer, quality: &str, status: u16, body: String) {
+fn mint_mock(quality: &str, status: u16, body: String) -> Mock {
     Mock::given(method("POST"))
         .and(path(MINT_PATH))
         .and(query_param("type", quality))
         .respond_with(ResponseTemplate::new(status).set_body_string(body))
-        .mount(server)
-        .await;
+}
+
+async fn mount_mint(server: &MockServer, quality: &str, status: u16, body: String) {
+    mint_mock(quality, status, body).mount(server).await;
 }
 
 async fn mount_discovery(server: &MockServer) {
@@ -128,11 +130,11 @@ async fn the_hero_and_a_tile_are_two_streams() {
     mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the hero wakes");
     h.supervisor
-        .ensure(DEVICE_ID, Quality::Low)
+        .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the tile wakes");
 
@@ -172,15 +174,15 @@ async fn asking_again_reuses_the_stream() {
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the hero wakes");
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("a second ask reuses");
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("and so does a third");
 
@@ -197,7 +199,7 @@ async fn an_idle_tile_is_dropped() {
     mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::Low)
+        .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -229,7 +231,7 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
     h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 1);
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::Low)
+        .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the tile wakes");
     // Nobody asks again: a home that is watching holds the stream open,
@@ -266,7 +268,7 @@ async fn a_watched_tile_is_kept() {
 
     for _ in 0..6 {
         h.supervisor
-            .ensure(DEVICE_ID, Quality::Low)
+            .ensure(DEVICE_ID, Quality::Low, false)
             .await
             .expect("the tile wakes");
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -300,11 +302,11 @@ async fn a_failing_quality_leaves_the_other_stream_alone() {
     mount_mint(&h.qubo, "low", 500, "boom".to_owned()).await;
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the hero wakes");
     h.supervisor
-        .ensure(DEVICE_ID, Quality::Low)
+        .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("a refused tile still registers");
 
@@ -332,12 +334,79 @@ async fn a_failing_quality_leaves_the_other_stream_alone() {
 }
 
 #[tokio::test]
+async fn only_a_persons_retry_skips_the_backoff() {
+    let h = harness(Duration::from_secs(30)).await;
+    // The camera refuses once, then answers; the first mint takes the
+    // refusal, every later one the success.
+    mint_mock("high", 500, "boom".to_owned())
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock("high", 200, mint_body("high"))
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        ),
+        "a refused mint degrades the stream"
+    );
+
+    // A page that keeps asking (the poll) must not hammer a down camera:
+    // the loop's own backoff is 30s here, so any second mint is the wake.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("asking again");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(mint_calls(&h.qubo).await, 1, "a poll's ask does not re-mint");
+
+    // The person presses Try again; the camera answers now.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the retry");
+
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(
+        live,
+        "the person's retry re-mints promptly (mints: {})",
+        mint_calls(&h.qubo).await
+    );
+    assert_eq!(mint_calls(&h.qubo).await, 2, "one mint per ask, not a storm");
+}
+
+async fn mint_calls(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("the requests")
+        .iter()
+        .filter(|request| request.url.path() == MINT_PATH)
+        .count()
+}
+
+#[tokio::test]
 async fn an_unknown_camera_is_refused() {
     let h = harness(Duration::from_secs(30)).await;
 
     let outcome = h
         .supervisor
-        .ensure("0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", Quality::High)
+        .ensure("0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", Quality::High, false)
         .await;
     assert!(
         matches!(

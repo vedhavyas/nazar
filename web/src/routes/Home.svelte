@@ -57,9 +57,9 @@
     }
   }
 
-  async function watch(id: string, quality: Quality) {
+  async function watch(id: string, quality: Quality, retry = false) {
     try {
-      const started = await api.watch(id, quality);
+      const started = await api.watch(id, quality, retry);
       streams = { ...streams, [id]: started.stream };
       qualities = { ...qualities, [id]: quality };
       cameras = cameras.map((camera) =>
@@ -73,7 +73,7 @@
   /** A tile asks for the stream its role and its own state imply. */
   function retile(id: string) {
     const tile = house.tiles.find((entry) => entry.camera.id === id);
-    void watch(id, tile?.hero === true ? 'high' : 'low').then(refresh);
+    void watch(id, tile?.hero === true ? 'high' : 'low', true).then(refresh);
   }
 
   function setAway(next: boolean) {
