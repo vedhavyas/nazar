@@ -106,11 +106,11 @@ test('a dragged move waits its turn, and only the latest one queues', async () =
   await vi.waitFor(() => expect(document.querySelector('video-rtc')).toBeTruthy());
 
   const surface = screen.getByTestId('ptz-surface');
-  // Three drags of different sizes, each in its own window, while the
-  // first move is still waiting on the camera.
+  // Three drag windows while the first move is still waiting on the
+  // camera: every window's motion must survive, one write at a time.
   vi.useFakeTimers();
   surface.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, clientY: 0, bubbles: true }));
-  for (const at of [200, 250, 325]) {
+  for (const at of [200, 400, 600]) {
     surface.dispatchEvent(
       new MouseEvent('pointermove', { clientX: at, clientY: 0, bubbles: true }),
     );
@@ -119,16 +119,21 @@ test('a dragged move waits its turn, and only the latest one queues', async () =
   vi.useRealTimers();
 
   expect(calls.length, 'one move is in flight, not three').toBe(1);
-  expect(calls[0], 'the first drag, in the camera signs').toContain('"dx":-60');
+  expect(calls[0], 'the first window, in the camera signs').toContain('"dx":-60');
 
   releases[0]();
   await vi.waitFor(() => expect(calls.length).toBe(2));
+  expect(calls[1], 'the second window queues, not replaces').toContain('"dx":-60');
   releases[1]();
+  await vi.waitFor(() => expect(calls.length).toBe(3));
+  releases[2]();
   await vi.waitFor(() => expect(screen.getByText(/at 0,0/)).toBeTruthy());
+
+  const moved = calls.reduce((sum, body) => sum + Number(JSON.parse(body).dx), 0);
   expect(
-    calls[1],
-    'the queued step is the last drag (-30), not the middle one (-20)',
-  ).toContain('"dx":-30');
+    moved,
+    'every window of the drag landed: three windows, 180 units, no loss',
+  ).toBe(-180);
 });
 
 test('the lens state is the camera’s own answer', async () => {

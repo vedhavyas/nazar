@@ -98,32 +98,50 @@
     }
   }
 
-  /** A drag emits steps faster than the camera answers; one move is in
-   * flight at a time, and only the latest waiting step survives. */
-  let moving = false;
-  let waiting: { dx: number; dy: number } | null = null;
+  /** A drag emits steps faster than the camera answers. One move is in
+   * flight at a time, the windows that arrive meanwhile ACCUMULATE (a
+   * sustained drag must not lose its middle), and each write stays within
+   * the server's per-request cap. */
+  const MAX_STEP = 60;
+  /** A backlog beyond a few writes is a camera nobody can catch up with. */
+  const MAX_QUEUED = 180;
 
-  async function step(dx: number, dy: number) {
-    if (moving) {
-      waiting = { dx, dy };
-      return;
-    }
+  let moving = false;
+  let queued = { dx: 0, dy: 0 };
+
+  function step(dx: number, dy: number) {
+    queued = {
+      dx: bound(queued.dx + dx, MAX_QUEUED),
+      dy: bound(queued.dy + dy, MAX_QUEUED),
+    };
+    void drain();
+  }
+
+  function bound(units: number, limit: number): number {
+    return Math.sign(units) * Math.min(Math.abs(units), limit);
+  }
+
+  async function drain() {
+    if (moving) return;
     moving = true;
     try {
-      const result = await api.ptz(id, dx, dy);
-      move = result.position ? `at ${result.position.x},${result.position.y}` : '';
-      if (!result.ok) {
-        move = result.reason ?? 'the move did not land';
+      while (queued.dx !== 0 || queued.dy !== 0) {
+        const dx = bound(queued.dx, MAX_STEP);
+        const dy = bound(queued.dy, MAX_STEP);
+        queued = { dx: queued.dx - dx, dy: queued.dy - dy };
+        const result = await api.ptz(id, dx, dy);
+        move = result.position ? `at ${result.position.x},${result.position.y}` : '';
+        if (!result.ok) {
+          // The camera is not following; stop pushing at it.
+          move = result.reason ?? 'the move did not land';
+          queued = { dx: 0, dy: 0 };
+        }
       }
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
+      queued = { dx: 0, dy: 0 };
     } finally {
       moving = false;
-    }
-    const next = waiting;
-    waiting = null;
-    if (next) {
-      void step(next.dx, next.dy);
     }
   }
 
