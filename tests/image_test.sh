@@ -44,7 +44,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[..] building $IMAGE"
-"$DOCKER" build -t "$IMAGE" "$ROOT"
+# Provenance labels come from the CI env when there is one.
+"$DOCKER" build -t "$IMAGE" \
+  --build-arg "VERSION=${VERSION:-${GITHUB_REF_NAME:-dev}}" \
+  --build-arg "REVISION=${REVISION:-${GITHUB_SHA:-unknown}}" \
+  "$ROOT"
 
 echo "[..] starting the container on a root-owned data dir"
 mkdir -p "$SCRATCH/data"

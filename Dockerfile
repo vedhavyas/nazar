@@ -23,6 +23,13 @@ RUN cargo build --release -p server
 FROM debian:bookworm-slim
 # Bump deliberately: the spike proved this exact go2rtc against the cameras.
 ARG GO2RTC_VERSION=v1.9.14
+# Provenance, so a pulled image can be traced to its release: the tag run
+# passes its ref name and sha in.
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/vedhavyas/nazar" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg util-linux \
  && rm -rf /var/lib/apt/lists/*
