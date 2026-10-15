@@ -29,8 +29,17 @@ PORT="${PORT:-18080}"
 SCRATCH="$(mktemp -d)"
 
 cleanup() {
+  # Nothing here may fail the script: on Linux a bind mount maps the
+  # container's chown to the host's root, so the scratch files are not
+  # deletable (or up for grabs) from the runner's own uid - clear them from
+  # a throwaway root shell running the image, then drop the directory.
   "$DOCKER" rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  rm -rf "$SCRATCH"
+  if [ -d "$SCRATCH" ] && ! rm -rf "$SCRATCH" 2>/dev/null; then
+    "$DOCKER" run --rm -v "$SCRATCH:/scratch" --entrypoint /bin/sh "$IMAGE" \
+      -c 'rm -rf /scratch/* /scratch/.[!.]*' >/dev/null 2>&1 || true
+    rm -rf "$SCRATCH" 2>/dev/null || true
+  fi
+  return 0
 }
 trap cleanup EXIT
 
