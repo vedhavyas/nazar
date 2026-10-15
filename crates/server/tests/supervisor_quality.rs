@@ -223,6 +223,43 @@ async fn an_idle_tile_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_tile_with_a_viewer_is_never_dropped() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 1);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low)
+        .await
+        .expect("the tile wakes");
+    // Nobody asks again: a home that is watching holds the stream open,
+    // and the browser never tells this server about it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "a viewed stream outlives the idle window: {:?}",
+        h.go2rtc.deletes()
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        ),
+        "and it is still live"
+    );
+
+    // The viewer leaves; now the idle rule applies again.
+    h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![format!("{DEVICE_ID}-low")],
+        "once nobody is watching, the tile is dropped"
+    );
+}
+
+#[tokio::test]
 async fn a_watched_tile_is_kept() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "low", 200, mint_body("low")).await;

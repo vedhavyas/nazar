@@ -34,12 +34,17 @@ pub struct StreamStatus {
     /// connection state is not exposed, so this is the strongest liveness
     /// signal the API gives.
     pub live: bool,
+    /// How many viewers are attached. A watched stream is not idle,
+    /// however long it has been since anyone asked this server for it.
+    pub consumers: usize,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamEntry {
     #[serde(default)]
     producers: Vec<Value>,
+    #[serde(default)]
+    consumers: Option<Vec<Value>>,
 }
 
 /// Everything that can go wrong running or calling go2rtc.
@@ -168,6 +173,7 @@ impl Go2rtc {
             .map(|(name, entry)| StreamStatus {
                 name,
                 live: !entry.producers.is_empty(),
+                consumers: entry.consumers.map_or(0, |consumers| consumers.len()),
             })
             .collect())
     }

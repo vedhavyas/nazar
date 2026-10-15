@@ -25,6 +25,7 @@ pub struct FakeApi {
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
     streams_visible: Arc<AtomicBool>,
+    viewers: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl FakeApi {
@@ -33,6 +34,7 @@ impl FakeApi {
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
+        let viewers = Arc::new(Mutex::new(HashMap::new()));
         let app = Router::new()
             .route(
                 "/api/streams",
@@ -78,9 +80,11 @@ impl FakeApi {
                 .get({
                     let recorded = Arc::clone(&puts);
                     let visible = Arc::clone(&streams_visible);
+                    let viewers = Arc::clone(&viewers);
                     move || {
                         let recorded = Arc::clone(&recorded);
                         let visible = Arc::clone(&visible);
+                        let viewers = Arc::clone(&viewers);
                         async move {
                             let recorded = recorded.lock().unwrap().clone();
                             if recorded.is_empty() {
@@ -89,16 +93,24 @@ impl FakeApi {
                             if !visible.load(Ordering::SeqCst) {
                                 return "{}".to_owned();
                             }
+                            let viewers = viewers.lock().unwrap().clone();
                             // go2rtc materializes a producer as soon as the
                             // source is set, which is what the fixture's
                             // unset case cannot show.
                             let mut streams = serde_json::Map::new();
                             for (name, source) in recorded {
+                                let watching = viewers.get(&name).copied().unwrap_or(0);
+                                // Measured shape: no viewers is `null`.
+                                let consumers = (watching > 0).then(|| {
+                                    (0..watching)
+                                        .map(|_| serde_json::json!({ "id": "viewer" }))
+                                        .collect::<Vec<_>>()
+                                });
                                 streams.insert(
                                     name,
                                     serde_json::json!({
                                         "producers": [{ "url": source }],
-                                        "consumers": null,
+                                        "consumers": consumers,
                                     }),
                                 );
                             }
@@ -121,7 +133,17 @@ impl FakeApi {
             deletes,
             put_status,
             streams_visible,
+            viewers,
         }
+    }
+
+    /// Report `count` viewers on the stream, as go2rtc does while a browser
+    /// holds it open.
+    pub fn set_viewers(&self, name: &str, count: usize) {
+        self.viewers
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), count);
     }
 
     /// Answer stream PUTs with `status` from now on.
