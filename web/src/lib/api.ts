@@ -1,6 +1,6 @@
-//! The server API: one place for fetch, the error envelope, and the
-//! session cookie (HttpOnly, so `same-origin` credentials is what makes it
-//! travel).
+//! The server API: one place for fetch and the error envelope. There is no
+//! cookie to carry: the session is a file on the server, and the browser
+//! holds nothing.
 
 /** What a failed call throws; `message` is the server's own words. */
 export class ApiError extends Error {
@@ -50,7 +50,6 @@ export interface PrivacyResult {
 
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
-    credentials: 'same-origin',
     ...init,
     headers: init.body ? { 'content-type': 'application/json' } : undefined,
   });
