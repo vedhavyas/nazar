@@ -12,7 +12,8 @@
 
   let host = $state<HTMLDivElement | null>(null);
   let attempt = $state(0);
-  let stalled = $state(false);
+  /** Why the picture is not moving, when it is not. */
+  let stalled = $state<null | 'start' | 'frozen'>(null);
 
   const STATE_WORDS: Record<Camera['state'], string> = {
     live: 'Live',
@@ -33,24 +34,40 @@
     player.src = `/go2rtc/api/ws?src=${encodeURIComponent(camera.id)}`;
     stage.appendChild(player);
 
-    // WebRTC can fail quietly (a blocked ICE path leaves a black frame);
-    // no frame inside the window is the signal the person needs.
+    // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
+    // dead stream leaves the last one. No first frame inside the window,
+    // then no advancing clock, are the two signals a person can act on.
     const timer = setTimeout(() => {
-      stalled = true;
+      stalled = 'start';
     }, 12000);
+    let watching: ReturnType<typeof setInterval> | null = null;
+    let lastTime = -1;
+    const onplaying = () => {
+      clearTimeout(timer);
+      if (watching) return;
+      watching = setInterval(() => {
+        const video = player.querySelector('video');
+        if (!video) return;
+        if (video.currentTime <= lastTime) {
+          stalled = 'frozen';
+          return;
+        }
+        lastTime = video.currentTime;
+      }, 5000);
+    };
     const video = player.querySelector('video');
-    const onplaying = () => clearTimeout(timer);
     video?.addEventListener('playing', onplaying);
 
     return () => {
       clearTimeout(timer);
+      if (watching) clearInterval(watching);
       video?.removeEventListener('playing', onplaying);
       player.remove();
     };
   });
 
   function retry() {
-    stalled = false;
+    stalled = null;
     attempt += 1;
     onwatch(camera.id);
   }
@@ -64,8 +81,11 @@
 
   {#if camera.state === 'live'}
     <div class="stage" bind:this={host}></div>
-    {#if stalled}
+    {#if stalled === 'start'}
       <p class="note">The video did not start. The camera link may be blocked on this network.</p>
+      <button class="btn" onclick={retry}>Try again</button>
+    {:else if stalled === 'frozen'}
+      <p class="note">The picture stopped. The camera link may have dropped.</p>
       <button class="btn" onclick={retry}>Try again</button>
     {/if}
   {:else if camera.state === 'degraded'}
