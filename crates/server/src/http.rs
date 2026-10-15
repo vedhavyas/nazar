@@ -35,8 +35,9 @@ struct Spa;
 /// bigger is a browser mistake, not a stream.
 const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// The go2rtc paths the browser's player may reach through the proxy.
-const ALLOWED_PROXY_PATHS: [&str; 2] = ["api/ws", "api/webrtc"];
+/// The only go2rtc path the browser's player may reach: its signalling
+/// socket. Everything else go2rtc serves is an admin surface.
+const PROXY_WS_PATH: &str = "api/ws";
 
 /// A fixed-window attempt limit, keyed by client: a short PIN must not be
 /// brute-forceable, and each verify costs a 19 MiB hash.
@@ -156,7 +157,15 @@ impl AppState {
             supervisor,
             pin,
             go2rtc_api: go2rtc_api.into(),
-            http: reqwest::Client::new(),
+            // No redirects on the proxy: a 3xx from go2rtc must reach the
+            // browser as-is rather than be followed into another host.
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, "proxy client fell back to defaults");
+                    reqwest::Client::new()
+                }),
             throttle: Arc::new(Throttle::new(5, Duration::from_secs(60), 2)),
         }
     }
@@ -396,17 +405,27 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
     require_unlocked(&state, &parts.headers)?;
 
     let rest = parts.uri.path().trim_start_matches("/go2rtc/").to_owned();
-    let query = parts
-        .uri
-        .query()
-        .map_or(String::new(), |query| format!("?{query}"));
-    // Only what the player needs. go2rtc's API is an admin surface (stream
-    // PUTs, api/exit); none of it may be reachable from a browser.
-    if !ALLOWED_PROXY_PATHS.contains(&rest.as_str()) {
+    if rest != PROXY_WS_PATH {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
     }
+    // go2rtc patches (or creates) streams from api/ws's `src`, so the query
+    // is rebuilt rather than forwarded: exactly one src, and only a camera
+    // this server already knows. Everything else the caller sent is
+    // dropped, and the value is never percent-decoded - `ffmpeg%3A...` must
+    // not become a source go2rtc would accept.
+    let src = single_src(parts.uri.query().unwrap_or_default())
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "only ?src=<camera> is proxied"))?;
+    let known = state
+        .supervisor
+        .devices()
+        .await
+        .iter()
+        .any(|device| device.device_id == src);
+    if !known {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+    }
     let base = state.go2rtc_api.trim_end_matches('/');
-    let target = format!("{base}/{rest}{query}");
+    let target = format!("{base}/api/ws?src={src}");
 
     if is_websocket(&parts.headers) {
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -603,6 +622,24 @@ fn with_session_cookie(status: StatusCode, token: &str, secure: bool) -> Respons
     let secure = if secure { "; Secure" } else { "" };
     let cookie = format!("nazar_session={token}; Path=/; HttpOnly; SameSite=Lax{secure}");
     ([(header::SET_COOKIE, cookie)], status).into_response()
+}
+
+/// The one `src` value in a raw query, or nothing.
+fn single_src(query: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name != "src" {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(value.to_owned());
+    }
+    found
 }
 
 /// Whether the request reached us over TLS, as caddy reports it.

@@ -756,17 +756,6 @@ async fn the_proxy_reaches_go2rtc_through_the_gate() {
     );
 
     unlock(&client, &h.base).await;
-    let response = client
-        .post(format!("{}/go2rtc/api/webrtc?src=cam", h.base))
-        .send()
-        .await
-        .expect("proxied sdp");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body = response.text().await.expect("body");
-    assert_eq!(
-        body, "sdp-answer",
-        "the fake go2rtc answered through the proxy"
-    );
 
     // go2rtc's admin surface stays out of the browser's reach.
     let admin = client
@@ -779,20 +768,61 @@ async fn the_proxy_reaches_go2rtc_through_the_gate() {
         reqwest::StatusCode::NOT_FOUND,
         "the streams admin path is not proxied"
     );
+
+    // Even the signalling path takes only a known camera as its source:
+    // go2rtc would otherwise patch the stream from whatever src arrives.
+    for source in ["ffmpeg:rtsp://evil/x", "rtsp://evil/x", "nope"] {
+        let redirected = client
+            .get(format!("{}/go2rtc/api/ws?src={source}", h.base))
+            .send()
+            .await
+            .expect("bad src");
+        assert_eq!(
+            redirected.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "src={source} is refused"
+        );
+    }
+
+    let doubled = client
+        .get(format!(
+            "{}/go2rtc/api/ws?src={DEVICE_ID}&src=rtsp://evil/x",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("doubled src");
+    assert_eq!(
+        doubled.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "two src values are refused rather than resolved"
+    );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
 #[tokio::test]
 async fn websocket_frames_are_piped_through_the_proxy() {
     let h = harness().await;
-    let cookie = unlock(&client(), &h.base).await;
+    mount_discovery(&h.qubo).await;
+    let browser = client();
+    let cookie = unlock(&browser, &h.base).await;
     let pair = cookie
         .split(';')
         .next()
         .expect("the cookie pair")
         .to_owned();
+    // The proxy only forwards a camera this server already knows.
+    let listed = browser
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
 
-    let url = format!("{}/go2rtc/api/ws", h.base.replace("http://", "ws://"));
+    let url = format!(
+        "{}/go2rtc/api/ws?src={DEVICE_ID}",
+        h.base.replace("http://", "ws://")
+    );
     let mut request = url.into_client_request().expect("a ws request");
     request
         .headers_mut()
