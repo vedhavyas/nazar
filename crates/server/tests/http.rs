@@ -45,7 +45,15 @@ async fn harness() -> Harness {
     harness_with(false).await
 }
 
+async fn harness_opts(secure_cookies: bool, trusted_proxies: TrustedProxies) -> Harness {
+    harness_with_trust(secure_cookies, trusted_proxies).await
+}
+
 async fn harness_with(secure_cookies: bool) -> Harness {
+    harness_with_trust(secure_cookies, TrustedProxies::parse("127.0.0.1/8")).await
+}
+
+async fn harness_with_trust(secure_cookies: bool, trusted_proxies: TrustedProxies) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = std::env::temp_dir().join(format!(
@@ -72,6 +80,7 @@ async fn harness_with(secure_cookies: bool) -> Harness {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),
             retry_max: Duration::from_secs(30),
+            discovery_retry: Duration::from_secs(30),
         },
     );
     let state = AppState::new(
@@ -82,8 +91,7 @@ async fn harness_with(secure_cookies: bool) -> Harness {
             supervisor,
             pin: PinGate::new(&data_dir),
             go2rtc_api: go2rtc.base.to_string(),
-            // The harness trusts itself, so a test can name its own bucket.
-            trusted_proxies: TrustedProxies::parse("127.0.0.1/8"),
+            trusted_proxies,
             secure_cookies,
         },
     );
@@ -609,6 +617,76 @@ async fn the_throttle_counts_each_forwarded_client_separately() {
         allowed.status(),
         reqwest::StatusCode::UNAUTHORIZED,
         "another client's own bucket is untouched"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn an_untrusted_peer_cannot_pick_its_own_bucket() {
+    let h = harness_opts(false, TrustedProxies::default()).await;
+    unlock(&client(), &h.base).await;
+
+    // The peer is not a trusted proxy, so X-Forwarded-For is ignored and
+    // every attempt lands in the one bucket the peer owns.
+    let flooding = client();
+    for attempt in 1..=5 {
+        let response = flooding
+            .post(format!("{}/api/unlock", h.base))
+            .header("x-forwarded-for", format!("10.1.1.{attempt}"))
+            .json(&json!({ "pin": "000000" }))
+            .send()
+            .await
+            .expect("wrong pin");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "attempt {attempt} inside the shared bucket is merely wrong"
+        );
+    }
+    let capped = flooding
+        .post(format!("{}/api/unlock", h.base))
+        .header("x-forwarded-for", "10.1.1.99")
+        .json(&json!({ "pin": "000000" }))
+        .send()
+        .await
+        .expect("fresh header value");
+    assert_eq!(
+        capped.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "a fresh header value buys nothing when the peer is untrusted"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn the_house_wide_ceiling_caps_rotating_keys() {
+    let h = harness().await;
+    unlock(&client(), &h.base).await;
+
+    let flooding = client();
+    let mut capped_at = None;
+    for attempt in 1..=40 {
+        let response = flooding
+            .post(format!("{}/api/unlock", h.base))
+            .header("x-forwarded-for", format!("10.2.0.{attempt}"))
+            .json(&json!({ "pin": "000000" }))
+            .send()
+            .await
+            .expect("rotating key");
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            capped_at = Some(attempt);
+            break;
+        }
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "attempt {attempt} has its own untouched bucket"
+        );
+    }
+    assert_eq!(
+        capped_at,
+        Some(31),
+        "the 31st rotating attempt hits the house-wide 30/60s ceiling"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

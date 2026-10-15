@@ -40,6 +40,7 @@ fn pacing(remint: Duration) -> Pacing {
         remint,
         retry_base: Duration::from_millis(20),
         retry_max: Duration::from_millis(200),
+        discovery_retry: Duration::from_millis(50),
     }
 }
 
@@ -279,6 +280,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
+        discovery_retry: Duration::from_secs(30),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -397,9 +399,32 @@ async fn a_failed_swap_never_leaks_the_stream_token() {
                 reason.contains("token=<redacted>"),
                 "the token is visibly redacted: {reason}"
             );
+            assert!(
+                reason.contains("#input=nazar#video=h264"),
+                "the redaction stops at the token and keeps the tail: {reason}"
+            );
         }
         other => panic!("expected Degraded, got {other:?}"),
     }
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+#[tokio::test]
+async fn discovery_backs_off_between_tries() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+
+    h.supervisor.refresh_devices().await.expect("discovery");
+    assert!(
+        !h.supervisor.discovery_due(),
+        "a just-run discovery is not due again"
+    );
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        h.supervisor.discovery_due(),
+        "the backoff expires and recovery can be noticed again"
+    );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
