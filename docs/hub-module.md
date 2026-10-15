@@ -7,26 +7,40 @@ The deployment contract for hosting nazar on Ved's hub, written from the hub's o
 ```yaml
 services:
   nazar:
+    container_name: nazar
+    hostname: nazar
     image: ghcr.io/vedhavyas/nazar:latest
-    pull_policy: always
-    user: "101:101"
     restart: unless-stopped
+    # The entrypoint chowns /data and drops to uid 101 itself; do NOT pin user:.
+    pull_policy: always
+    ports:
+      # WebRTC media only, bound to the WireGuard address so it never lands on
+      # the public interface; every viewer is a WG peer.
+      - "198.51.100.1:8555:8555/tcp"
+      - "198.51.100.1:8555:8555/udp"
     environment:
       DATA_DIR: /data
       RUST_LOG: info
       QUBO_SP: d10e4bfb0153496e8e8bb955f7ebe413
+      NAZAR_WEBRTC_CANDIDATES: 198.51.100.1:8555
     volumes:
       - $DATA_DIR/nazar:/data
     networks:
       - docker-direct
+    healthcheck:
+      test: curl -fsS http://127.0.0.1:8080/api/health || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     labels:
       caddy: nazar.hub
       caddy.tls.issuer: internal
+      caddy.tls.issuer.lifetime: 720h
       caddy.reverse_proxy: "{{upstreams 8080}}"
       hub.type: nazar
       hub.group: tools
-      hub.exposed: "false"
-      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.enable: false
 
 networks:
   docker-direct:
@@ -34,11 +48,11 @@ networks:
 ```
 
 Notes:
-- `user` uid/gid must match whatever the image's entrypoint expects for `/data` (the image declares it; adjust to its uid 101 or the image's own).
-- Bind mount only (hub convention), directory auto-provisioned by the pre-start hook.
+- WebRTC media does not flow through caddy: browsers connect directly to `198.51.100.1:8555` (the hub's WG address), which is why go2rtc's `webrtc.candidates` is templated from `NAZAR_WEBRTC_CANDIDATES`. The coturn route (`webrtc.ice_servers` -> the hub's coturn) stays documented as the fallback if a future client cannot reach the direct candidate.
+- Bind mount only (hub convention); the directory is auto-provisioned, and the image's entrypoint fixes ownership itself (hence no `user:` pin, unlike forge-web).
 - `docker-direct` for public egress (Qubo cloud + Wowza).
-- `pull_policy: always` + watchtower off: the restart is the upgrade gate, per hub convention; image floats on `:latest`.
-- No `[envs]` in config.toml needed beyond what the compose inlines; the SP id is public (it ships in every APK).
+- `pull_policy: always` + watchtower off: the restart is the upgrade gate; image floats on `:latest`.
+- GHCR package must be set public once (the hub pulls without credentials).
 
 ## Where secrets live
 
