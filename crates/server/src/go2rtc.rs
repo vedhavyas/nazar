@@ -130,6 +130,27 @@ impl Go2rtc {
         Ok(())
     }
 
+    /// Drop the stream `name` and the producer behind it. go2rtc's own UI
+    /// deletes with `?src=`, so that is the shape its API takes.
+    pub async fn delete_stream(&self, name: &str) -> Result<(), Go2rtcError> {
+        let response = self
+            .http
+            .delete(self.api_for("/api/streams")?)
+            .query(&[("src", name)])
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Go2rtcError::Rejected {
+                status: status.as_u16(),
+                body: snippet(&body),
+            });
+        }
+        tracing::debug!(stream = name, "go2rtc stream dropped");
+        Ok(())
+    }
+
     /// Every stream go2rtc currently holds, by name.
     pub async fn streams(&self) -> Result<Vec<StreamStatus>, Go2rtcError> {
         let response = self.http.get(self.api_for("/api/streams")?).send().await?;

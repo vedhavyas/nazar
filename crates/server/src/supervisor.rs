@@ -1,9 +1,12 @@
-//! The stream supervisor: one mint-and-swap loop per live camera.
+//! The stream supervisor: one mint-and-swap loop per live camera and
+//! quality.
 //!
 //! Qubo sessions last about five minutes and cannot be refreshed (the OTP
 //! route issues no refresh token), so a live stream is re-minted on a
 //! cadence and the session is re-read from the store on every mint - a
-//! fresh login heals the streams without restarting the server.
+//! fresh login heals the streams without restarting the server. A camera
+//! may hold two streams at once: the hero's high one, and a tile's low one
+//! which is dropped once nobody has asked for it for a while.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +29,8 @@ pub struct Pacing {
     /// How often a refused session is re-discovered; the UI is already
     /// routed to login, so this is just how soon recovery is noticed.
     pub discovery_retry: Duration,
+    /// How long a tile stream may go unasked-for before it is dropped.
+    pub tile_idle: Duration,
 }
 
 impl Default for Pacing {
@@ -35,8 +40,15 @@ impl Default for Pacing {
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(5),
+            tile_idle: Duration::from_secs(120),
         }
     }
+}
+
+/// The go2rtc stream name for a camera's quality class; the browser asks
+/// for exactly this name over the proxy.
+pub fn stream_name(device_id: &str, quality: Quality) -> String {
+    format!("{device_id}-{}", quality.as_str())
 }
 
 /// A camera's stream state.
@@ -59,11 +71,12 @@ pub enum SupervisorError {
     Qubo(#[from] qubo::QuboError),
 }
 
-/// A camera the supervisor is following: its state and the signal that
-/// forces an immediate retry.
+/// A stream the supervisor is following: its state, the signal that forces
+/// an immediate retry, and when it was last asked for.
 struct Tracked {
     state: StreamState,
     wake: Arc<Notify>,
+    last_request: Instant,
 }
 
 /// The streams the server is keeping alive.
@@ -138,12 +151,40 @@ impl Supervisor {
         self.devices.read().await.clone()
     }
 
-    /// The camera's stream state.
+    /// The camera's stream state across its quality classes: live if
+    /// anything of it is, so a camera held only as a tile does not read as
+    /// offline.
     pub async fn status(&self, device_id: &str) -> StreamState {
+        let state = self.state.read().await;
+        let mut degraded = None;
+        let mut waking = false;
+        for quality in [Quality::High, Quality::Low] {
+            match state
+                .get(&stream_name(device_id, quality))
+                .map(|tracked| &tracked.state)
+            {
+                Some(StreamState::Live { since }) => return StreamState::Live { since: *since },
+                Some(StreamState::Waking) => waking = true,
+                Some(StreamState::Degraded { reason }) => {
+                    degraded.get_or_insert_with(|| reason.clone());
+                }
+                _ => {}
+            }
+        }
+        if waking {
+            return StreamState::Waking;
+        }
+        degraded.map_or(StreamState::Offline, |reason| StreamState::Degraded {
+            reason,
+        })
+    }
+
+    /// The state of one quality class alone.
+    pub async fn status_for(&self, device_id: &str, quality: Quality) -> StreamState {
         self.state
             .read()
             .await
-            .get(device_id)
+            .get(&stream_name(device_id, quality))
             .map_or(StreamState::Offline, |tracked| tracked.state.clone())
     }
 
@@ -154,20 +195,32 @@ impl Supervisor {
         }
     }
 
-    /// Ensure the camera's stream is running: mint, hand the source to
-    /// go2rtc, and keep re-minting until the process ends. Later calls for
-    /// the same camera reuse the running loop; a failed first mint leaves
-    /// the stream retrying and the state `Degraded`.
-    pub async fn ensure_live(&self, device_id: &str) -> Result<(), SupervisorError> {
+    /// Remember that Qubo refused the session. The MQTT feed raises the
+    /// same flag when its own reconnect is turned away.
+    pub fn mark_needs_login(&self) {
+        self.needs_login.store(true, Ordering::SeqCst);
+    }
+
+    /// Ensure the camera's stream of `quality` is running: mint, hand the
+    /// source to go2rtc, and keep re-minting until the process ends. Later
+    /// calls for the same stream reuse the running loop, and count as the
+    /// request that keeps an idle tile alive.
+    pub async fn ensure(
+        &self,
+        device_id: &str,
+        quality: Quality,
+    ) -> Result<StreamState, SupervisorError> {
+        let name = stream_name(device_id, quality);
         {
-            let state = self.state.read().await;
-            if let Some(tracked) = state.get(device_id) {
+            let mut state = self.state.write().await;
+            if let Some(tracked) = state.get_mut(&name) {
+                tracked.last_request = Instant::now();
                 // A manual retry forces the loop's next attempt now instead
                 // of leaving the person waiting out the backoff.
                 if matches!(tracked.state, StreamState::Degraded { .. }) {
                     tracked.wake.notify_one();
                 }
-                return Ok(());
+                return Ok(tracked.state.clone());
             }
         }
         let device = {
@@ -179,45 +232,41 @@ impl Supervisor {
         }
         .ok_or_else(|| SupervisorError::UnknownDevice(device_id.to_owned()))?;
 
-        // A cancelled request must not strand the device as Waking: the
+        // A cancelled request must not strand the stream as Waking: the
         // registration is undone unless the loop below takes it over.
         let mut registration = Registration {
             supervisor: self.clone(),
-            device_id: device_id.to_owned(),
+            name: name.clone(),
             armed: false,
         };
 
         let wait = {
             let mut state = self.state.write().await;
-            if state.contains_key(device_id) {
-                return Ok(());
+            if state.contains_key(&name) {
+                return Ok(state
+                    .get(&name)
+                    .map_or(StreamState::Offline, |tracked| tracked.state.clone()));
             }
-            state.insert(
-                device_id.to_owned(),
-                Tracked {
-                    state: StreamState::Waking,
-                    wake: Arc::new(Notify::new()),
-                },
-            );
+            state.insert(name.clone(), new_tracked());
             drop(state);
             registration.armed = true;
 
-            match self.mint_and_swap(&device).await {
+            match self.mint_and_swap(&device, quality).await {
                 Ok(()) => {
-                    self.mark_live(&device.device_id).await;
+                    self.mark_live(&name).await;
                     self.pacing.remint
                 }
                 Err(reason) => {
-                    self.mark_degraded(&device.device_id, reason).await;
+                    self.mark_degraded(&name, reason).await;
                     self.pacing.retry_base
                 }
             }
         };
 
         let supervisor = self.clone();
-        tokio::spawn(async move { supervisor.remint_loop(device, wait).await });
+        tokio::spawn(async move { supervisor.remint_loop(device, quality, wait).await });
         registration.armed = false;
-        Ok(())
+        Ok(self.status_for(device_id, quality).await)
     }
 
     /// Reserved for M3: cloud-allocated VOD sessions for recordings. M1
@@ -226,23 +275,40 @@ impl Supervisor {
         Err(SupervisorError::VodUnavailable)
     }
 
-    async fn remint_loop(self, device: Device, mut wait: Duration) {
-        let wake = self.wake_signal(&device.device_id).await;
+    async fn remint_loop(self, device: Device, quality: Quality, mut wait: Duration) {
+        let name = stream_name(&device.device_id, quality);
+        let wake = self.wake_signal(&name).await;
+        // Only tiles idle out; a hero stream lives until nobody watches the
+        // house at all, and that is the app's business, not the loop's.
+        let idle_after = match quality {
+            Quality::Low => Some(self.pacing.tile_idle),
+            Quality::High => None,
+        };
         loop {
+            let sleep_for = match (idle_after, self.idle_for(&name).await) {
+                (Some(idle), Some(idle_for)) => wait.min(idle.saturating_sub(idle_for)),
+                _ => wait,
+            };
             tokio::select! {
-                () = tokio::time::sleep(wait) => {}
+                () = tokio::time::sleep(sleep_for) => {}
                 () = wake.notified() => {
-                    tracing::info!(device = %device.device_id, "remint forced by a retry");
+                    tracing::info!(stream = %name, "remint forced by a retry");
                 }
             }
-            wait = match self.mint_and_swap(&device).await {
+            if let (Some(idle), Some(idle_for)) = (idle_after, self.idle_for(&name).await)
+                && idle_for >= idle
+            {
+                self.teardown(&name).await;
+                return;
+            }
+            wait = match self.mint_and_swap(&device, quality).await {
                 Ok(()) => {
-                    self.mark_live(&device.device_id).await;
+                    self.mark_live(&name).await;
                     self.pacing.remint
                 }
                 Err(reason) => {
-                    tracing::warn!(device = %device.device_id, %reason, "stream re-mint failed");
-                    self.mark_degraded(&device.device_id, reason).await;
+                    tracing::warn!(stream = %name, %reason, "stream re-mint failed");
+                    self.mark_degraded(&name, reason).await;
                     if wait >= self.pacing.remint {
                         self.pacing.retry_base
                     } else {
@@ -255,13 +321,14 @@ impl Supervisor {
 
     /// One mint, handed straight to go2rtc. The source swaps under the
     /// stream's own name, so a viewer's stream URL survives re-mints.
-    async fn mint_and_swap(&self, device: &Device) -> Result<(), String> {
+    async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), String> {
+        let name = stream_name(&device.device_id, quality);
         let session = self
             .sessions
             .load()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "no Qubo session; log in".to_owned())?;
-        let mint = match mint_live(&self.qubo, &session, device, Quality::High).await {
+        let mint = match mint_live(&self.qubo, &session, device, quality).await {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);
@@ -269,7 +336,7 @@ impl Supervisor {
             }
         };
         self.go2rtc
-            .put_stream(&device.device_id, &live_source(&mint.url))
+            .put_stream(&name, &live_source(&mint.url))
             .await
             .map_err(|err| redact(&err.to_string()))?;
         // Live means go2rtc actually holds a producer for the stream, not
@@ -283,7 +350,7 @@ impl Supervisor {
             .await
             .map_err(|err| redact(&err.to_string()))?
             .iter()
-            .any(|stream| stream.name == device.device_id && stream.live);
+            .any(|stream| stream.name == name && stream.live);
         if !held {
             return Err("go2rtc did not take the stream".to_owned());
         }
@@ -291,23 +358,41 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Drop a stream nobody asked for: go2rtc's copy and the tracked
+    /// entry. No reference shows an API that releases a minted session -
+    /// it expires on its own - so dropping the stream is the whole release.
+    async fn teardown(&self, name: &str) {
+        if let Err(err) = self.go2rtc.delete_stream(name).await {
+            tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+        }
+        self.state.write().await.remove(name);
+        tracing::info!(stream = name, "idle tile stream dropped");
+    }
+
+    /// How long since the stream was last asked for, if it is still known.
+    async fn idle_for(&self, name: &str) -> Option<Duration> {
+        self.state
+            .read()
+            .await
+            .get(name)
+            .map(|tracked| tracked.last_request.elapsed())
+    }
+
     /// The tracked entry's wake handle, created if the entry is missing.
-    async fn wake_signal(&self, device_id: &str) -> Arc<Notify> {
+    async fn wake_signal(&self, name: &str) -> Arc<Notify> {
         self.state
             .write()
             .await
-            .entry(device_id.to_owned())
+            .entry(name.to_owned())
             .or_insert_with(new_tracked)
             .wake
             .clone()
     }
 
     /// `Live` keeps its original `since` through successful re-mints.
-    async fn mark_live(&self, device_id: &str) {
+    async fn mark_live(&self, name: &str) {
         let mut state = self.state.write().await;
-        let entry = state
-            .entry(device_id.to_owned())
-            .or_insert_with(new_tracked);
+        let entry = state.entry(name.to_owned()).or_insert_with(new_tracked);
         if !matches!(entry.state, StreamState::Live { .. }) {
             entry.state = StreamState::Live {
                 since: Instant::now(),
@@ -315,11 +400,11 @@ impl Supervisor {
         }
     }
 
-    async fn mark_degraded(&self, device_id: &str, reason: String) {
+    async fn mark_degraded(&self, name: &str, reason: String) {
         self.state
             .write()
             .await
-            .entry(device_id.to_owned())
+            .entry(name.to_owned())
             .or_insert_with(new_tracked)
             .state = StreamState::Degraded { reason };
     }
@@ -329,14 +414,15 @@ fn new_tracked() -> Tracked {
     Tracked {
         state: StreamState::Offline,
         wake: Arc::new(Notify::new()),
+        last_request: Instant::now(),
     }
 }
 
-/// Undoes a registration whose `ensure_live` future was dropped before the
+/// Undoes a registration whose `ensure` future was dropped before the
 /// re-mint loop took over.
 struct Registration {
     supervisor: Supervisor,
-    device_id: String,
+    name: String,
     armed: bool,
 }
 
@@ -346,16 +432,16 @@ impl Drop for Registration {
             return;
         }
         if let Ok(mut state) = self.supervisor.state.try_write() {
-            state.remove(&self.device_id);
+            state.remove(&self.name);
             return;
         }
         // The map is held elsewhere right now; finish the cleanup from a
         // task rather than leaking the registration.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let supervisor = self.supervisor.clone();
-            let device_id = self.device_id.clone();
+            let name = self.name.clone();
             handle.spawn(async move {
-                supervisor.state.write().await.remove(&device_id);
+                supervisor.state.write().await.remove(&name);
             });
         }
     }

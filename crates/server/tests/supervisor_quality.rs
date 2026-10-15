@@ -1,0 +1,312 @@
+//! Quality classes: the hero streams high, tiles stream low, and a tile
+//! nobody watches is dropped after its idle window.
+
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+mod common;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use serde_json::json;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use qubo::{Quality, QuboClient, Session, SessionStore};
+use server::go2rtc::Go2rtc;
+use server::supervisor::{Pacing, StreamState, Supervisor};
+
+const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
+const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
+const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
+const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
+const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+
+static NEXT_SESSION_FILE: AtomicUsize = AtomicUsize::new(0);
+
+struct Harness {
+    supervisor: Supervisor,
+    qubo: MockServer,
+    go2rtc: common::FakeApi,
+}
+
+/// Pacing for the quality tests: re-mints and retries are far away, so
+/// anything that happens is the idle rule's doing.
+fn pacing(tile_idle: Duration) -> Pacing {
+    Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_secs(30),
+        retry_max: Duration::from_secs(30),
+        discovery_retry: Duration::from_secs(30),
+        tile_idle,
+    }
+}
+
+async fn harness(tile_idle: Duration) -> Harness {
+    let qubo = MockServer::start().await;
+    let go2rtc = common::FakeApi::start().await;
+    mount_discovery(&qubo).await;
+    let sessions_path = temp_path();
+    let store = SessionStore::new(&sessions_path);
+    store
+        .save(&Session {
+            access_token: "token-abc".to_owned(),
+            uuid: "user-uuid-1".to_owned(),
+            email: None,
+        })
+        .expect("the session saves");
+    let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
+    let supervisor = Supervisor::new(
+        client,
+        store,
+        Go2rtc::connect(go2rtc.base.clone()),
+        pacing(tile_idle),
+    );
+    supervisor.refresh_devices().await.expect("discovery");
+    Harness {
+        supervisor,
+        qubo,
+        go2rtc,
+    }
+}
+
+fn temp_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "nazar-quality-{}-{}.json",
+        std::process::id(),
+        NEXT_SESSION_FILE.fetch_add(1, Ordering::SeqCst)
+    ))
+}
+
+fn mint_body(quality: &str) -> String {
+    json!({
+        "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}_{quality}?token=tok"),
+        "sessionId": format!("session-{quality}"),
+    })
+    .to_string()
+}
+
+async fn mount_mint(server: &MockServer, quality: &str, status: u16, body: String) {
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", quality))
+        .respond_with(ResponseTemplate::new(status).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+async fn mount_discovery(server: &MockServer) {
+    mount_json(
+        server,
+        UNITS_PATH,
+        json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
+    )
+    .await;
+    mount_json(
+        server,
+        DEVICES_PATH,
+        json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" }] })
+            .to_string(),
+    )
+    .await;
+}
+
+async fn mount_json(server: &MockServer, route: &str, body: String) {
+    Mock::given(method("GET"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn the_hero_and_a_tile_are_two_streams() {
+    let h = harness(Duration::from_secs(30)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("the hero wakes");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low)
+        .await
+        .expect("the tile wakes");
+
+    let names: Vec<String> = h
+        .go2rtc
+        .puts()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
+        "each quality gets its own go2rtc stream"
+    );
+    let bodies: Vec<String> = h
+        .qubo
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.url.path() == MINT_PATH)
+        .map(|request| request.url.query().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        bodies.iter().any(|query| query.contains("type=high")),
+        "the hero mints high: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|query| query.contains("type=low")),
+        "the tile mints low: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn asking_again_reuses_the_stream() {
+    let h = harness(Duration::from_secs(30)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("the hero wakes");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("a second ask reuses");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("and so does a third");
+
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        1,
+        "three asks, one mint: the stream is reused, not hammered"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_tile_is_dropped() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low)
+        .await
+        .expect("the tile wakes");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![format!("{DEVICE_ID}-low")],
+        "the idle tile is dropped from go2rtc"
+    );
+    assert_eq!(
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+        StreamState::Offline,
+        "and the supervisor forgets it"
+    );
+
+    let settled = h.go2rtc.puts().len();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        settled,
+        "the dropped tile's loop is gone, not re-minting"
+    );
+}
+
+#[tokio::test]
+async fn a_watched_tile_is_kept() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+
+    for _ in 0..6 {
+        h.supervisor
+            .ensure(DEVICE_ID, Quality::Low)
+            .await
+            .expect("the tile wakes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "a tile that keeps being asked for is never dropped: {:?}",
+        h.go2rtc.deletes()
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        ),
+        "and it is still live"
+    );
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        ),
+        "a camera held only as a tile still reads as live"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_quality_leaves_the_other_stream_alone() {
+    let h = harness(Duration::from_secs(30)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    mount_mint(&h.qubo, "low", 500, "boom".to_owned()).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("the hero wakes");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low)
+        .await
+        .expect("a refused tile still registers");
+
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ),
+        "the hero is untouched by the tile's failure"
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Degraded { .. }
+        ),
+        "the tile carries its own failure"
+    );
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        ),
+        "and the camera reads as live while anything of it streams"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_camera_is_refused() {
+    let h = harness(Duration::from_secs(30)).await;
+
+    let outcome = h
+        .supervisor
+        .ensure("0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", Quality::High)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(server::supervisor::SupervisorError::UnknownDevice(_))
+        ),
+        "an id the account does not have cannot be ensured"
+    );
+}

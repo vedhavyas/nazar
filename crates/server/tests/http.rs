@@ -66,6 +66,7 @@ async fn harness() -> Harness {
             retry_base: Duration::from_secs(30),
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
+            tile_idle: Duration::from_secs(120),
         },
     );
     let state = AppState::new(
@@ -246,8 +247,8 @@ async fn watching_a_camera_starts_the_stream() {
     assert_eq!(started.status(), reqwest::StatusCode::OK);
     assert_eq!(
         started.json::<Value>().await.expect("json"),
-        json!({ "stream": DEVICE_ID }),
-        "the stream name is the device id"
+        json!({ "stream": format!("{DEVICE_ID}-high") }),
+        "the stream name is the device and its quality class"
     );
 
     let page = browser
@@ -429,7 +430,17 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
 #[tokio::test]
 async fn the_proxy_only_reaches_the_ws_path() {
     let h = harness().await;
+    mount_discovery(&h.qubo).await;
     let client = client();
+
+    // Fill the device list, so a refusal below is about the source and not
+    // about an empty list.
+    let listed = client
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
 
     // go2rtc's admin surface stays out of the browser's reach.
     let admin = client
@@ -443,9 +454,16 @@ async fn the_proxy_only_reaches_the_ws_path() {
         "the streams admin path is not proxied"
     );
 
-    // Even the signalling path takes only a known camera as its source:
-    // go2rtc would otherwise patch the stream from whatever src arrives.
-    for source in ["ffmpeg:rtsp://evil/x", "rtsp://evil/x", "nope"] {
+    // Even the signalling path takes only a known camera's stream as its
+    // source: go2rtc would otherwise patch the stream from whatever src
+    // arrives. The quality suffix must be one of the two classes.
+    for source in [
+        "ffmpeg:rtsp://evil/x",
+        "rtsp://evil/x",
+        "nope",
+        "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01-ultra",
+        "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01",
+    ] {
         let redirected = client
             .get(format!("{}/go2rtc/api/ws?src={source}", h.base))
             .send()
@@ -488,7 +506,7 @@ async fn websocket_frames_are_piped_through_the_proxy() {
     assert_eq!(listed.status(), reqwest::StatusCode::OK);
 
     let url = format!(
-        "{}/go2rtc/api/ws?src={DEVICE_ID}",
+        "{}/go2rtc/api/ws?src={DEVICE_ID}-high",
         h.base.replace("http://", "ws://")
     );
     let request = url.into_client_request().expect("a ws request");
