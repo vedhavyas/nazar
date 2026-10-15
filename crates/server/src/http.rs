@@ -3,11 +3,12 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts as _, Path, Request, State};
+use axum::extract::{FromRequestParts as _, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -22,6 +23,9 @@ use qubo::{
     verify_otp, write_service,
 };
 
+use crate::events::EventBus;
+use crate::motion::{Hysteresis, MotionOrder};
+use crate::mqtt::UnitEvent;
 use crate::supervisor::{StreamState, Supervisor, SupervisorError, stream_name};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
@@ -78,6 +82,10 @@ pub struct AppState {
     /// go2rtc's API base the proxy forwards to.
     pub go2rtc_api: String,
     pub control: ControlTiming,
+    /// The broker events every live view follows.
+    pub events: EventBus,
+    /// The hero decision, fed by the event bus.
+    pub motion: Arc<Mutex<MotionOrder>>,
     http: reqwest::Client,
 }
 
@@ -87,6 +95,8 @@ pub struct Wiring {
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
     pub go2rtc_api: String,
+    pub events: EventBus,
+    pub motion: Arc<Mutex<MotionOrder>>,
 }
 
 impl AppState {
@@ -98,6 +108,8 @@ impl AppState {
             supervisor: wiring.supervisor,
             go2rtc_api: wiring.go2rtc_api,
             control: ControlTiming::default(),
+            events: wiring.events,
+            motion: wiring.motion,
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -167,6 +179,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/cameras/{id}/live", post(camera_live))
         .route("/api/cameras/{id}/ptz", post(camera_ptz))
         .route("/api/cameras/{id}/privacy", post(camera_privacy))
+        .route("/api/motion/hero", get(motion_hero))
+        .route("/api/events", get(events_socket))
         .route("/go2rtc/{*rest}", any(proxy))
         .fallback(spa)
         .with_state(state)
@@ -234,13 +248,70 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
     })))
 }
 
+#[derive(Deserialize)]
+struct LiveQuery {
+    quality: Option<String>,
+}
+
 async fn camera_live(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<LiveQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let quality = match query.quality.as_deref() {
+        None | Some("high") => Quality::High,
+        Some("low") => Quality::Low,
+        Some(other) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown quality {other}"),
+            ));
+        }
+    };
     ensure_devices(&state).await?;
-    state.supervisor.ensure(&id, Quality::High).await?;
-    Ok(Json(json!({ "stream": stream_name(&id, Quality::High) })))
+    state.supervisor.ensure(&id, quality).await?;
+    Ok(Json(json!({ "stream": stream_name(&id, quality) })))
+}
+
+/// The camera the house is watching: the supervisor's hysteresis decision,
+/// never the browser's own ordering.
+async fn motion_hero(State(state): State<AppState>) -> Json<Value> {
+    let hero = state
+        .motion
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hero(Instant::now(), Hysteresis::default());
+    Json(json!({ "hero": hero }))
+}
+
+/// Every broker event, as it happens, for the home to follow.
+async fn events_socket(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| pump_events(socket, state.events.subscribe()))
+}
+
+async fn pump_events(socket: WebSocket, mut events: tokio::sync::broadcast::Receiver<UnitEvent>) {
+    let mut socket = socket;
+    loop {
+        let frame = match events.recv().await {
+            Ok(UnitEvent::Motion { device_id }) => {
+                json!({ "type": "motion", "device_id": device_id })
+            }
+            Ok(UnitEvent::Liveness { device_id, online }) => {
+                json!({ "type": "liveness", "device_id": device_id, "online": online })
+            }
+            // A viewer that fell behind misses events rather than the
+            // connection.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        if socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 #[derive(Deserialize)]

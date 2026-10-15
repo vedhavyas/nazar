@@ -8,12 +8,20 @@
     media: string;
   }
 
-  let { camera, onwatch }: { camera: Camera; onwatch: (id: string) => void } = $props();
+  let {
+    camera,
+    onwatch,
+    still = false,
+  }: { camera: Camera; onwatch: (id: string) => void; still?: boolean } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
+  let snapshot = $state<HTMLCanvasElement | null>(null);
   let attempt = $state(0);
   /** Why the picture is not moving, when it is not. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
+
+  /** How often away mode refreshes a tile's still. */
+  const STILL_EVERY_MS = 10_000;
 
   const STATE_WORDS: Record<Camera['state'], string> = {
     live: 'Live',
@@ -111,6 +119,25 @@
     };
   });
 
+  // Away mode: the tile keeps its own low stream, and shows one frame of it
+  // every ten seconds rather than a live picture - no extra server work.
+  $effect(() => {
+    if (!still || camera.state !== 'live' || stalled) return;
+    const canvas = snapshot;
+    if (!canvas) return;
+    const draw = () => {
+      const video = host?.querySelector('video');
+      const ctx = canvas.getContext('2d');
+      if (!video || !ctx) return;
+      canvas.width = video.videoWidth || canvas.width || 640;
+      canvas.height = video.videoHeight || canvas.height || 360;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    };
+    draw();
+    const timer = setInterval(draw, STILL_EVERY_MS);
+    return () => clearInterval(timer);
+  });
+
   function retry() {
     stalled = null;
     attempt += 1;
@@ -125,7 +152,10 @@
   </header>
 
   {#if camera.state === 'live'}
-    <div class="stage" bind:this={host}></div>
+    <div class="stage" class:hidden={still} bind:this={host}></div>
+    {#if still && !stalled}
+      <canvas class="still" bind:this={snapshot}></canvas>
+    {/if}
     {#if stalled === 'start'}
       <p class="note">The video did not start. The camera link may be blocked on this network.</p>
       <button class="btn" onclick={retry}>Try again</button>
@@ -181,6 +211,19 @@
     aspect-ratio: 16 / 9;
     border-radius: 8px;
     overflow: hidden;
+    background: #000;
+  }
+
+  /* Away mode hides the live picture behind the still it feeds. */
+  .stage.hidden {
+    display: none;
+  }
+
+  .still {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    border-radius: 8px;
     background: #000;
   }
 

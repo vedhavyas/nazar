@@ -26,6 +26,14 @@ export interface Cameras {
   needsLogin: boolean;
 }
 
+/** The two stream classes the gateway mints. */
+export type Quality = 'high' | 'low';
+
+/** The server's hero decision: the camera that last saw the house move. */
+export interface MotionHero {
+  hero: string | null;
+}
+
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -62,5 +70,7 @@ export const api = {
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
   verifyOtp: (phone: string, code: string) => post('/api/login/verify', { phone, code }),
   cameras: () => call<Cameras>('/api/cameras'),
-  watch: (id: string) => call<{ stream: string }>(`/api/cameras/${id}/live`, { method: 'POST' }),
+  watch: (id: string, quality: Quality = 'high') =>
+    call<{ stream: string }>(`/api/cameras/${id}/live?quality=${quality}`, { method: 'POST' }),
+  hero: () => call<MotionHero>('/api/motion/hero'),
 };
