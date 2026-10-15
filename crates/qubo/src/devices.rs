@@ -27,6 +27,10 @@ pub async fn list_devices(
 
     for unit in list_units(client, session).await? {
         let Some(unit_id) = string_of(&unit, &["unitUUID", "uuid", "unitId"]) else {
+            tracing::warn!(
+                shape = %shape_of(&unit),
+                "unit record without an id was skipped"
+            );
             continue;
         };
         let path = format!(
@@ -36,6 +40,11 @@ pub async fn list_devices(
         let response = client.get_json(&path, Some(session)).await?;
         for value in items_of(&response, &["data", "devices"]) {
             let Some(device) = device_of(&value, &unit_id) else {
+                tracing::warn!(
+                    unit = %unit_id,
+                    shape = %shape_of(&value),
+                    "device record without an id was skipped"
+                );
                 continue;
             };
             if seen.insert(device.device_id.clone()) {
@@ -65,8 +74,35 @@ fn items_of(response: &Value, keys: &[&str]) -> Vec<Value> {
             .find_map(|key| response.get(*key))
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_else(|| vec![response.clone()]),
-        _ => Vec::new(),
+            .unwrap_or_else(|| {
+                // The wrapped shapes are unchecked (spec §4: the aliases are
+                // inferred), so an unknown envelope must not look like data.
+                tracing::warn!(
+                    expected = keys.join(","),
+                    shape = %shape_of(response),
+                    "unexpected list envelope; treating the object as one record"
+                );
+                vec![response.clone()]
+            }),
+        other => {
+            tracing::warn!(shape = %shape_of(other), "unexpected list body; no records read");
+            Vec::new()
+        }
+    }
+}
+
+/// A compact description of a payload for a warning line.
+fn shape_of(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            format!("object with keys [{}]", keys.join(", "))
+        }
+        Value::Array(items) => format!("array of {}", items.len()),
+        Value::String(_) => "string".to_owned(),
+        Value::Number(_) => "number".to_owned(),
+        Value::Bool(_) => "bool".to_owned(),
+        Value::Null => "null".to_owned(),
     }
 }
 
