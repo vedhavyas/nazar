@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/qubo", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Vedhavyas Singareddi <7549475+vedhavyas@users.noreply.github.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+# Nothing here is published, so there is no docs.rs target and no public
+# API contract to document against.
+missing_docs = "allow"
+# `unused_crate_dependencies` is deliberately absent: it false-positives
+# on integration-test targets, where each test binary imports a subset of
+# the lib's dependencies. Opt in per src/lib.rs instead.
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+exit = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Pedantic exemptions, each with its reason inline.
+module_name_repetitions = "allow"   # Rust-idiomatic; not actually repetition.
+must_use_candidate = "allow"        # Most fns don't need the marker.
+missing_errors_doc = "allow"        # thiserror covers public-error docs.
+missing_panics_doc = "allow"        # `panic` is denied above; noise is minimal.
+doc_markdown = "allow"              # Bare crate paths in prose are fine.

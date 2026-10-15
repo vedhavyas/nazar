@@ -1,0 +1,16 @@
+{
+  "name": "nazar-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "svelte": "^5.57.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.4"
+  }
+}

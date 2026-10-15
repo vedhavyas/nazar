@@ -1,0 +1,12 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "nazar-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
