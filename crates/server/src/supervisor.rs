@@ -349,8 +349,10 @@ fn redact(text: &str) -> String {
         out.push_str(&rest[..start]);
         out.push_str("token=<redacted>");
         let after = &rest[start + "token=".len()..];
+        // `#` matters: the source rides as `?token=..#input=nazar..`, and
+        // without it the whole tail of the message is swallowed.
         let end = after
-            .find(['&', ' ', '"', '\'', ')', ']', '\\'])
+            .find(['&', ' ', '"', '\'', ')', ']', '\\', '#'])
             .unwrap_or(after.len());
         rest = &after[end..];
     }
