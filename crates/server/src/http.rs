@@ -140,7 +140,7 @@ fn client_key(headers: &HeaderMap, peer: IpAddr, trusted: &TrustedProxies) -> St
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(',').next())
-            .map(|value| value.trim())
+            .map(str::trim)
             .filter(|value| !value.is_empty())
     {
         return forwarded.to_owned();
