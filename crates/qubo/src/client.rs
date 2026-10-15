@@ -1,6 +1,7 @@
 //! The HTTP client for the Qubo REST gateway.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -62,6 +63,8 @@ pub struct QuboClient {
     base: Url,
     sp: ServiceProvider,
     device_id: String,
+    /// The login session id the OTP flow carries from request to verify.
+    pending_login: Arc<Mutex<Option<String>>>,
 }
 
 impl QuboClient {
@@ -72,7 +75,26 @@ impl QuboClient {
             base,
             sp,
             device_id: Uuid::new_v4().to_string(),
+            pending_login: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn set_pending_login(&self, uuid: &str) {
+        *self.lock_pending() = Some(uuid.to_owned());
+    }
+
+    pub(crate) fn pending_login(&self) -> Option<String> {
+        self.lock_pending().clone()
+    }
+
+    pub(crate) fn clear_pending_login(&self) {
+        *self.lock_pending() = None;
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.pending_login
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The `Source-Device-Id` this client sends. Persist it across
