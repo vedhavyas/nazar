@@ -28,12 +28,17 @@
   /** How often an advancing clock is looked for once the picture starts. */
   const WATCH_EVERY_MS = 5_000;
 
-  /** What hls.js exposes once its script is on the page. */
-  interface HlsJs {
-    isSupported?: () => boolean;
+  /** hls.js as the vendored file exposes it: `isSupported` is on the
+   * constructor, everything else on an instance. */
+  interface HlsInstance {
     loadSource: (source: string) => void;
     attachMedia: (video: HTMLVideoElement) => void;
     destroy: () => void;
+  }
+
+  interface HlsConstructor {
+    new (): HlsInstance;
+    isSupported?: () => boolean;
   }
 
   let host = $state<HTMLDivElement | null>(null);
@@ -62,8 +67,8 @@
     return loading;
   }
 
-  function hlsJs(): HlsJs | undefined {
-    return (globalThis as { Hls?: HlsJs }).Hls;
+  function hlsJs(): HlsConstructor | undefined {
+    return (globalThis as { Hls?: HlsConstructor }).Hls;
   }
 
   /** Give the picture to the fallback: native HLS where the browser has it,
@@ -168,9 +173,10 @@
     if (!fallback || native || !element || !name) return;
     const Hls = hlsJs();
     if (!Hls) return;
-    Hls.loadSource(`/go2rtc/api/stream.m3u8?src=${encodeURIComponent(name)}`);
-    Hls.attachMedia(element);
-    return () => Hls.destroy();
+    const hls = new Hls();
+    hls.loadSource(`/go2rtc/api/stream.m3u8?src=${encodeURIComponent(name)}`);
+    hls.attachMedia(element);
+    return () => hls.destroy();
   });
 
   // A new attempt (or a fallback reversal) starts the socket over.
