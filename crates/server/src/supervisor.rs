@@ -285,8 +285,17 @@ impl Supervisor {
             Quality::High => None,
         };
         loop {
-            let sleep_for = match (idle_after, self.idle_for(&name).await) {
+            // A stream with a viewer is not idle, whatever this server was
+            // last asked: the viewer holds it open through go2rtc.
+            let idle_since = match idle_after {
+                Some(_) if self.watched(&name).await => None,
+                _ => self.idle_for(&name).await,
+            };
+            let sleep_for = match (idle_after, idle_since) {
                 (Some(idle), Some(idle_for)) => wait.min(idle.saturating_sub(idle_for)),
+                // Watched: wake again within a window, so a viewer who
+                // leaves is noticed without waiting out a re-mint.
+                (Some(idle), None) => wait.min(idle),
                 _ => wait,
             };
             tokio::select! {
@@ -295,7 +304,7 @@ impl Supervisor {
                     tracing::info!(stream = %name, "remint forced by a retry");
                 }
             }
-            if let (Some(idle), Some(idle_for)) = (idle_after, self.idle_for(&name).await)
+            if let (Some(idle), Some(idle_for)) = (idle_after, idle_since)
                 && idle_for >= idle
             {
                 self.teardown(&name).await;
@@ -367,6 +376,16 @@ impl Supervisor {
         }
         self.state.write().await.remove(name);
         tracing::info!(stream = name, "idle tile stream dropped");
+    }
+
+    /// Whether go2rtc has a viewer on the stream. An API that cannot say
+    /// keeps the stream: a late teardown beats a wrong one.
+    async fn watched(&self, name: &str) -> bool {
+        self.go2rtc.streams().await.map_or(true, |streams| {
+            streams
+                .iter()
+                .any(|stream| stream.name == name && stream.consumers > 0)
+        })
     }
 
     /// How long since the stream was last asked for, if it is still known.
