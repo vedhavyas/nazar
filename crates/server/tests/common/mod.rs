@@ -25,6 +25,7 @@ pub struct FakeApi {
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
     streams_visible: Arc<AtomicBool>,
+    streams_error: Arc<AtomicBool>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
 }
 
@@ -34,12 +35,14 @@ impl FakeApi {
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
+        let streams_error = Arc::new(AtomicBool::new(false));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
             &put_status,
             &streams_visible,
+            &streams_error,
             &viewers,
         ));
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -55,6 +58,7 @@ impl FakeApi {
             deletes,
             put_status,
             streams_visible,
+            streams_error,
             viewers,
         }
     }
@@ -76,6 +80,12 @@ impl FakeApi {
         self.streams_visible.store(visible, Ordering::SeqCst);
     }
 
+    /// Answer GET /api/streams with a body nobody can read, as a go2rtc in
+    /// trouble would.
+    pub fn set_streams_error(&self, broken: bool) {
+        self.streams_error.store(broken, Ordering::SeqCst);
+    }
+
     /// The stream PUTs received so far, as `(name, source)`.
     pub fn puts(&self) -> Vec<(String, String)> {
         self.puts.lock().unwrap().clone()
@@ -93,6 +103,7 @@ fn streams_routes(
     deletes: &Arc<Mutex<Vec<String>>>,
     put_status: &Arc<AtomicU16>,
     streams_visible: &Arc<AtomicBool>,
+    streams_error: &Arc<AtomicBool>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
 ) -> Router {
     Router::new().route("/api/ws", get(echo)).route(
@@ -140,11 +151,17 @@ fn streams_routes(
             let recorded = Arc::clone(puts);
             let visible = Arc::clone(streams_visible);
             let viewers = Arc::clone(viewers);
+            let error = Arc::clone(streams_error);
             move || {
                 let recorded = Arc::clone(&recorded);
                 let visible = Arc::clone(&visible);
                 let viewers = Arc::clone(&viewers);
+                let error = Arc::clone(&error);
                 async move {
+                    // An unreadable status: what a go2rtc in trouble answers.
+                    if error.load(Ordering::SeqCst) {
+                        return String::new();
+                    }
                     let recorded = recorded.lock().unwrap().clone();
                     if recorded.is_empty() {
                         return include_str!("../fixtures/streams.json").to_owned();

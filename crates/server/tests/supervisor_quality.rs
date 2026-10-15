@@ -346,6 +346,36 @@ async fn a_failing_quality_leaves_the_other_stream_alone() {
 }
 
 #[tokio::test]
+async fn a_status_check_that_fails_keeps_the_stream() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    h.go2rtc.set_streams_error(true);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // An API that cannot say whether anyone is watching must not be read
+    // as nobody: a wrong teardown kills a live picture.
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "an unreadable status is not an idle stream: {:?}",
+        h.go2rtc.deletes()
+    );
+
+    // The status answers again; the idle rule applies as before.
+    h.go2rtc.set_streams_error(false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![format!("{DEVICE_ID}-low")],
+        "once the status answers, a quiet tile is dropped as usual"
+    );
+}
+
+#[tokio::test]
 async fn only_a_persons_retry_skips_the_backoff() {
     let h = harness(Duration::from_secs(30)).await;
     // The camera refuses once, then answers; the first mint takes the
