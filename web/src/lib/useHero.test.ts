@@ -104,6 +104,7 @@ test('away mode stills the small tiles and never the hero', async () => {
 });
 
 test('the event socket does not come back after the teardown', async () => {
+  vi.useFakeTimers();
   let made = 0;
   class FakeSocket {
     onmessage: (() => void) | null = null;
@@ -122,10 +123,13 @@ test('the event socket does not come back after the teardown', async () => {
   expect(made, 'the socket opens').toBe(1);
 
   stop();
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // Past the reconnect delay, not merely past a tick: the re-arm this
+  // guards against is three seconds out.
+  await vi.advanceTimersByTimeAsync(5_000);
 
   expect(made, 'a closed socket must not re-arm after teardown').toBe(1);
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 test('an event re-asks the server who is big', async () => {
