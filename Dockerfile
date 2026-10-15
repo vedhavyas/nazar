@@ -12,6 +12,11 @@ RUN npm run build
 
 # --- the server --------------------------------------------------------------
 FROM rust:bookworm AS rust
+# The MQTT client's TLS is the platform's (native-tls), which is openssl
+# here; the headers are build-time only.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libssl-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
 # rust-toolchain.toml pins the nightly; rustup installs it here.
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
@@ -31,7 +36,7 @@ LABEL org.opencontainers.image.source="https://github.com/vedhavyas/nazar" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg util-linux \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libssl3 util-linux \
  && rm -rf /var/lib/apt/lists/*
 RUN case "$(dpkg --print-architecture)" in \
       amd64) GO2RTC_ARCH=amd64 ;; \
