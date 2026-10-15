@@ -329,6 +329,12 @@ struct PtzStep {
     dy: i64,
 }
 
+/// The biggest step one request may carry, in camera units. The camera's
+/// own range is not known to anyone (no reference carries one), so the
+/// read-back stays the contract; this only stops a hand-rolled request
+/// from throwing the lens across its arc in one write.
+const MAX_STEP: i64 = 60;
+
 /// The camera is asked to move by a delta from where it reports it is, and
 /// the answer is the position the shadow holds afterwards - the camera's
 /// ack says nothing either way.
@@ -337,6 +343,12 @@ async fn camera_ptz(
     Path(id): Path<String>,
     Json(step): Json<PtzStep>,
 ) -> Result<Json<Value>, ApiError> {
+    if step.dx.abs() > MAX_STEP || step.dy.abs() > MAX_STEP {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("a step is at most {MAX_STEP} units"),
+        ));
+    }
     let (device, session) = control_target(&state, &id).await?;
     let (x, y) = read_shadow(&state.qubo, &session, &device)
         .await?
