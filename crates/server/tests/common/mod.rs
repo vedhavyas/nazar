@@ -11,7 +11,7 @@ use axum::Router;
 use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::routing::{get, put};
+use axum::routing::{any, get, put};
 use tokio::net::TcpListener;
 
 /// A fake go2rtc API: records the stream PUTs it receives and answers GETs
@@ -53,7 +53,9 @@ impl FakeApi {
                 })
                 .get(|| async { include_str!("../fixtures/streams.json") }),
             )
-            .route("/api/ws", get(echo));
+            .route("/api/ws", get(echo))
+            // The SDP exchange the proxy is allowed to carry.
+            .route("/api/webrtc", any(|| async { "sdp-answer" }));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port");

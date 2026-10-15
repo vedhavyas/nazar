@@ -30,6 +30,9 @@ struct Spa;
 /// bigger is a browser mistake, not a stream.
 const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
+/// The go2rtc paths the browser's player may reach through the proxy.
+const ALLOWED_PROXY_PATHS: [&str; 2] = ["api/ws", "api/webrtc"];
+
 /// The WebSocket client wants a `ws://` URL; the API base is `http://`.
 fn ws_target(target: &str) -> String {
     match target.strip_prefix("http") {
@@ -282,6 +285,11 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
         .uri
         .query()
         .map_or(String::new(), |query| format!("?{query}"));
+    // Only what the player needs. go2rtc's API is an admin surface (stream
+    // PUTs, api/exit); none of it may be reachable from a browser.
+    if !ALLOWED_PROXY_PATHS.contains(&rest.as_str()) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
+    }
     let base = state.go2rtc_api.trim_end_matches('/');
     let target = format!("{base}/{rest}{query}");
 

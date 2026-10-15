@@ -431,15 +431,27 @@ async fn the_proxy_reaches_go2rtc_through_the_gate() {
 
     unlock(&client, &h.base).await;
     let response = client
-        .get(format!("{}/go2rtc/api/streams", h.base))
+        .post(format!("{}/go2rtc/api/webrtc?src=cam", h.base))
         .send()
         .await
-        .expect("proxied streams");
+        .expect("proxied sdp");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body = response.text().await.expect("body");
-    assert!(
-        body.contains("\"hall\""),
-        "the fake go2rtc answered through the proxy: {body}"
+    assert_eq!(
+        body, "sdp-answer",
+        "the fake go2rtc answered through the proxy"
+    );
+
+    // go2rtc's admin surface stays out of the browser's reach.
+    let admin = client
+        .put(format!("{}/go2rtc/api/streams?name=x&src=y", h.base))
+        .send()
+        .await
+        .expect("admin put");
+    assert_eq!(
+        admin.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the streams admin path is not proxied"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
