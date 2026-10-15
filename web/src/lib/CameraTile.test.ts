@@ -58,32 +58,50 @@ test('a browser without native HLS gets the vendored player', async () => {
   vi.useFakeTimers();
   // Desktop Chromium plays no HLS itself, but hls.js carries it.
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
-  const loaded: string[] = [];
-  const attached: string[] = [];
-  vi.stubGlobal('Hls', {
-    isSupported: () => true,
-    loadSource: (source: string) => loaded.push(source),
-    attachMedia: (video: HTMLVideoElement) => attached.push(video.tagName),
-    destroy: () => {},
-  });
+  FakeHls.instances = [];
+  vi.stubGlobal('Hls', FakeHls);
   liveTile();
 
   await vi.advanceTimersByTimeAsync(12_500);
   await vi.waitFor(() =>
-    expect(loaded.length, 'the vendored player is given the stream').toBe(1),
+    expect(FakeHls.instances.length, 'the vendored player is started').toBe(1),
   );
 
+  const player = FakeHls.instances[0];
   expect(
-    loaded[0],
-    "the vendored player was pointed at the tile's stream",
+    player.loaded[0],
+    "the instance was pointed at the tile's stream",
   ).toBe('/go2rtc/api/stream.m3u8?src=cam-1-high');
-  expect(attached[0], 'and given the element to play into').toBe('VIDEO');
+  expect(player.attached[0]?.tagName, 'and given the element to play into').toBe('VIDEO');
   expect(
     document.querySelector('[data-testid=hls]'),
     'the fallback is what is shown',
   ).toBeTruthy();
   expect(screen.queryByText(/did not start/), 'no retry note').toBeNull();
 });
+
+/** The vendored player's shape: a class whose only static is
+ * `isSupported`, with the rest on the instance - exactly as hls.js ships.
+ * A stub shaped any other way would pass while the real file threw. */
+class FakeHls {
+  static instances: FakeHls[] = [];
+  static isSupported = () => true;
+  loaded: string[] = [];
+  attached: HTMLVideoElement[] = [];
+  destroyed = 0;
+  constructor() {
+    FakeHls.instances.push(this);
+  }
+  loadSource(source: string) {
+    this.loaded.push(source);
+  }
+  attachMedia(video: HTMLVideoElement) {
+    this.attached.push(video);
+  }
+  destroy() {
+    this.destroyed += 1;
+  }
+}
 
 /** Fail the vendored player's fetch, as a browser that cannot reach it
  * would: the retry path is what is left. */
@@ -100,12 +118,9 @@ async function failVendoredPlayer(note: RegExp = /did not start/) {
 test('hls.js refusing the browser offers the retry too', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
-  vi.stubGlobal('Hls', {
-    isSupported: () => false,
-    loadSource: vi.fn(),
-    attachMedia: vi.fn(),
-    destroy: vi.fn(),
-  });
+  FakeHls.instances = [];
+  FakeHls.isSupported = () => false;
+  vi.stubGlobal('Hls', FakeHls);
   liveTile();
 
   await vi.advanceTimersByTimeAsync(12_500);
