@@ -69,7 +69,9 @@ test('a browser without native HLS gets the vendored player', async () => {
   liveTile();
 
   await vi.advanceTimersByTimeAsync(12_500);
-  await vi.waitFor(() => expect(loaded.length).toBe(1));
+  await vi.waitFor(() =>
+    expect(loaded.length, 'the vendored player is given the stream').toBe(1),
+  );
 
   expect(
     loaded[0],
@@ -94,6 +96,27 @@ async function failVendoredPlayer(note: RegExp = /did not start/) {
     expect(screen.getByText(note), 'the person gets the retry').toBeTruthy();
   });
 }
+
+test('hls.js refusing the browser offers the retry too', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  vi.stubGlobal('Hls', {
+    isSupported: () => false,
+    loadSource: vi.fn(),
+    attachMedia: vi.fn(),
+    destroy: vi.fn(),
+  });
+  liveTile();
+
+  await vi.advanceTimersByTimeAsync(12_500);
+  await vi.waitFor(() => {
+    expect(screen.getByText(/did not start/), 'no player means the retry').toBeTruthy();
+  });
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'and no video element pretending to play',
+  ).toBeNull();
+});
 
 test('a browser with neither native HLS nor hls.js offers the retry', async () => {
   vi.useFakeTimers();
