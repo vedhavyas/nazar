@@ -32,4 +32,7 @@ test('the banner follows the server in both directions', async () => {
   expect(get(reachable), 'the next answered poll clears the banner').toBe(true);
 
   stop();
+  healthy = false;
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(get(reachable), 'a stopped poller stops touching the store').toBe(true);
 });

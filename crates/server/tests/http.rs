@@ -897,9 +897,9 @@ async fn websocket_frames_are_piped_through_the_proxy() {
     );
 
     // go2rtc hanging up reaches the browser as a close, not a silent stall.
-    let closed = socket
-        .next()
+    let closed = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
+        .expect("the close arrives promptly")
         .expect("a close frame comes back")
         .expect("without an error");
     assert!(

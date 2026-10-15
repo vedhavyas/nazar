@@ -70,6 +70,19 @@ test('an advancing picture is left alone', async () => {
   expect(screen.queryByText(/stopped/), 'a moving picture raises nothing').toBeNull();
 });
 
+test('a second playing event does not double the watch', async () => {
+  vi.useFakeTimers();
+  liveTile();
+  const video = await videoOf();
+  const every = vi.spyOn(globalThis, 'setInterval');
+
+  video.dispatchEvent(new Event('playing'));
+  video.dispatchEvent(new Event('playing'));
+
+  expect(every.mock.calls.length, 'one watch, not two').toBe(1);
+  every.mockRestore();
+});
+
 test('a frozen picture asks for a retry', async () => {
   vi.useFakeTimers();
   const { onwatch } = liveTile();
