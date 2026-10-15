@@ -33,7 +33,7 @@ build: build-web
 # paths all take environment overrides; just checks PATH otherwise).
 run: build-web
     mkdir -p {{justfile_directory()}}/.data
-    DATA_DIR={{justfile_directory()}}/.data cargo run -p server
+    DATA_DIR={{justfile_directory()}}/.data NAZAR_INSECURE_COOKIE=1 cargo run -p server
 
 # Build the container image and prove it healthy end to end.
 image:

@@ -17,8 +17,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
+use server::config::TrustedProxies;
 use server::go2rtc::Go2rtc;
-use server::http::{AppState, app};
+use server::http::{AppState, Wiring, app};
 use server::pin::PinGate;
 use server::supervisor::{Pacing, Supervisor};
 
@@ -39,6 +40,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(false).await
+}
+
+async fn harness_with(secure_cookies: bool) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = std::env::temp_dir().join(format!(
@@ -69,17 +74,27 @@ async fn harness() -> Harness {
     );
     let state = AppState::new(
         "test",
-        sessions,
-        client,
-        supervisor,
-        PinGate::new(&data_dir),
-        go2rtc.base.to_string(),
+        Wiring {
+            sessions,
+            qubo: client,
+            supervisor,
+            pin: PinGate::new(&data_dir),
+            go2rtc_api: go2rtc.base.to_string(),
+            // The harness trusts itself, so a test can name its own bucket.
+            trusted_proxies: TrustedProxies::parse("127.0.0.1/8"),
+            secure_cookies,
+        },
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let base = format!("http://{}", listener.local_addr().expect("the address"));
     tokio::spawn(async move {
-        axum::serve(listener, app(state)).await.expect("serves");
+        axum::serve(
+            listener,
+            app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serves");
     });
     Harness {
         base,
@@ -541,6 +556,57 @@ async fn the_camera_page_carries_the_degraded_reason() {
 }
 
 #[tokio::test]
+async fn the_throttle_counts_each_forwarded_client_separately() {
+    let h = harness().await;
+    unlock(&client(), &h.base).await;
+
+    // One client floods its own bucket through the trusted proxy.
+    let flooding = client();
+    for attempt in 1..=5 {
+        let response = flooding
+            .post(format!("{}/api/unlock", h.base))
+            .header("x-forwarded-for", "10.9.9.9")
+            .json(&json!({ "pin": "000000" }))
+            .send()
+            .await
+            .expect("wrong pin");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "attempt {attempt} inside the bucket is merely wrong"
+        );
+    }
+    let capped = flooding
+        .post(format!("{}/api/unlock", h.base))
+        .header("x-forwarded-for", "10.9.9.9")
+        .json(&json!({ "pin": "000000" }))
+        .send()
+        .await
+        .expect("sixth attempt");
+    assert_eq!(
+        capped.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the flooding client is capped"
+    );
+
+    // A different forwarded client keeps its own bucket.
+    let other = client();
+    let allowed = other
+        .post(format!("{}/api/unlock", h.base))
+        .header("x-forwarded-for", "10.9.9.10")
+        .json(&json!({ "pin": "000000" }))
+        .send()
+        .await
+        .expect("another client");
+    assert_eq!(
+        allowed.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "another client's own bucket is untouched"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn login_otp_is_gated_and_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
@@ -638,54 +704,23 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
 }
 
 #[tokio::test]
-async fn the_cookie_is_secure_only_behind_tls() {
-    let h = harness().await;
-    let client = client();
-
-    let local = client
-        .post(format!("{}/api/pin", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("set pin");
-    assert_eq!(local.status(), reqwest::StatusCode::NO_CONTENT);
-    let plain = client
-        .post(format!("{}/api/unlock", h.base))
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock");
-    let plain_cookie = plain
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .expect("a cookie")
-        .to_str()
-        .expect("a header value")
-        .to_owned();
+async fn the_cookie_is_secure_by_default_and_opt_out_for_local_runs() {
+    let secure = harness_with(true).await;
+    let browser = client();
+    let cookie = unlock(&browser, &secure.base).await;
     assert!(
-        !plain_cookie.contains("Secure"),
-        "a plain-http run must keep a usable cookie: {plain_cookie}"
+        cookie.contains("Secure") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"),
+        "deployment hands out a Secure, HttpOnly, SameSite=Lax cookie: {cookie}"
     );
+    let _ = std::fs::remove_dir_all(&secure.data_dir);
 
-    let behind_tls = client
-        .post(format!("{}/api/unlock", h.base))
-        .header("x-forwarded-proto", "https")
-        .json(&json!({ "pin": PIN }))
-        .send()
-        .await
-        .expect("unlock behind caddy");
-    let secure_cookie = behind_tls
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .expect("a cookie")
-        .to_str()
-        .expect("a header value")
-        .to_owned();
+    let local = harness().await;
+    let cookie = unlock(&client(), &local.base).await;
     assert!(
-        secure_cookie.contains("Secure") && secure_cookie.contains("HttpOnly"),
-        "behind TLS the cookie is Secure and HttpOnly: {secure_cookie}"
+        !cookie.contains("Secure"),
+        "the local opt-out keeps the cookie usable over http: {cookie}"
     );
-    let _ = std::fs::remove_dir_all(&h.data_dir);
+    let _ = std::fs::remove_dir_all(&local.data_dir);
 }
 
 #[tokio::test]

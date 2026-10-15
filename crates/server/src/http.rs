@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts as _, Path, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts as _, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 
 use qubo::{QuboClient, QuboError, SessionStore, request_otp, verify_otp};
 
+use crate::config::TrustedProxies;
 use crate::pin::{PinError, PinGate};
 use crate::supervisor::{StreamState, Supervisor, SupervisorError};
 
@@ -40,11 +42,15 @@ const PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const PROXY_WS_PATH: &str = "api/ws";
 
 /// A fixed-window attempt limit, keyed by client: a short PIN must not be
-/// brute-forceable, and each verify costs a 19 MiB hash.
+/// brute-forceable, and each verify costs a 19 MiB hash. A house-wide
+/// ceiling sits beside the per-client one so rotating keys cannot buy
+/// unlimited guesses.
 struct Throttle {
     limit: u32,
+    global_limit: u32,
     window: Duration,
     attempts: Mutex<HashMap<String, Attempts>>,
+    global: Mutex<Attempts>,
     permits: Semaphore,
 }
 
@@ -54,22 +60,38 @@ struct Attempts {
 }
 
 impl Throttle {
-    fn new(limit: u32, window: Duration, concurrent: usize) -> Self {
+    fn new(limit: u32, global_limit: u32, window: Duration, concurrent: usize) -> Self {
         Self {
             limit,
+            global_limit,
             window,
             attempts: Mutex::new(HashMap::new()),
+            global: Mutex::new(Attempts {
+                count: 0,
+                until: Instant::now(),
+            }),
             permits: Semaphore::new(concurrent),
         }
     }
 
-    /// Count one attempt, or say how long the client must wait.
+    /// Count one attempt, or say how long the caller must wait.
     fn allow(&self, key: &str) -> Result<(), Duration> {
         let now = Instant::now();
-        let mut attempts = self
-            .attempts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut global = self.lock_global();
+            if now >= global.until {
+                *global = Attempts {
+                    count: 0,
+                    until: now + self.window,
+                };
+            }
+            if global.count >= self.global_limit {
+                return Err(global.until - now);
+            }
+            global.count += 1;
+        }
+
+        let mut attempts = self.lock_attempts();
         if attempts.len() > 64 {
             attempts.retain(|_, entry| entry.until > now);
         }
@@ -92,24 +114,38 @@ impl Throttle {
 
     /// Forget a client's failures once it has proven itself.
     fn clear(&self, key: &str) {
+        self.lock_attempts().remove(key);
+    }
+
+    fn lock_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
         self.attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+    }
+
+    fn lock_global(&self) -> std::sync::MutexGuard<'_, Attempts> {
+        self.global
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-/// The client behind caddy: the first `X-Forwarded-For` hop, else one
-/// shared bucket (a mesh peer talking to the server directly is inside the
-/// perimeter already).
-fn client_key(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+/// The client the rate limiter counts against: the first `X-Forwarded-For`
+/// hop, but only when the transport peer is a configured proxy - otherwise
+/// anyone reaching the server directly could pick their own bucket by
+/// setting the header. A stranger peer keys as itself.
+fn client_key(headers: &HeaderMap, peer: IpAddr, trusted: &TrustedProxies) -> String {
+    if trusted.trusts(peer)
+        && let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    {
+        return forwarded.to_owned();
+    }
+    peer.to_string()
 }
 
 /// The WebSocket client wants a `ws://` URL; the API base is `http://`.
@@ -137,26 +173,36 @@ pub struct AppState {
     pub pin: PinGate,
     /// go2rtc's API base the proxy forwards to.
     pub go2rtc_api: String,
+    /// Whose `X-Forwarded-For` the throttle believes.
+    pub trusted_proxies: TrustedProxies,
+    /// Off only for local http runs; deployment is TLS-only.
+    pub secure_cookies: bool,
     http: reqwest::Client,
     throttle: Arc<Throttle>,
 }
 
+/// What the app is wired to: the deployment's parts, in one literal.
+pub struct Wiring {
+    pub sessions: SessionStore,
+    pub qubo: QuboClient,
+    pub supervisor: Supervisor,
+    pub pin: PinGate,
+    pub go2rtc_api: String,
+    pub trusted_proxies: TrustedProxies,
+    pub secure_cookies: bool,
+}
+
 impl AppState {
-    pub fn new(
-        version: &'static str,
-        sessions: SessionStore,
-        qubo: QuboClient,
-        supervisor: Supervisor,
-        pin: PinGate,
-        go2rtc_api: impl Into<String>,
-    ) -> Self {
+    pub fn new(version: &'static str, wiring: Wiring) -> Self {
         Self {
             version,
-            sessions,
-            qubo,
-            supervisor,
-            pin,
-            go2rtc_api: go2rtc_api.into(),
+            sessions: wiring.sessions,
+            qubo: wiring.qubo,
+            supervisor: wiring.supervisor,
+            pin: wiring.pin,
+            go2rtc_api: wiring.go2rtc_api,
+            trusted_proxies: wiring.trusted_proxies,
+            secure_cookies: wiring.secure_cookies,
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -166,7 +212,7 @@ impl AppState {
                     tracing::warn!(%err, "proxy client fell back to defaults");
                     reqwest::Client::new()
                 }),
-            throttle: Arc::new(Throttle::new(5, Duration::from_secs(60), 2)),
+            throttle: Arc::new(Throttle::new(5, 30, Duration::from_secs(60), 2)),
         }
     }
 }
@@ -262,10 +308,11 @@ async fn set_pin(
 
 async fn unlock(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<PinRequest>,
 ) -> Result<Response, ApiError> {
-    let client = client_key(&headers);
+    let client = client_key(&headers, peer.ip(), &state.trusted_proxies);
     if let Err(wait) = state.throttle.allow(&client) {
         tracing::warn!(client = %client, "unlock refused: too many tries");
         return Err(ApiError::new(
@@ -296,7 +343,7 @@ async fn unlock(
     Ok(with_session_cookie(
         StatusCode::NO_CONTENT,
         &token,
-        is_secure(&headers),
+        state.secure_cookies,
     ))
 }
 
@@ -342,7 +389,7 @@ async fn login_verify(
     Ok(with_session_cookie(
         StatusCode::NO_CONTENT,
         &state.pin.mint_session(),
-        is_secure(&headers),
+        state.secure_cookies,
     ))
 }
 
@@ -640,14 +687,6 @@ fn single_src(query: &str) -> Option<String> {
         found = Some(value.to_owned());
     }
     found
-}
-
-/// Whether the request reached us over TLS, as caddy reports it.
-fn is_secure(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
 }
 
 /// Run blocking work (Argon2 hashing, fsyncs) off the runtime's worker

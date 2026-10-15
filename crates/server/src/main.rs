@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
 use server::go2rtc::Go2rtc;
-use server::http::{AppState, app};
+use server::http::{AppState, Wiring, app};
 use server::pin::PinGate;
 use server::supervisor::{Pacing, Supervisor};
 use tracing_subscriber::EnvFilter;
@@ -45,11 +45,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(
         env!("CARGO_PKG_VERSION"),
-        sessions,
-        qubo,
-        supervisor,
-        PinGate::new(&config.data_dir),
-        server::go2rtc::API_BASE,
+        Wiring {
+            sessions,
+            qubo,
+            supervisor,
+            pin: PinGate::new(&config.data_dir),
+            go2rtc_api: server::go2rtc::API_BASE.to_owned(),
+            trusted_proxies: config.trusted_proxies.clone(),
+            secure_cookies: !config.insecure_cookie,
+        },
     );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT))
         .await
@@ -58,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
         "nazar listening on {}",
         listener.local_addr().context("the local address")?
     );
-    axum::serve(listener, app(state)).await.context("serving")?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serving")?;
     Ok(())
 }
