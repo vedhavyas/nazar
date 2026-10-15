@@ -108,7 +108,7 @@ async fn harness() -> Harness {
     );
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
-    server::motion::follow(&events, Arc::clone(&motion));
+    server::motion::follow(&events, Arc::clone(&motion), &supervisor);
     let state = AppState::new(
         "test",
         Wiring {
@@ -211,6 +211,28 @@ async fn the_hero_follows_motion_after_a_burst_past_the_bus() {
             online: true,
         });
     }
+    // A motion from something the account does not have (or that is not a
+    // camera) must not take the tile.
+    for device in ["not-a-camera", "d0000000-0000-4000-8000-000000000003"] {
+        h.events.publish(UnitEvent::Motion {
+            device_id: device.to_owned(),
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let untouched: Value = browser
+        .get(format!("{}/api/motion/hero", h.base))
+        .send()
+        .await
+        .expect("hero")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        untouched,
+        json!({ "hero": null }),
+        "only a camera the account has can be the hero"
+    );
+
     h.events.publish(UnitEvent::Motion {
         device_id: GATE.to_owned(),
     });
