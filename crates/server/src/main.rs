@@ -30,13 +30,17 @@ async fn main() -> anyhow::Result<()> {
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
 
-    if sessions
-        .load()
-        .context("reading the stored session")?
-        .is_some()
-        && let Err(err) = supervisor.refresh_devices().await
-    {
-        tracing::warn!(%err, "device discovery at boot failed");
+    // A session that cannot be read is not fatal: the UI can serve login.
+    match sessions.load() {
+        Ok(Some(_)) => {
+            if let Err(err) = supervisor.refresh_devices().await {
+                tracing::warn!(%err, "device discovery at boot failed");
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(%err, "the stored session could not be read; starting logged out");
+        }
     }
 
     let state = AppState::new(
