@@ -7,7 +7,7 @@ mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ use qubo::{QuboClient, SessionStore};
 use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
-use server::motion::MotionOrder;
+use server::motion::{Hysteresis, MotionOrder};
 use server::mqtt::UnitEvent;
 use server::supervisor::{Pacing, Supervisor};
 
@@ -37,6 +37,9 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 struct Harness {
     base: String,
     qubo: MockServer,
+    /// A second handle on the app's supervisor, for tests that follow the
+    /// bus themselves.
+    supervisor: Supervisor,
     go2rtc: common::FakeApi,
     events: EventBus,
 }
@@ -120,7 +123,7 @@ async fn harness() -> Harness {
         Wiring {
             sessions,
             qubo: client,
-            supervisor,
+            supervisor: supervisor.clone(),
             go2rtc_api: go2rtc.base.to_string(),
             events: events.clone(),
             motion,
@@ -134,6 +137,7 @@ async fn harness() -> Harness {
     Harness {
         base,
         qubo,
+        supervisor,
         go2rtc,
         events,
     }
@@ -265,6 +269,35 @@ async fn the_hero_follows_motion_after_a_burst_past_the_bus() {
         Some(json!({ "hero": GATE })),
         "motion after an overflow still elects"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_motion_published_before_the_follower_is_polled_is_not_lost() {
+    let h = harness().await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    let order = Arc::new(Mutex::new(MotionOrder::new()));
+    let follower = server::motion::follow(&h.events, Arc::clone(&order), &h.supervisor);
+
+    // No await between the subscription above and this publish: on a
+    // current-thread runtime the follower's task has not been polled yet,
+    // so a subscription taken up inside that task would miss it.
+    h.events.publish(UnitEvent::Motion {
+        device_id: HALL.to_owned(),
+    });
+
+    let heard = common::eventually(|| async {
+        let hero = order
+            .lock()
+            .expect("the order")
+            .hero(Instant::now(), Hysteresis::default());
+        hero == Some(HALL.to_owned())
+    })
+    .await;
+    assert!(
+        heard,
+        "a motion published before the follower's first poll still elects"
+    );
+    follower.abort();
 }
 
 #[tokio::test]
