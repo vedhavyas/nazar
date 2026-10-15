@@ -36,6 +36,7 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct Harness {
     base: String,
+    qubo: MockServer,
     go2rtc: common::FakeApi,
     events: EventBus,
 }
@@ -98,10 +99,12 @@ async fn harness() -> Harness {
         client.clone(),
         sessions.clone(),
         Go2rtc::connect(go2rtc.base.clone()),
+        // Long, so a re-mint inside a test's window is the wake's doing and
+        // never the loop's own backoff.
         Pacing {
             remint: Duration::from_secs(30),
-            retry_base: Duration::from_millis(50),
-            retry_max: Duration::from_millis(200),
+            retry_base: Duration::from_secs(30),
+            retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
         },
@@ -127,6 +130,7 @@ async fn harness() -> Harness {
     });
     Harness {
         base,
+        qubo,
         go2rtc,
         events,
     }
@@ -317,6 +321,103 @@ async fn a_stream_is_asked_for_by_quality() {
         reqwest::StatusCode::BAD_REQUEST,
         "a quality that is not one of the two is refused"
     );
+}
+
+#[tokio::test]
+async fn only_the_persons_retry_reaches_the_wake_over_the_wire() {
+    let h = harness().await;
+    let browser = client();
+    let mint = format!("{MINT_PATH}/device/{HALL}");
+
+    // The camera refuses once, then answers: the first ask lands Degraded
+    // and never recovers on its own inside this test.
+    Mock::given(method("POST"))
+        .and(path(mint.clone()))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+
+    let first = browser
+        .post(format!("{}/api/cameras/{HALL}/live", h.base))
+        .send()
+        .await
+        .expect("the first ask");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let refused = common::eventually(|| async {
+        browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json")["cameras"][0]["state"]
+            == json!("degraded")
+    })
+    .await;
+    assert!(refused, "the refused mint degrades the stream");
+
+    // A poll's ask, without the person's intent: nothing re-mints.
+    let poll = browser
+        .post(format!("{}/api/cameras/{HALL}/live?quality=high", h.base))
+        .send()
+        .await
+        .expect("the poll's ask");
+    assert_eq!(poll.status(), reqwest::StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(mints(&h.qubo, &mint).await, 1, "the poll did not re-mint");
+
+    // The person's Try again, spelled the way the server parses it.
+    let retry = browser
+        .post(format!(
+            "{}/api/cameras/{HALL}/live?quality=high&retry=true",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("the retry");
+    assert_eq!(retry.status(), reqwest::StatusCode::OK);
+    let live = common::eventually(|| async {
+        browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json")["cameras"][0]["state"]
+            == json!("live")
+    })
+    .await;
+    assert!(live, "retry=true re-minted inside the window");
+    assert_eq!(mints(&h.qubo, &mint).await, 2, "one re-mint, not a storm");
+
+    // The spelling that shipped the flag dead: refused, not ignored.
+    let wrong = browser
+        .post(format!(
+            "{}/api/cameras/{HALL}/live?quality=high&retry=1",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("the wrong spelling");
+    assert_eq!(
+        wrong.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "retry=1 is not a bool the server takes"
+    );
+}
+
+async fn mints(server: &MockServer, mint: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("the requests")
+        .iter()
+        .filter(|request| request.url.path() == mint)
+        .count()
 }
 
 #[tokio::test]
