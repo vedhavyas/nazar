@@ -18,11 +18,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use qubo::{
-    Device, QuboClient, QuboError, Session, SessionStore, read_shadow, request_otp, verify_otp,
-    write_service,
+    Device, Quality, QuboClient, QuboError, Session, SessionStore, read_shadow, request_otp,
+    verify_otp, write_service,
 };
 
-use crate::supervisor::{StreamState, Supervisor, SupervisorError};
+use crate::supervisor::{StreamState, Supervisor, SupervisorError, stream_name};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
 #[derive(Embed)]
@@ -239,8 +239,8 @@ async fn camera_live(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_devices(&state).await?;
-    state.supervisor.ensure_live(&id).await?;
-    Ok(Json(json!({ "stream": id })))
+    state.supervisor.ensure(&id, Quality::High).await?;
+    Ok(Json(json!({ "stream": stream_name(&id, Quality::High) })))
 }
 
 #[derive(Deserialize)]
@@ -411,12 +411,19 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
     if !safe {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
     }
+    // A stream is a camera plus its quality class, and only those two.
+    let Some((camera, quality)) = src.rsplit_once('-') else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+    };
+    if !matches!(quality, "high" | "low") {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+    }
     let known = state
         .supervisor
         .devices()
         .await
         .iter()
-        .any(|device| device.device_id == src);
+        .any(|device| device.device_id == camera);
     if !known {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
     }

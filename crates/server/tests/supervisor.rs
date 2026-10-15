@@ -15,9 +15,9 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use qubo::{QuboClient, Session, SessionStore};
+use qubo::{Quality, QuboClient, Session, SessionStore};
 use server::go2rtc::Go2rtc;
-use server::supervisor::{Pacing, StreamState, Supervisor, SupervisorError};
+use server::supervisor::{Pacing, StreamState, Supervisor, SupervisorError, stream_name};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
@@ -41,6 +41,7 @@ fn pacing(remint: Duration) -> Pacing {
         retry_base: Duration::from_millis(20),
         retry_max: Duration::from_millis(200),
         discovery_retry: Duration::from_millis(50),
+        tile_idle: Duration::from_secs(30),
     }
 }
 
@@ -139,21 +140,25 @@ async fn ensure_live_mints_once_and_reuses_the_stream() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure_live(DEVICE_ID)
+        .ensure(DEVICE_ID, Quality::High)
         .await
         .expect("the first call starts the stream");
     assert!(is_live(&h.supervisor).await, "the stream goes live");
     assert_eq!(mint_count(&h.qubo).await, 1, "the first call mints once");
     assert_eq!(h.go2rtc.puts().len(), 1, "the source reached go2rtc");
     let (name, source) = h.go2rtc.puts().remove(0);
-    assert_eq!(name, DEVICE_ID, "the stream carries the device id");
+    assert_eq!(
+        name,
+        stream_name(DEVICE_ID, Quality::High),
+        "the stream carries the device and its quality"
+    );
     assert!(
         source.starts_with("ffmpeg:") && source.contains("#input=nazar#video=h264"),
         "the minted URL rides the transcoding template: {source}"
     );
 
     h.supervisor
-        .ensure_live(DEVICE_ID)
+        .ensure(DEVICE_ID, Quality::High)
         .await
         .expect("the second call reuses the stream");
     assert_eq!(
@@ -193,7 +198,7 @@ async fn an_expired_session_degrades_with_the_exact_reason_and_a_fresh_login_rec
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure_live(DEVICE_ID)
+        .ensure(DEVICE_ID, Quality::High)
         .await
         .expect("the stream starts");
     assert!(is_live(&h.supervisor).await, "the stream goes live");
@@ -221,7 +226,8 @@ async fn an_expired_session_degrades_with_the_exact_reason_and_a_fresh_login_rec
     let puts = h.go2rtc.puts();
     assert!(puts.len() >= 2, "go2rtc was handed a new source");
     assert!(
-        puts.iter().all(|(name, _)| name == DEVICE_ID),
+        puts.iter()
+            .all(|(name, _)| name == &stream_name(DEVICE_ID, Quality::High)),
         "every swap keeps the stream name"
     );
     assert_ne!(
@@ -240,7 +246,7 @@ async fn a_failing_mint_degrades_and_keeps_retrying() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure_live(DEVICE_ID)
+        .ensure(DEVICE_ID, Quality::High)
         .await
         .expect("ensure_live still returns; the state carries the failure");
 
@@ -281,6 +287,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
         discovery_retry: Duration::from_secs(30),
+        tile_idle: Duration::from_secs(30),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -290,7 +297,10 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         .mount(&h.qubo)
         .await;
     h.supervisor.refresh_devices().await.expect("discovery");
-    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("starts");
 
     assert!(
         matches!(
@@ -312,7 +322,10 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         .mount(&h.qubo)
         .await;
 
-    h.supervisor.ensure_live(DEVICE_ID).await.expect("retry");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("retry");
     let recovered = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(
         recovered,
@@ -342,7 +355,7 @@ async fn a_cancelled_start_does_not_strand_the_device() {
 
     let cancelled = tokio::time::timeout(
         Duration::from_millis(150),
-        h.supervisor.ensure_live(DEVICE_ID),
+        h.supervisor.ensure(DEVICE_ID, Quality::High),
     )
     .await;
     assert!(cancelled.is_err(), "the request gave up mid-mint");
@@ -363,7 +376,10 @@ async fn a_put_go2rtc_did_not_take_is_degraded_not_live() {
     h.go2rtc.set_streams_visible(false);
     h.supervisor.refresh_devices().await.expect("discovery");
 
-    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("starts");
 
     match h.supervisor.status(DEVICE_ID).await {
         StreamState::Degraded { reason } => {
@@ -387,7 +403,10 @@ async fn a_failed_swap_never_leaks_the_stream_token() {
     h.go2rtc.set_put_status(400);
     h.supervisor.refresh_devices().await.expect("discovery");
 
-    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High)
+        .await
+        .expect("starts");
 
     match h.supervisor.status(DEVICE_ID).await {
         StreamState::Degraded { reason } => {

@@ -15,11 +15,12 @@ use axum::response::Response;
 use axum::routing::{get, put};
 use tokio::net::TcpListener;
 
-/// A fake go2rtc API: records the stream PUTs it receives and answers GETs
-/// with the shape measured from go2rtc 1.9.14.
+/// A fake go2rtc API: records the stream PUTs and DELETEs it receives and
+/// answers GETs with the shape measured from go2rtc 1.9.14.
 pub struct FakeApi {
     pub base: reqwest::Url,
     puts: Arc<Mutex<Vec<(String, String)>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
     streams_visible: Arc<AtomicBool>,
 }
@@ -27,6 +28,7 @@ pub struct FakeApi {
 impl FakeApi {
     pub async fn start() -> Self {
         let puts = Arc::new(Mutex::new(Vec::new()));
+        let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let app = Router::new()
@@ -56,6 +58,18 @@ impl FakeApi {
                                 )
                             };
                             (code, body)
+                        }
+                    }
+                })
+                .delete({
+                    let dropped = Arc::clone(&deletes);
+                    move |Query(params): Query<HashMap<String, String>>| {
+                        let dropped = Arc::clone(&dropped);
+                        async move {
+                            dropped
+                                .lock()
+                                .unwrap()
+                                .push(params.get("src").cloned().unwrap_or_default());
                         }
                     }
                 })
@@ -102,6 +116,7 @@ impl FakeApi {
         Self {
             base: format!("http://{addr}").parse().expect("a url"),
             puts,
+            deletes,
             put_status,
             streams_visible,
         }
@@ -121,6 +136,11 @@ impl FakeApi {
     /// The stream PUTs received so far, as `(name, source)`.
     pub fn puts(&self) -> Vec<(String, String)> {
         self.puts.lock().unwrap().clone()
+    }
+
+    /// The stream names dropped so far.
+    pub fn deletes(&self) -> Vec<String> {
+        self.deletes.lock().unwrap().clone()
     }
 }
 
