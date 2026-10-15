@@ -179,7 +179,6 @@ async fn run(
                 backoff = config.retry_min;
             }
             Ok(FeedEnd::Lost { healthy: false }) => {
-                eprintln!("DIAG lost unhealthy");
                 tracing::warn!("the mqtt feed could not connect");
                 backoff = (backoff * 2).min(config.retry_max);
             }
@@ -270,15 +269,19 @@ async fn feed(
                 }
                 // A rejected subscription is not a quiet house: the broker
                 // said no, and only a fresh connect (and the REST check
-                // behind it) can tell an expired session from a refusual.
+                // behind it) can tell an expired session from a refusal.
                 Ok(Event::Incoming(Incoming::SubAck(ack))) => {
                     healthy = true;
                     let refused = ack.return_codes.iter().any(|code| {
                         !matches!(code, rumqttc::SubscribeReasonCode::Success(_))
                     });
                     if refused {
-                        tracing::warn!(?ack, "the broker refused a subscription; reconnecting");
-                        return Ok(FeedEnd::Reconnect);
+                        // A refusal is a broker-level failure, not a
+                        // deliberate restart: it takes the backoff, or a
+                        // broker that keeps refusing becomes a hot loop of
+                        // REST calls and reconnects.
+                        tracing::warn!(?ack, "the broker refused a subscription");
+                        return Ok(FeedEnd::Lost { healthy: false });
                     }
                 }
                 Ok(_) => {}
