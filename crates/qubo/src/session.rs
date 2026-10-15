@@ -1,8 +1,6 @@
 //! Durable Qubo session state.
 
-use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,18 +46,13 @@ impl SessionStore {
     pub fn save(&self, session: &Session) -> Result<(), QuboError> {
         let raw = serde_json::to_vec_pretty(session)?;
         // Write-then-rename so a crash mid-write cannot leave a torn
-        // session behind; re-login needs the phone owner.
-        let tmp = self.path.with_extension("tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        // session behind; re-login needs the phone owner. The temp file is
+        // unique per writer (0600), so two savers cannot tear each other's.
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
         file.write_all(&raw)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.path)?;
+        file.as_file().sync_all()?;
+        file.persist(&self.path).map_err(|err| err.error)?;
         Ok(())
     }
 }

@@ -70,18 +70,13 @@ impl PinGate {
             .map_err(|err| PinError::Hash(err.to_string()))?;
         let hash = hash.to_string();
         // Write-then-rename, owner-only: a torn PIN file would lock the
-        // family out until the volume is fixed by hand.
-        let tmp = self.path.with_extension("tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        // family out until the volume is fixed by hand. The temp file is
+        // unique per writer, so two setters cannot tear each other's.
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
         file.write_all(hash.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.path)?;
+        file.as_file().sync_all()?;
+        file.persist(&self.path).map_err(|err| err.error)?;
         tracing::info!(path = %self.path.display(), "household PIN set");
         Ok(())
     }
