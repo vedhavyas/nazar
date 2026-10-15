@@ -178,7 +178,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/cameras", get(cameras))
         .route("/api/cameras/{id}/live", post(camera_live))
         .route("/api/cameras/{id}/ptz", post(camera_ptz))
-        .route("/api/cameras/{id}/privacy", post(camera_privacy))
+        .route(
+            "/api/cameras/{id}/privacy",
+            get(camera_privacy_state).post(camera_privacy),
+        )
         .route("/api/motion/hero", get(motion_hero))
         .route("/api/events", get(events_socket))
         .route("/go2rtc/{*rest}", any(proxy))
@@ -366,6 +369,20 @@ async fn camera_ptz(
 #[derive(Deserialize)]
 struct PrivacyOn {
     on: bool,
+}
+
+/// The lens, as the camera itself reports it: what the screen shows on
+/// arrival, before any write has happened.
+async fn camera_privacy_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (device, session) = control_target(&state, &id).await?;
+    let privacy = read_shadow(&state.qubo, &session, &device)
+        .await?
+        .camera_enabled()
+        .map(|enabled| !enabled);
+    Ok(Json(json!({ "privacy": privacy })))
 }
 
 /// Privacy on means the lens is closed: `cameraFunction.state = disable`.

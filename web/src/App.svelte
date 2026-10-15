@@ -3,12 +3,14 @@
 
   import { api } from './lib/api';
   import { reachable, watchHealth } from './lib/health';
+  import Camera from './routes/Camera.svelte';
   import Home from './routes/Home.svelte';
   import Login from './routes/Login.svelte';
 
-  type Screen = 'checking' | 'login' | 'home';
+  type Screen = 'checking' | 'login' | 'home' | 'camera';
 
   let screen = $state<Screen>('checking');
+  let openId = $state<string | null>(null);
 
   onMount(() => {
     const stop = watchHealth();
@@ -37,6 +39,14 @@
   </main>
 {:else if screen === 'login'}
   <Login onloggedin={() => (screen = 'home')} />
+{:else if screen === 'camera' && openId}
+  <Camera id={openId} onback={() => (screen = 'home')} onlocked={() => (screen = 'login')} />
 {:else}
-  <Home onlocked={() => (screen = 'login')} />
+  <Home
+    onopen={(id) => {
+      openId = id;
+      screen = 'camera';
+    }}
+    onlocked={() => (screen = 'login')}
+  />
 {/if}

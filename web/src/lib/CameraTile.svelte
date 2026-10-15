@@ -11,8 +11,14 @@
   let {
     camera,
     onwatch,
+    onopen,
     still = false,
-  }: { camera: Camera; onwatch: (id: string) => void; still?: boolean } = $props();
+  }: {
+    camera: Camera;
+    onwatch: (id: string) => void;
+    onopen?: (id: string) => void;
+    still?: boolean;
+  } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let snapshot = $state<HTMLCanvasElement | null>(null);
@@ -102,7 +108,11 @@
 
 <article class="tile">
   <header>
-    <h2>{camera.name}</h2>
+    {#if onopen}
+      <button class="name" onclick={() => onopen(camera.id)}>{camera.name}</button>
+    {:else}
+      <h2>{camera.name}</h2>
+    {/if}
     <span class="state" data-state={camera.state}>{STATE_WORDS[camera.state]}</span>
   </header>
 
@@ -147,6 +157,30 @@
 
   h2 {
     font-size: 17px;
+  }
+
+  /* The name is the door to the camera's own screen. */
+  .name {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: 17px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: var(--line);
+    text-underline-offset: 4px;
+  }
+
+  .name:hover {
+    text-decoration-color: var(--accent);
+  }
+
+  .name:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .state {
