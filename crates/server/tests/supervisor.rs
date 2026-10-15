@@ -309,6 +309,36 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
 }
 
 #[tokio::test]
+async fn a_cancelled_start_does_not_strand_the_device() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(mint_body("slow"))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&h.qubo)
+        .await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(150),
+        h.supervisor.ensure_live(DEVICE_ID),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the request gave up mid-mint");
+
+    assert_eq!(
+        h.supervisor.status(DEVICE_ID).await,
+        StreamState::Offline,
+        "a cancelled start leaves no Waking registration behind"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+#[tokio::test]
 async fn vod_is_reserved_for_m3() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     let err = h

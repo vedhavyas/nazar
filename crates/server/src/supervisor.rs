@@ -159,6 +159,14 @@ impl Supervisor {
         }
         .ok_or_else(|| SupervisorError::UnknownDevice(device_id.to_owned()))?;
 
+        // A cancelled request must not strand the device as Waking: the
+        // registration is undone unless the loop below takes it over.
+        let mut registration = Registration {
+            supervisor: self.clone(),
+            device_id: device_id.to_owned(),
+            armed: false,
+        };
+
         let wait = {
             let mut state = self.state.write().await;
             if state.contains_key(device_id) {
@@ -172,6 +180,7 @@ impl Supervisor {
                 },
             );
             drop(state);
+            registration.armed = true;
 
             match self.mint_and_swap(&device).await {
                 Ok(()) => {
@@ -187,6 +196,7 @@ impl Supervisor {
 
         let supervisor = self.clone();
         tokio::spawn(async move { supervisor.remint_loop(device, wait).await });
+        registration.armed = false;
         Ok(())
     }
 
@@ -284,6 +294,35 @@ fn new_tracked() -> Tracked {
     Tracked {
         state: StreamState::Offline,
         wake: Arc::new(Notify::new()),
+    }
+}
+
+/// Undoes a registration whose `ensure_live` future was dropped before the
+/// re-mint loop took over.
+struct Registration {
+    supervisor: Supervisor,
+    device_id: String,
+    armed: bool,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut state) = self.supervisor.state.try_write() {
+            state.remove(&self.device_id);
+            return;
+        }
+        // The map is held elsewhere right now; finish the cleanup from a
+        // task rather than leaking the registration.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let supervisor = self.supervisor.clone();
+            let device_id = self.device_id.clone();
+            handle.spawn(async move {
+                supervisor.state.write().await.remove(&device_id);
+            });
+        }
     }
 }
 
