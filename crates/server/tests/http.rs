@@ -214,6 +214,50 @@ async fn a_refused_session_reads_as_needs_login() {
 }
 
 #[tokio::test]
+async fn only_cameras_are_listed() {
+    let h = harness().await;
+    mount_json(
+        &h.qubo,
+        UNITS_PATH,
+        json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
+    )
+    .await;
+    mount_json(
+        &h.qubo,
+        DEVICES_PATH,
+        json!({ "data": [
+            { "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" },
+            { "deviceUUID": "d0000000-0000-4000-8000-000000000003", "deviceName": "Purifier", "deviceType": "HPH01" },
+            { "deviceUUID": "d0000000-0000-4000-8000-000000000002", "deviceName": "Something", "deviceType": "" }
+        ] })
+        .to_string(),
+    )
+    .await;
+
+    let page: Value = client()
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras")
+        .json()
+        .await
+        .expect("json");
+
+    let ids: Vec<&str> = page["cameras"]
+        .as_array()
+        .expect("cameras")
+        .iter()
+        .map(|camera| camera["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![DEVICE_ID, "d0000000-0000-4000-8000-000000000002"],
+        "the camera and the unmarked device stay; the purifier is not a camera"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn watching_a_camera_starts_the_stream() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
