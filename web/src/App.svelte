@@ -38,12 +38,12 @@
 </script>
 
 {#if !$reachable}
-  <p class="banner" role="status">The server is not answering. Trying again…</p>
+  <p class="banner" role="status">The server is not answering. Trying again...</p>
 {/if}
 
 {#if screen === 'checking'}
   <main class="gate">
-    <p class="quiet">Looking for the server…</p>
+    <p class="quiet">Looking for the server...</p>
   </main>
 {:else if screen === 'unlock'}
   <Unlock onunlocked={afterUnlock} />

@@ -41,7 +41,7 @@
   <h1>Sign in</h1>
   <p class="lede">
     {#if step === 'phone'}
-      The cameras live behind the family's Qubo account. We will text a code to your phone.
+      The cameras live behind the family's Qubo account. Nazar will text a code to your phone.
     {:else}
       Enter the code we sent to {phone}.
     {/if}

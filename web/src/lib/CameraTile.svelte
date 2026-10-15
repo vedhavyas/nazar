@@ -92,7 +92,7 @@
     <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
     <button class="btn" onclick={() => onwatch(camera.id)}>Try again</button>
   {:else if camera.state === 'waking'}
-    <p class="note">Starting the stream…</p>
+    <p class="note">Starting the stream...</p>
   {:else}
     <p class="note">Not streaming.</p>
     <button class="btn go" onclick={() => onwatch(camera.id)}>Watch</button>
