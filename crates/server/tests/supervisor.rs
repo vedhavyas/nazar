@@ -140,7 +140,7 @@ async fn ensure_live_mints_once_and_reuses_the_stream() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the first call starts the stream");
     assert!(is_live(&h.supervisor).await, "the stream goes live");
@@ -158,7 +158,7 @@ async fn ensure_live_mints_once_and_reuses_the_stream() {
     );
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the second call reuses the stream");
     assert_eq!(
@@ -198,7 +198,7 @@ async fn an_expired_session_degrades_with_the_exact_reason_and_a_fresh_login_rec
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream starts");
     assert!(is_live(&h.supervisor).await, "the stream goes live");
@@ -246,7 +246,7 @@ async fn a_failing_mint_degrades_and_keeps_retrying() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("ensure_live still returns; the state carries the failure");
 
@@ -298,7 +298,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         .await;
     h.supervisor.refresh_devices().await.expect("discovery");
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("starts");
 
@@ -323,7 +323,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         .await;
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, true)
         .await
         .expect("retry");
     let recovered = common::eventually(|| async { is_live(&h.supervisor).await }).await;
@@ -355,7 +355,7 @@ async fn a_cancelled_start_does_not_strand_the_device() {
 
     let cancelled = tokio::time::timeout(
         Duration::from_millis(150),
-        h.supervisor.ensure(DEVICE_ID, Quality::High),
+        h.supervisor.ensure(DEVICE_ID, Quality::High, false),
     )
     .await;
     assert!(cancelled.is_err(), "the request gave up mid-mint");
@@ -377,7 +377,7 @@ async fn a_put_go2rtc_did_not_take_is_degraded_not_live() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("starts");
 
@@ -404,7 +404,7 @@ async fn a_failed_swap_never_leaks_the_stream_token() {
     h.supervisor.refresh_devices().await.expect("discovery");
 
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("starts");
 

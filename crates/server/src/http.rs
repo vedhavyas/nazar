@@ -254,6 +254,9 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
 #[derive(Deserialize)]
 struct LiveQuery {
     quality: Option<String>,
+    /// The person is asking again - a Try again - and only that skips the
+    /// supervisor's backoff.
+    retry: Option<bool>,
 }
 
 async fn camera_live(
@@ -272,7 +275,10 @@ async fn camera_live(
         }
     };
     ensure_devices(&state).await?;
-    state.supervisor.ensure(&id, quality).await?;
+    state
+        .supervisor
+        .ensure(&id, quality, query.retry.unwrap_or(false))
+        .await?;
     Ok(Json(json!({ "stream": stream_name(&id, quality) })))
 }
 

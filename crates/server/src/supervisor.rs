@@ -206,19 +206,22 @@ impl Supervisor {
     /// source to go2rtc, and keep re-minting until the process ends. Later
     /// calls for the same stream reuse the running loop, and count as the
     /// request that keeps an idle tile alive.
+    ///
+    /// `retry` is the person's intent - a Try again - and only it skips the
+    /// loop's backoff; a page that keeps asking must not hammer a camera
+    /// that is down.
     pub async fn ensure(
         &self,
         device_id: &str,
         quality: Quality,
+        retry: bool,
     ) -> Result<StreamState, SupervisorError> {
         let name = stream_name(device_id, quality);
         {
             let mut state = self.state.write().await;
             if let Some(tracked) = state.get_mut(&name) {
                 tracked.last_request = Instant::now();
-                // A manual retry forces the loop's next attempt now instead
-                // of leaving the person waiting out the backoff.
-                if matches!(tracked.state, StreamState::Degraded { .. }) {
+                if retry && matches!(tracked.state, StreamState::Degraded { .. }) {
                     tracked.wake.notify_one();
                 }
                 return Ok(tracked.state.clone());
