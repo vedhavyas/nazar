@@ -35,6 +35,6 @@ run: build-web
     mkdir -p {{justfile_directory()}}/.data
     DATA_DIR={{justfile_directory()}}/.data cargo run -p server
 
-# Build the container image.
+# Build the container image and prove it healthy end to end.
 image:
-    docker build -t nazar:dev .
+    ./tests/image_test.sh
