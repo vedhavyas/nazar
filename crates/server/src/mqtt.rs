@@ -1,25 +1,54 @@
 //! The broker side of the house: Qubo's MQTT feed of device events.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qubo::{Device, QuboClient, QuboError, SessionStore, list_devices};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, TlsConfiguration, Transport};
 use serde_json::Value;
 
 use crate::events::EventBus;
+use crate::supervisor::Supervisor;
 
 /// The broker the app itself uses, reached over TLS with the session
 /// token as the password (spec §5).
 const BROKER_HOST: &str = "mqtt.platform.quboworld.com";
 const BROKER_PORT: u16 = 8883;
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
-const RETRY_MIN: Duration = Duration::from_secs(2);
-const RETRY_MAX: Duration = Duration::from_secs(120);
 /// Bound on requests in flight; the feed subscribes once per unit at most.
 const REQUEST_CAPACITY: usize = 32;
 
 /// The device-event topic family: `/monitor/<unit>/<device>/<service>`.
 const MONITOR_PREFIX: &str = "/monitor/";
+
+/// How the feed paces itself and when it calls itself deaf.
+#[derive(Debug, Clone)]
+pub struct FeedConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    /// How long the feed may hear nothing before it drops the connection
+    /// and reconnects. Heartbeats arrive about once a minute per device.
+    pub quiet_window: Duration,
+    /// How often a connected feed re-reads the stored session, so a fresh
+    /// login reconnects onto the new token.
+    pub session_check: Duration,
+    pub retry_min: Duration,
+    pub retry_max: Duration,
+}
+
+impl Default for FeedConfig {
+    fn default() -> Self {
+        Self {
+            host: BROKER_HOST.to_owned(),
+            port: BROKER_PORT,
+            tls: true,
+            quiet_window: Duration::from_secs(300),
+            session_check: Duration::from_secs(30),
+            retry_min: Duration::from_secs(2),
+            retry_max: Duration::from_secs(120),
+        }
+    }
+}
 
 /// What the monitor feed tells the house.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +83,11 @@ impl MqttService {
     pub fn start(
         client: QuboClient,
         sessions: SessionStore,
+        supervisor: Supervisor,
         events: EventBus,
+        config: FeedConfig,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(run(client, sessions, events))
+        tokio::spawn(run(client, sessions, supervisor, events, config))
     }
 }
 
@@ -98,18 +129,26 @@ pub fn parse_monitor_message(topic: &str, payload: &str) -> Option<UnitEvent> {
     }
 }
 
-async fn run(client: QuboClient, sessions: SessionStore, events: EventBus) {
-    let mut backoff = RETRY_MIN;
+async fn run(
+    client: QuboClient,
+    sessions: SessionStore,
+    supervisor: Supervisor,
+    events: EventBus,
+    config: FeedConfig,
+) {
+    let mut backoff = config.retry_min;
     loop {
-        match feed(&client, &sessions, &events).await {
-            Ok(()) => backoff = RETRY_MIN,
+        match feed(&client, &sessions, &supervisor, &events, &config).await {
+            // A deliberate reconnect (the session moved, or the house went
+            // quiet): straight back on, no backoff.
+            Ok(()) => continue,
             Err(err @ MqttError::NoSession) => {
                 tracing::debug!(%err, "mqtt feed idles until a login lands");
-                backoff = RETRY_MIN;
+                backoff = config.retry_min;
             }
             Err(err) => {
                 tracing::warn!(%err, "mqtt feed down; reconnecting");
-                backoff = (backoff * 2).min(RETRY_MAX);
+                backoff = (backoff * 2).min(config.retry_max);
             }
         }
         tokio::time::sleep(backoff).await;
@@ -117,24 +156,45 @@ async fn run(client: QuboClient, sessions: SessionStore, events: EventBus) {
 }
 
 /// One connection's life: resolve the units, connect, and pump events into
-/// the bus until the broker drops us.
+/// the bus until the broker drops us, the session moves under us, or the
+/// house has been quiet long enough to be suspicious.
+///
+/// The broker accepts a connection on an expired token and then delivers
+/// nothing (measured 2026-10-15), so silence - not a refusal - is what a
+/// dead session looks like from here. The reconnect is what tells the two
+/// apart: it re-resolves the units over REST, where an expired token is an
+/// error the login flag can carry.
 async fn feed(
     client: &QuboClient,
     sessions: &SessionStore,
+    supervisor: &Supervisor,
     events: &EventBus,
+    config: &FeedConfig,
 ) -> Result<(), MqttError> {
     let Some(session) = sessions.load()? else {
         return Err(MqttError::NoSession);
     };
-    let units = units_of(&list_devices(client, &session).await?);
+    let units = match list_devices(client, &session).await {
+        Ok(devices) => units_of(&devices),
+        Err(err) => {
+            if matches!(err, QuboError::Auth { .. }) {
+                supervisor.mark_needs_login();
+            }
+            return Err(err.into());
+        }
+    };
     let Some(first) = units.first() else {
         return Err(MqttError::NoUnits);
     };
 
-    let mut options = MqttOptions::new(client_id(first), BROKER_HOST, BROKER_PORT);
-    options.set_credentials(session.uuid, session.access_token);
+    let mut options = MqttOptions::new(client_id(first), &config.host, config.port);
+    options.set_credentials(session.uuid.clone(), session.access_token.clone());
     options.set_keep_alive(KEEP_ALIVE);
-    options.set_transport(Transport::Tls(TlsConfiguration::default()));
+    options.set_transport(if config.tls {
+        Transport::Tls(TlsConfiguration::default())
+    } else {
+        Transport::Tcp
+    });
     let (broker, mut stream) = AsyncClient::new(options, REQUEST_CAPACITY);
     for unit in &units {
         broker
@@ -142,19 +202,40 @@ async fn feed(
             .await
             .map_err(|err| MqttError::Subscribe(err.to_string()))?;
     }
+    tracing::info!(units = units.len(), "mqtt feed connected");
 
+    let mut last_heard = Instant::now();
+    let mut check = tokio::time::interval(config.session_check);
     loop {
-        match stream.poll().await {
-            Ok(Event::Incoming(Incoming::Publish(message))) => {
-                let Ok(payload) = std::str::from_utf8(&message.payload) else {
-                    continue;
-                };
-                if let Some(event) = parse_monitor_message(&message.topic, payload) {
-                    events.publish(event);
+        tokio::select! {
+            polled = stream.poll() => match polled {
+                Ok(Event::Incoming(Incoming::Publish(message))) => {
+                    last_heard = Instant::now();
+                    let Ok(payload) = std::str::from_utf8(&message.payload) else {
+                        continue;
+                    };
+                    if let Some(event) = parse_monitor_message(&message.topic, payload) {
+                        events.publish(event);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => return Err(MqttError::Connection(err.to_string())),
+            },
+            _ = check.tick() => {
+                if last_heard.elapsed() >= config.quiet_window {
+                    tracing::warn!(
+                        quiet = %last_heard.elapsed().as_secs(),
+                        "the monitor feed has gone quiet; reconnecting"
+                    );
+                    return Ok(());
+                }
+                if let Some(current) = sessions.load()?
+                    && current.access_token != session.access_token
+                {
+                    tracing::info!("the stored session changed; reconnecting the feed");
+                    return Ok(());
                 }
             }
-            Ok(_) => {}
-            Err(err) => return Err(MqttError::Connection(err.to_string())),
         }
     }
 }
