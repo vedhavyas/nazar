@@ -76,7 +76,7 @@ test('the picture arrives muted, and the toggle is what unmutes it', async () =>
   expect(screen.getByRole('button', { name: 'Listening' }), 'and it says so').toBeTruthy();
 });
 
-test('a dragged move waits its turn, and only the latest one queues', async () => {
+test('a sustained drag lands every window, one write at a time', async () => {
   const calls: string[] = [];
   const releases: Array<() => void> = [];
   vi.stubGlobal(
