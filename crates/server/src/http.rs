@@ -3,6 +3,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,7 +17,10 @@ use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use qubo::{QuboClient, QuboError, SessionStore, request_otp, verify_otp};
+use qubo::{
+    Device, QuboClient, QuboError, Session, SessionStore, read_shadow, request_otp, verify_otp,
+    write_service,
+};
 
 use crate::supervisor::{StreamState, Supervisor, SupervisorError};
 
@@ -48,6 +52,22 @@ fn is_websocket(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
+/// How long a control write is given to show up in the shadow.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlTiming {
+    pub poll_every: Duration,
+    pub window: Duration,
+}
+
+impl Default for ControlTiming {
+    fn default() -> Self {
+        Self {
+            poll_every: Duration::from_millis(250),
+            window: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Everything the routes share.
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +77,7 @@ pub struct AppState {
     pub supervisor: Supervisor,
     /// go2rtc's API base the proxy forwards to.
     pub go2rtc_api: String,
+    pub control: ControlTiming,
     http: reqwest::Client,
 }
 
@@ -76,6 +97,7 @@ impl AppState {
             qubo: wiring.qubo,
             supervisor: wiring.supervisor,
             go2rtc_api: wiring.go2rtc_api,
+            control: ControlTiming::default(),
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -143,6 +165,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/login/verify", post(login_verify))
         .route("/api/cameras", get(cameras))
         .route("/api/cameras/{id}/live", post(camera_live))
+        .route("/api/cameras/{id}/ptz", post(camera_ptz))
+        .route("/api/cameras/{id}/privacy", post(camera_privacy))
         .route("/go2rtc/{*rest}", any(proxy))
         .fallback(spa)
         .with_state(state)
@@ -217,6 +241,134 @@ async fn camera_live(
     ensure_devices(&state).await?;
     state.supervisor.ensure_live(&id).await?;
     Ok(Json(json!({ "stream": id })))
+}
+
+#[derive(Deserialize)]
+struct PtzStep {
+    dx: i64,
+    dy: i64,
+}
+
+/// The camera is asked to move by a delta from where it reports it is, and
+/// the answer is the position the shadow holds afterwards - the camera's
+/// ack says nothing either way.
+async fn camera_ptz(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(step): Json<PtzStep>,
+) -> Result<Json<Value>, ApiError> {
+    let (device, session) = control_target(&state, &id).await?;
+    let (x, y) = read_shadow(&state.qubo, &session, &device)
+        .await?
+        .position()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "the camera reports no pan/tilt position",
+            )
+        })?;
+    let target = (x + step.dx, y + step.dy);
+    let target_text = format!("{},{}", target.0, target.1);
+    write_service(
+        &state.qubo,
+        &session,
+        &device,
+        "panTiltControl",
+        &[("horizontalVerticalPostion", target_text.as_str())],
+    )
+    .await?;
+
+    let landed = await_position(&state, &device, &session, target).await?;
+    Ok(Json(match landed {
+        Some(position) if position == target => json!({
+            "ok": true,
+            "position": { "x": position.0, "y": position.1 },
+        }),
+        last => json!({
+            "ok": false,
+            "reason": NOT_APPLIED,
+            "position": last.map(|(x, y)| json!({ "x": x, "y": y })),
+        }),
+    }))
+}
+
+#[derive(Deserialize)]
+struct PrivacyOn {
+    on: bool,
+}
+
+/// Privacy on means the lens is closed: `cameraFunction.state = disable`.
+/// The answer carries the state the shadow reports, never the ack.
+async fn camera_privacy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PrivacyOn>,
+) -> Result<Json<Value>, ApiError> {
+    let (device, session) = control_target(&state, &id).await?;
+    write_service(
+        &state.qubo,
+        &session,
+        &device,
+        "cameraFunction",
+        &[("state", if body.on { "disable" } else { "enable" })],
+    )
+    .await?;
+
+    let deadline = Instant::now() + state.control.window;
+    let reported = loop {
+        let reported = read_shadow(&state.qubo, &session, &device)
+            .await?
+            .camera_enabled()
+            .map(|enabled| !enabled);
+        if reported == Some(body.on) || Instant::now() >= deadline {
+            break reported;
+        }
+        tokio::time::sleep(state.control.poll_every).await;
+    };
+    Ok(Json(match reported {
+        Some(privacy) if privacy == body.on => json!({ "ok": true, "privacy": privacy }),
+        last => json!({ "ok": false, "reason": NOT_APPLIED, "privacy": last }),
+    }))
+}
+
+/// The reason every unconfirmed write comes back with.
+const NOT_APPLIED: &str = "not applied";
+
+/// Read the shadow until it reports `target`, within the control window;
+/// the last position seen, matched or not.
+async fn await_position(
+    state: &AppState,
+    device: &Device,
+    session: &Session,
+    target: (i64, i64),
+) -> Result<Option<(i64, i64)>, ApiError> {
+    let deadline = Instant::now() + state.control.window;
+    loop {
+        let position = read_shadow(&state.qubo, session, device).await?.position();
+        if position == Some(target) || Instant::now() >= deadline {
+            return Ok(position);
+        }
+        tokio::time::sleep(state.control.poll_every).await;
+    }
+}
+
+/// Resolve a camera id to the device and the session a control write
+/// needs.
+async fn control_target(state: &AppState, id: &str) -> Result<(Device, Session), ApiError> {
+    ensure_devices(state).await?;
+    let device = state
+        .supervisor
+        .devices()
+        .await
+        .into_iter()
+        .find(|device| device.device_id == id)
+        .ok_or_else(|| SupervisorError::UnknownDevice(id.to_owned()))?;
+    let sessions = state.sessions.clone();
+    let session = blocking(move || sessions.load())
+        .await?
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "no session; log in again"))?;
+    Ok((device, session))
 }
 
 /// Discovery is lazy: the first gated call after boot or login fills the
