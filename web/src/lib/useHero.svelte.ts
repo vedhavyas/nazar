@@ -79,20 +79,29 @@ export function createHero(cameras: () => Camera[], source: HeroSource = serverS
 
 /** The live source: the motion API and the server's event socket. */
 export function serverSource(): HeroSource {
-  let socket: WebSocket | null = null;
   return {
     hero: async () => (await api.hero()).hero ?? null,
     watch(onEvent) {
+      let stopped = false;
+      let socket: WebSocket | null = null;
+      let again: ReturnType<typeof setTimeout> | null = null;
       const open = () => {
+        if (stopped) return;
         socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events`);
         socket.onmessage = () => onEvent();
         // A dropped socket would silently freeze the hero: come back.
         socket.onclose = () => {
-          setTimeout(open, 3000);
+          if (stopped) return;
+          again = setTimeout(open, 3000);
         };
       };
       open();
       return () => {
+        // Teardown ends the reconnects too: closing the socket fires its
+        // own `onclose`, and without this flag that would arm another one
+        // and another, one dead socket per visit.
+        stopped = true;
+        if (again) clearTimeout(again);
         socket?.close();
         socket = null;
       };

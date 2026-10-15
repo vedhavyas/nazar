@@ -6,7 +6,7 @@
 import { expect, test, vi } from 'vitest';
 
 import type { Camera } from './api';
-import { createHero, type HeroSource } from './useHero.svelte';
+import { createHero, serverSource, type HeroSource } from './useHero.svelte';
 
 function camera(id: string, name: string): Camera {
   return { id, name, state: 'live', reason: null };
@@ -101,6 +101,31 @@ test('away mode stills the small tiles and never the hero', async () => {
     house.tiles.map((tile) => tile.still),
     'and the stills go back to live',
   ).toEqual([false, false]);
+});
+
+test('the event socket does not come back after the teardown', async () => {
+  let made = 0;
+  class FakeSocket {
+    onmessage: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    constructor() {
+      made += 1;
+    }
+    close() {
+      this.onclose?.();
+    }
+  }
+  vi.stubGlobal('WebSocket', FakeSocket);
+
+  const source = serverSource();
+  const stop = source.watch(() => {});
+  expect(made, 'the socket opens').toBe(1);
+
+  stop();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  expect(made, 'a closed socket must not re-arm after teardown').toBe(1);
+  vi.unstubAllGlobals();
 });
 
 test('an event re-asks the server who is big', async () => {
