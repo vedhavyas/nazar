@@ -1,0 +1,65 @@
+//! Durable Qubo session state.
+
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::QuboError;
+
+/// A logged-in Qubo account session. The phone-OTP route issues no
+/// refresh token, so there is none here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub access_token: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+/// A session file at a caller-provided path.
+#[derive(Debug, Clone)]
+pub struct SessionStore {
+    path: PathBuf,
+}
+
+impl SessionStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Load the stored session; `None` means none has been saved yet.
+    pub fn load(&self) -> Result<Option<Session>, QuboError> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Replace the stored session, readable only by its owner.
+    pub fn save(&self, session: &Session) -> Result<(), QuboError> {
+        let raw = serde_json::to_vec_pretty(session)?;
+        // Write-then-rename so a crash mid-write cannot leave a torn
+        // session behind; re-login needs the phone owner.
+        let tmp = self.path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&raw)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
