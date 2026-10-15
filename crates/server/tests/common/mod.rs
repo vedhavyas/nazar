@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod mqtt;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
