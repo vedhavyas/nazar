@@ -240,10 +240,13 @@ async fn set_pin(
     State(state): State<AppState>,
     Json(body): Json<PinRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state.pin.set(&body.pin).map_err(|err| match err {
-        PinError::AlreadySet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
-        other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-    })?;
+    let gate = state.pin.clone();
+    blocking(move || gate.set(&body.pin))
+        .await?
+        .map_err(|err| match err {
+            PinError::AlreadySet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
+            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -267,15 +270,18 @@ async fn unlock(
         )
     })?;
 
-    let token = state.pin.unlock(&body.pin).map_err(|err| match err {
-        // No PIN exists yet: the UI turns this into its first-run form.
-        PinError::NotSet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
-        PinError::Wrong => {
-            tracing::warn!(client = %client, "unlock refused: wrong PIN");
-            ApiError::new(StatusCode::UNAUTHORIZED, err.to_string())
-        }
-        other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-    })?;
+    let gate = state.pin.clone();
+    let token = blocking(move || gate.unlock(&body.pin))
+        .await?
+        .map_err(|err| match err {
+            // No PIN exists yet: the UI turns this into its first-run form.
+            PinError::NotSet => ApiError::new(StatusCode::CONFLICT, err.to_string()),
+            PinError::Wrong => {
+                tracing::warn!(client = %client, "unlock refused: wrong PIN");
+                ApiError::new(StatusCode::UNAUTHORIZED, err.to_string())
+            }
+            other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
     state.throttle.clear(&client);
     Ok(with_session_cookie(StatusCode::NO_CONTENT, &token))
 }
@@ -312,9 +318,9 @@ async fn login_verify(
 ) -> Result<Response, ApiError> {
     require_unlocked(&state, &headers)?;
     let session = verify_otp(&state.qubo, &body.phone, &body.code).await?;
-    state
-        .sessions
-        .save(&session)
+    let sessions = state.sessions.clone();
+    blocking(move || sessions.save(&session))
+        .await?
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     if let Err(err) = state.supervisor.refresh_devices().await {
         tracing::warn!(%err, "device discovery after login failed");
@@ -563,6 +569,16 @@ fn mime_for(path: &str) -> &'static str {
 fn with_session_cookie(status: StatusCode, token: &str) -> Response {
     let cookie = format!("nazar_session={token}; Path=/; HttpOnly; SameSite=Lax");
     ([(header::SET_COOKIE, cookie)], status).into_response()
+}
+
+/// Run blocking work (Argon2 hashing, fsyncs) off the runtime's worker
+/// threads so an unlock attempt cannot stall every other request.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 fn require_unlocked(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
