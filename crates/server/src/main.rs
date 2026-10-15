@@ -3,8 +3,10 @@
 use anyhow::Context as _;
 use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
+use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
+use server::mqtt::MqttService;
 use server::supervisor::{Pacing, Supervisor};
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +30,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
+    let events = EventBus::new();
+    let _mqtt = MqttService::start(qubo.clone(), sessions.clone(), events);
 
     // A session that cannot be read is not fatal: the UI can serve login.
     match sessions.load() {
