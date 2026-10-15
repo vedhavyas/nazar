@@ -361,6 +361,34 @@ async fn a_put_go2rtc_did_not_take_is_degraded_not_live() {
 }
 
 #[tokio::test]
+async fn a_failed_swap_never_leaks_the_stream_token() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    mint_mock(200, &mint_body("sekrit-token"))
+        .mount(&h.qubo)
+        .await;
+    h.go2rtc.set_put_status(400);
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor.ensure_live(DEVICE_ID).await.expect("starts");
+
+    match h.supervisor.status(DEVICE_ID).await {
+        StreamState::Degraded { reason } => {
+            assert!(
+                !reason.contains("sekrit-token"),
+                "the browser's reason carries no mint token: {reason}"
+            );
+            assert!(
+                reason.contains("token=<redacted>"),
+                "the token is visibly redacted: {reason}"
+            );
+        }
+        other => panic!("expected Degraded, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+#[tokio::test]
 async fn vod_is_reserved_for_m3() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     let err = h

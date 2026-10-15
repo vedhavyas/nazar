@@ -45,10 +45,15 @@ impl FakeApi {
                             ));
                             let code = StatusCode::from_u16(status.load(Ordering::SeqCst))
                                 .expect("a status");
+                            // A rejected PUT quotes the source back, as
+                            // go2rtc's own refusals do - token and all.
                             let body = if code.is_success() {
                                 String::new()
                             } else {
-                                "streams: source from insecure producer".to_owned()
+                                format!(
+                                    "streams: source from insecure producer: {}",
+                                    params.get("src").cloned().unwrap_or_default()
+                                )
                             };
                             (code, body)
                         }
