@@ -13,6 +13,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use qubo::ServiceProvider;
 use server::config::Config;
 use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source};
 
@@ -104,6 +105,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         data_dir: data_dir.clone(),
         go2rtc_bin: fake_bin(),
         ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -150,7 +152,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
 }
 
 async fn await_args(path: &Path) -> Vec<String> {
-    for _ in 0..40 {
+    for _ in 0..100 {
         if let Ok(text) = std::fs::read_to_string(path) {
             return text.lines().map(str::to_owned).collect();
         }

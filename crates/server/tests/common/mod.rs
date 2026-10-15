@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Query;
+use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::routing::put;
+use axum::response::Response;
+use axum::routing::{get, put};
 use tokio::net::TcpListener;
 
 /// A fake go2rtc API: records the stream PUTs it receives and answers GETs
@@ -25,32 +26,34 @@ impl FakeApi {
     pub async fn start() -> Self {
         let puts = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
-        let app = Router::new().route(
-            "/api/streams",
-            put({
-                let recorded = Arc::clone(&puts);
-                let status = Arc::clone(&put_status);
-                move |Query(params): Query<HashMap<String, String>>| {
-                    let recorded = Arc::clone(&recorded);
-                    let status = Arc::clone(&status);
-                    async move {
-                        recorded.lock().unwrap().push((
-                            params.get("name").cloned().unwrap_or_default(),
-                            params.get("src").cloned().unwrap_or_default(),
-                        ));
-                        let code =
-                            StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
-                        let body = if code.is_success() {
-                            String::new()
-                        } else {
-                            "streams: source from insecure producer".to_owned()
-                        };
-                        (code, body)
+        let app = Router::new()
+            .route(
+                "/api/streams",
+                put({
+                    let recorded = Arc::clone(&puts);
+                    let status = Arc::clone(&put_status);
+                    move |Query(params): Query<HashMap<String, String>>| {
+                        let recorded = Arc::clone(&recorded);
+                        let status = Arc::clone(&status);
+                        async move {
+                            recorded.lock().unwrap().push((
+                                params.get("name").cloned().unwrap_or_default(),
+                                params.get("src").cloned().unwrap_or_default(),
+                            ));
+                            let code = StatusCode::from_u16(status.load(Ordering::SeqCst))
+                                .expect("a status");
+                            let body = if code.is_success() {
+                                String::new()
+                            } else {
+                                "streams: source from insecure producer".to_owned()
+                            };
+                            (code, body)
+                        }
                     }
-                }
-            })
-            .get(|| async { include_str!("../fixtures/streams.json") }),
-        );
+                })
+                .get(|| async { include_str!("../fixtures/streams.json") }),
+            )
+            .route("/api/ws", get(echo));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port");
@@ -74,6 +77,17 @@ impl FakeApi {
     pub fn puts(&self) -> Vec<(String, String)> {
         self.puts.lock().unwrap().clone()
     }
+}
+
+/// Echo every frame back, standing in for go2rtc's signalling socket.
+async fn echo(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(|mut socket| async move {
+        while let Some(Ok(message)) = socket.recv().await {
+            if socket.send(message).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// Poll `check` for about two seconds.
