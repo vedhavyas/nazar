@@ -83,9 +83,11 @@ export const api = {
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
   verifyOtp: (phone: string, code: string) => post('/api/login/verify', { phone, code }),
   cameras: () => call<Cameras>('/api/cameras'),
+  // `retry=true`, spelled out: the server's query parser takes the words,
+  // not `1`, and a wrong spelling is a 400 at the wire.
   watch: (id: string, quality: Quality = 'high', retry = false) =>
     call<{ stream: string }>(
-      `/api/cameras/${id}/live?quality=${quality}${retry ? '&retry=1' : ''}`,
+      `/api/cameras/${id}/live?quality=${quality}${retry ? '&retry=true' : ''}`,
       { method: 'POST' },
     ),
   hero: () => call<MotionHero>('/api/motion/hero'),

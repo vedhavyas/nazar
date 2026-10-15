@@ -75,4 +75,10 @@ test('watching a camera calls its live route', async () => {
   expect(fetchMock.mock.calls[1][0], 'a tile asks for the low stream').toBe(
     '/api/cameras/cam-1/live?quality=low',
   );
+
+  // The wire spelling the server parses; `1` is a 400 there.
+  await api.watch('cam-1', 'high', true);
+  expect(fetchMock.mock.calls[2][0], "Try again says so in the server's words").toBe(
+    '/api/cameras/cam-1/live?quality=high&retry=true',
+  );
 });
