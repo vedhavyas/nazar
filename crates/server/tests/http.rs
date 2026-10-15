@@ -30,6 +30,8 @@ const PIN: &str = "246810";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const OTP_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login";
+const VERIFY_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify";
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -395,6 +397,11 @@ async fn a_wrong_pin_is_refused_and_the_pin_is_first_run_only() {
         reqwest::StatusCode::CONFLICT,
         "the PIN cannot be overwritten in M1"
     );
+    assert_eq!(
+        response.json::<Value>().await.expect("json")["error"],
+        json!("a PIN is already set"),
+        "the UI shows the server's words"
+    );
 
     let fresh = client();
     let response = fresh
@@ -642,6 +649,16 @@ async fn login_otp_is_gated_and_forwards_to_the_gateway() {
         reqwest::StatusCode::NO_CONTENT,
         "an unlocked browser forwards the request"
     );
+    let requests = h.qubo.received_requests().await.expect("recorded requests");
+    let otp = requests
+        .iter()
+        .find(|request| request.url.path() == OTP_PATH)
+        .expect("the OTP request reached the gateway");
+    let body: Value = serde_json::from_slice(&otp.body).expect("json");
+    assert_eq!(
+        body["phone"], "9876543210",
+        "the number the browser typed is the number the gateway texts"
+    );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
@@ -658,7 +675,7 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
         .await;
     Mock::given(method("POST"))
         .and(path(
-            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify",
+            VERIFY_PATH,
         ))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             json!([{ "accessToken": "token-live", "uuid": "user-uuid-1", "email": "family@example.com" }])
@@ -735,9 +752,7 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
         .mount(&h.qubo)
         .await;
     Mock::given(method("POST"))
-        .and(path(
-            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify",
-        ))
+        .and(path(VERIFY_PATH))
         .respond_with(
             ResponseTemplate::new(401)
                 .set_body_string(include_str!("fixtures/error_auth_002.json")),
