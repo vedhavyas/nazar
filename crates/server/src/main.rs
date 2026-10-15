@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
-    let _motion = server::motion::follow(&events, Arc::clone(&motion));
+    let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);
     let _mqtt = MqttService::start(
         qubo.clone(),
         sessions.clone(),

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::EventBus;
 use crate::mqtt::UnitEvent;
+use crate::supervisor::Supervisor;
 
 /// Record every motion the bus carries, against the arrival clock the
 /// hysteresis reads: the server owns the hero decision, so the browser
@@ -14,12 +15,28 @@ use crate::mqtt::UnitEvent;
 /// A follower that falls behind the bus (a burst past its capacity) misses
 /// events rather than dying: a dead follower freezes the hero for good,
 /// with nothing in the logs to say why.
-pub fn follow(events: &EventBus, order: Arc<Mutex<MotionOrder>>) -> tokio::task::JoinHandle<()> {
+pub fn follow(
+    events: &EventBus,
+    order: Arc<Mutex<MotionOrder>>,
+    supervisor: &Supervisor,
+) -> tokio::task::JoinHandle<()> {
     let mut events = events.subscribe();
+    let supervisor = supervisor.clone();
     tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(UnitEvent::Motion { device_id }) => {
+                    // Only a camera the account actually has may take the
+                    // tile: an id nothing renders would elect a hero the
+                    // home cannot show.
+                    let known = supervisor
+                        .devices()
+                        .await
+                        .iter()
+                        .any(|device| device.device_id == device_id && device.is_camera());
+                    if !known {
+                        continue;
+                    }
                     order
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
