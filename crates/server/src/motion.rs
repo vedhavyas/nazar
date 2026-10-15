@@ -10,15 +10,26 @@ use crate::mqtt::UnitEvent;
 /// Record every motion the bus carries, against the arrival clock the
 /// hysteresis reads: the server owns the hero decision, so the browser
 /// never has to order cameras itself.
+///
+/// A follower that falls behind the bus (a burst past its capacity) misses
+/// events rather than dying: a dead follower freezes the hero for good,
+/// with nothing in the logs to say why.
 pub fn follow(events: &EventBus, order: Arc<Mutex<MotionOrder>>) -> tokio::task::JoinHandle<()> {
     let mut events = events.subscribe();
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            if let UnitEvent::Motion { device_id } = event {
-                order
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .motion(&device_id, Instant::now());
+        loop {
+            match events.recv().await {
+                Ok(UnitEvent::Motion { device_id }) => {
+                    order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .motion(&device_id, Instant::now());
+                }
+                Ok(UnitEvent::Liveness { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(missed, "the motion follower fell behind a burst");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     })
