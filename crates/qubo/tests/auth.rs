@@ -188,8 +188,8 @@ async fn verify_refuses_a_different_phone_than_the_pending_code() {
     match err {
         QuboError::Auth { message, .. } => {
             assert!(
-                message.contains("9876543210") && message.contains("9000000000"),
-                "the refusal names both numbers: {message}"
+                !message.contains("9876543210") && !message.contains("9000000000"),
+                "the refusal echoes neither number: {message}"
             );
         }
         other => panic!("expected Auth, got {other:?}"),

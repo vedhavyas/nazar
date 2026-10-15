@@ -68,12 +68,12 @@ pub async fn verify_otp(
         message: "no OTP was requested for this client".to_owned(),
     })?;
     if pending.phone != phone {
+        // Deliberately silent about the other number: the mismatch is the
+        // caller's error to fix, and the message travels to a browser.
         return Err(QuboError::Auth {
             code: None,
-            message: format!(
-                "the pending code was sent to {}; request one for {phone}",
-                pending.phone
-            ),
+            message: "the pending code belongs to another number; request one for this number"
+                .to_owned(),
         });
     }
 
