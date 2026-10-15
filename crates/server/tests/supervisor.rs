@@ -273,8 +273,14 @@ async fn a_failing_mint_degrades_and_keeps_retrying() {
 
 #[tokio::test]
 async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
-    // Long pacing: only the wake signal can deliver a re-mint this fast.
-    let h = harness(pacing(Duration::from_secs(30))).await;
+    // Everything paced long: only the wake signal can deliver a re-mint
+    // inside the test's window, so the retry path is what is measured.
+    let h = harness(Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_secs(30),
+        retry_max: Duration::from_secs(30),
+    })
+    .await;
     mount_discovery(&h.qubo).await;
     mint_mock(401, include_str!("fixtures/error_auth_002.json"))
         .up_to_n_times(1)
