@@ -106,6 +106,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         go2rtc_bin: fake_bin(),
         ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
         service_provider: ServiceProvider::default(),
+        webrtc_candidates: Some("198.51.100.1:8555".to_owned()),
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -136,6 +137,10 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         config.contains("nazar:"),
         "the template live_source names exists"
     );
+    assert!(
+        config.contains("candidates:") && config.contains("198.51.100.1:8555"),
+        "the configured WebRTC candidate reaches the generated config"
+    );
 
     let argv = await_args(Path::new(ARGS_PATH)).await;
     assert_eq!(
@@ -149,6 +154,27 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
 
     go2rtc.stop().await.expect("stop kills the fake binary");
     let _ = std::fs::remove_file(ARGS_PATH);
+}
+
+#[tokio::test]
+async fn no_webrtc_section_without_a_configured_candidate() {
+    let data_dir = temp_dir();
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: fake_bin(),
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+    };
+
+    let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
+    let config = std::fs::read_to_string(go2rtc.config_path()).expect("the config is written");
+    assert!(
+        !config.contains("webrtc:"),
+        "go2rtc's own discovery stands when no candidate is configured: {config}"
+    );
+
+    go2rtc.stop().await.expect("stop kills the fake binary");
 }
 
 async fn await_args(path: &Path) -> Vec<String> {

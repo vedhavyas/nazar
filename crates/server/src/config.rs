@@ -16,11 +16,15 @@ pub struct Config {
     pub ffmpeg_bin: PathBuf,
     /// The Qubo service provider.
     pub service_provider: ServiceProvider,
+    /// One WebRTC candidate viewers can reach, `ip:port`. Empty means
+    /// go2rtc's own discovery, which finds container-internal addresses.
+    pub webrtc_candidates: Option<String>,
 }
 
 impl Config {
     /// Read the environment: `DATA_DIR` (default `/data`), `GO2RTC_BIN`
-    /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`.
+    /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`,
+    /// `NAZAR_WEBRTC_CANDIDATES`.
     pub fn from_env() -> Self {
         Self {
             data_dir: var("DATA_DIR").unwrap_or_else(|| "/data".to_owned()).into(),
@@ -32,6 +36,7 @@ impl Config {
                 .into(),
             service_provider: var("QUBO_SP")
                 .map_or_else(ServiceProvider::default, ServiceProvider::new),
+            webrtc_candidates: var("NAZAR_WEBRTC_CANDIDATES"),
         }
     }
 }

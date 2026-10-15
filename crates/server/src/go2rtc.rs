@@ -72,7 +72,10 @@ impl Go2rtc {
     /// their first request.
     pub fn start(cfg: &Config) -> Result<Self, Go2rtcError> {
         let config_path = cfg.data_dir.join("go2rtc.yaml");
-        std::fs::write(&config_path, config_yaml(&cfg.ffmpeg_bin))?;
+        std::fs::write(
+            &config_path,
+            config_yaml(&cfg.ffmpeg_bin, cfg.webrtc_candidates.as_deref()),
+        )?;
         let child = Command::new(&cfg.go2rtc_bin)
             .arg("--config")
             .arg(&config_path)
@@ -171,11 +174,20 @@ pub fn live_source(mint_url: &str) -> String {
 }
 
 /// The generated config text.
-fn config_yaml(ffmpeg_bin: &Path) -> String {
+///
+/// WebRTC media flows browser-to-go2rtc directly, so the candidate an env
+/// names is what mesh viewers connect to; without one go2rtc advertises
+/// container-internal addresses. When direct candidates do not reach a
+/// viewer, the fallback is go2rtc's `webrtc.ice_servers` pointed at the
+/// hub's coturn (design §9 risk 3).
+fn config_yaml(ffmpeg_bin: &Path, webrtc_candidates: Option<&str>) -> String {
+    let webrtc = webrtc_candidates.map_or_else(String::new, |candidates| {
+        format!("webrtc:\n  candidates:\n    - {candidates}\n")
+    });
     format!(
         r#"api:
   listen: "127.0.0.1:1984"
-ffmpeg:
+{webrtc}ffmpeg:
   bin: "{ffmpeg}"
   {TEMPLATE}: "{TEMPLATE_ARGS}"
 "#,
