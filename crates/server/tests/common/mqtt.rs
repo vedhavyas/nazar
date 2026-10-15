@@ -21,19 +21,43 @@ pub struct FakeBroker {
     sessions: Arc<AtomicUsize>,
 }
 
+/// What a broker does with a connection once it is subscribed.
+#[derive(Clone, Copy)]
+pub enum Mode {
+    /// Nothing at all, so a feed goes quiet.
+    Silent,
+    /// A heartbeat on a cadence, so a feed hears something but no motion.
+    Chatty(Duration),
+    /// A motion event on a cadence.
+    Moving(Duration),
+    /// A subscription refusal (0x80), as a broker with a dead session
+    /// answers.
+    Refusing,
+}
+
 impl FakeBroker {
     /// Start a broker that says nothing after the handshake.
     pub async fn silent() -> Self {
-        Self::start(None).await
+        Self::start(Mode::Silent).await
     }
 
     /// Start a broker that publishes a heartbeat every `every`, so a feed
     /// connected to it never goes quiet.
     pub async fn chatty(every: Duration) -> Self {
-        Self::start(Some(every)).await
+        Self::start(Mode::Chatty(every)).await
     }
 
-    async fn start(publish_every: Option<Duration>) -> Self {
+    /// Start a broker that publishes motion every `every`.
+    pub async fn moving(every: Duration) -> Self {
+        Self::start(Mode::Moving(every)).await
+    }
+
+    /// Start a broker that refuses every subscription.
+    pub async fn refusing() -> Self {
+        Self::start(Mode::Refusing).await
+    }
+
+    async fn start(mode: Mode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let port = listener.local_addr().expect("the address").port();
         let sessions = Arc::new(AtomicUsize::new(0));
@@ -44,7 +68,7 @@ impl FakeBroker {
                     return;
                 };
                 let counter = Arc::clone(&counter);
-                tokio::spawn(async move { serve(socket, publish_every, counter).await });
+                tokio::spawn(async move { serve(socket, mode, counter).await });
             }
         });
         Self { port, sessions }
@@ -68,7 +92,14 @@ fn heartbeat() -> (String, Vec<u8>) {
     (topic, payload)
 }
 
-async fn serve(mut socket: TcpStream, publish_every: Option<Duration>, sessions: Arc<AtomicUsize>) {
+/// A motion event, in the captured payload's shape.
+fn motion() -> (String, Vec<u8>) {
+    let topic = "/monitor/20000000-0000-4000-8000-000000000001/c0000000-0000-4000-8000-000000000002/recordingControl".to_owned();
+    let payload = br#"{"devices" : {"deviceUUID" : "c0000000-0000-4000-8000-000000000002","services" : {"recordingControl" : {"events" : {"stateChanged" : {"cause" : "MOTION_DETECTED","record" : "start"}}}},"timestamp" : 1791974501206}}"#.to_vec();
+    (topic, payload)
+}
+
+async fn serve(mut socket: TcpStream, mode: Mode, sessions: Arc<AtomicUsize>) {
     loop {
         let Some(packet) = read_packet(&mut socket).await else {
             return;
@@ -80,8 +111,8 @@ async fn serve(mut socket: TcpStream, publish_every: Option<Duration>, sessions:
                     return;
                 }
             }
-            // SUBSCRIBE: ack every filter with QoS 1, then keep the socket
-            // fed if this broker is chatty.
+            // SUBSCRIBE: ack every filter, or refuse them all; a chatty or
+            // moving broker then keeps the socket fed.
             8 => {
                 sessions.fetch_add(1, Ordering::SeqCst);
                 let id = u16::from_be_bytes([packet[2], packet[3]]);
@@ -90,7 +121,10 @@ async fn serve(mut socket: TcpStream, publish_every: Option<Duration>, sessions:
                 while at + 3 <= packet.len() {
                     let len = u16::from_be_bytes([packet[at], packet[at + 1]]) as usize;
                     at += 2 + len + 1;
-                    codes.push(0x01);
+                    codes.push(match mode {
+                        Mode::Refusing => 0x80,
+                        _ => 0x01,
+                    });
                 }
                 let mut ack = vec![0x90];
                 push_length(&mut ack, 2 + codes.len());
@@ -99,8 +133,14 @@ async fn serve(mut socket: TcpStream, publish_every: Option<Duration>, sessions:
                 if socket.write_all(&ack).await.is_err() {
                     return;
                 }
-                if let Some(every) = publish_every {
-                    let (topic, payload) = heartbeat();
+                if let Some(every) = match mode {
+                    Mode::Chatty(every) | Mode::Moving(every) => Some(every),
+                    _ => None,
+                } {
+                    let (topic, payload) = match mode {
+                        Mode::Moving(_) => motion(),
+                        _ => heartbeat(),
+                    };
                     let frame = publish_frame(&topic, &payload);
                     loop {
                         tokio::time::sleep(every).await;

@@ -367,7 +367,11 @@ async fn only_a_persons_retry_skips_the_backoff() {
         .await
         .expect("asking again");
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(mint_calls(&h.qubo).await, 1, "a poll's ask does not re-mint");
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        1,
+        "a poll's ask does not re-mint"
+    );
 
     // The person presses Try again; the camera answers now.
     h.supervisor
@@ -387,7 +391,11 @@ async fn only_a_persons_retry_skips_the_backoff() {
         "the person's retry re-mints promptly (mints: {})",
         mint_calls(&h.qubo).await
     );
-    assert_eq!(mint_calls(&h.qubo).await, 2, "one mint per ask, not a storm");
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        2,
+        "one mint per ask, not a storm"
+    );
 }
 
 async fn mint_calls(server: &MockServer) -> usize {

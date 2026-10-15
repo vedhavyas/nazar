@@ -29,6 +29,10 @@ pub struct FeedConfig {
     /// How long the feed may hear nothing before it drops the connection
     /// and reconnects. Heartbeats arrive about once a minute per device.
     pub quiet_window: Duration,
+    /// How long the feed may hear no *motion* before it reconnects to be
+    /// sure its subscription is live. A house nobody walks past is quiet
+    /// for hours, so this is deliberately far longer than `quiet_window`.
+    pub motion_window: Duration,
     /// How often a connected feed re-reads the stored session, so a fresh
     /// login reconnects onto the new token.
     pub session_check: Duration,
@@ -43,6 +47,7 @@ impl Default for FeedConfig {
             port: BROKER_PORT,
             tls: true,
             quiet_window: Duration::from_secs(300),
+            motion_window: Duration::from_secs(1800),
             session_check: Duration::from_secs(30),
             retry_min: Duration::from_secs(2),
             retry_max: Duration::from_secs(120),
@@ -205,6 +210,7 @@ async fn feed(
     tracing::info!(units = units.len(), "mqtt feed connected");
 
     let mut last_heard = Instant::now();
+    let mut last_motion = Instant::now();
     let mut check = tokio::time::interval(config.session_check);
     loop {
         tokio::select! {
@@ -215,7 +221,22 @@ async fn feed(
                         continue;
                     };
                     if let Some(event) = parse_monitor_message(&message.topic, payload) {
+                        if matches!(event, UnitEvent::Motion { .. }) {
+                            last_motion = Instant::now();
+                        }
                         events.publish(event);
+                    }
+                }
+                // A rejected subscription is not a quiet house: the broker
+                // said no, and only a fresh connect (and the REST check
+                // behind it) can tell an expired session from a refusual.
+                Ok(Event::Incoming(Incoming::SubAck(ack))) => {
+                    let refused = ack.return_codes.iter().any(|code| {
+                        !matches!(code, rumqttc::SubscribeReasonCode::Success(_))
+                    });
+                    if refused {
+                        tracing::warn!(?ack, "the broker refused a subscription; reconnecting");
+                        return Ok(());
                     }
                 }
                 Ok(_) => {}
@@ -226,6 +247,16 @@ async fn feed(
                     tracing::warn!(
                         quiet = %last_heard.elapsed().as_secs(),
                         "the monitor feed has gone quiet; reconnecting"
+                    );
+                    return Ok(());
+                }
+                // Heartbeats can keep arriving while the motion
+                // subscription is silently dead, so motion is timed on its
+                // own, far coarser clock.
+                if last_motion.elapsed() >= config.motion_window {
+                    tracing::info!(
+                        quiet = %last_motion.elapsed().as_secs(),
+                        "no motion for a long while; reconnecting to be sure"
                     );
                     return Ok(());
                 }
