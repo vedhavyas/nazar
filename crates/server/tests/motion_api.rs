@@ -70,7 +70,10 @@ async fn harness() -> Harness {
         DEVICES_PATH,
         json!({ "data": [
             { "deviceUUID": HALL, "deviceName": "Hall", "deviceType": "HCP01" },
-            { "deviceUUID": GATE, "deviceName": "Gate", "deviceType": "HCP01" }
+            { "deviceUUID": GATE, "deviceName": "Gate", "deviceType": "HCP01" },
+            // On the account, not a camera: the motion filter has to tell
+            // the two apart, and the id is the captured purifier's.
+            { "deviceUUID": "d0000000-0000-4000-8000-000000000003", "deviceName": "Purifier", "deviceType": "HPH01" }
         ] })
         .to_string(),
     )
