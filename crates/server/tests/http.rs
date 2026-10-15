@@ -572,6 +572,57 @@ async fn verify_requires_the_unlock_and_saves_the_session() {
 }
 
 #[tokio::test]
+async fn a_gateway_auth_failure_reads_as_unauthorized() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"uuid":"login-1"}"#))
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify",
+        ))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    let browser = client();
+    unlock(&browser, &h.base).await;
+    let otp = browser
+        .post(format!("{}/api/login/otp", h.base))
+        .json(&json!({ "phone": "9876543210" }))
+        .send()
+        .await
+        .expect("otp");
+    assert_eq!(otp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let refused = browser
+        .post(format!("{}/api/login/verify", h.base))
+        .json(&json!({ "phone": "9876543210", "code": "000000" }))
+        .send()
+        .await
+        .expect("verify");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a gateway auth failure re-locks the browser"
+    );
+    assert_eq!(
+        refused.json::<Value>().await.expect("json")["error"],
+        json!("auth error: User Token expired, Access denied"),
+        "the gateway's words ride the envelope"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn the_proxy_reaches_go2rtc_through_the_gate() {
     let h = harness().await;
     let client = client();
