@@ -178,6 +178,22 @@ fn the_air_line_can_be_moved() {
 }
 
 #[test]
+fn an_unreadable_bell_log_is_kept_aside_not_overwritten() {
+    let dir = temp_dir("notify-broken");
+    let path = dir.join("notifications.json");
+    std::fs::write(&path, "{ not json at all").expect("a broken log");
+
+    let store = Arc::new(NotificationStore::open(path.clone(), COALESCE));
+    assert!(store.list().is_empty(), "an unreadable log starts empty");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notifications.bak")).expect("the original is kept"),
+        "{ not json at all",
+        "the unreadable bytes survive the next save"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_store_survives_a_restart() {
     let dir = temp_dir("notify-restart");
     {
