@@ -325,7 +325,9 @@ impl Supervisor {
         // asked: a demoted hero's high stream must not run for ever. The
         // consumer check keeps a watched one - a hero - alive regardless.
         let idle = self.pacing.stream_idle;
+        let mut next_mint = Instant::now();
         loop {
+            let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
             // last asked: the viewer holds it open through go2rtc.
             let idle_since = if self.watched(&name).await {
@@ -333,12 +335,14 @@ impl Supervisor {
             } else {
                 self.idle_for(&name).await
             };
-            let seen_at = self.last_request_at(&name).await;
+            // Waited until the mint is due, or until the idle window is
+            // reached - whichever comes first, so a viewer who leaves is
+            // noticed without waiting out a re-mint.
             let sleep_for = match idle_since {
-                Some(idle_for) => wait.min(idle.saturating_sub(idle_for)),
-                // Watched: wake again within a window, so a viewer who
-                // leaves is noticed without waiting out a re-mint.
-                None => wait.min(idle),
+                Some(idle_for) => next_mint
+                    .saturating_duration_since(now)
+                    .min(idle.saturating_sub(idle_for)),
+                None => next_mint.saturating_duration_since(now).min(idle),
             };
             tokio::select! {
                 () = tokio::time::sleep(sleep_for) => {}
@@ -346,22 +350,31 @@ impl Supervisor {
                     tracing::info!(stream = %name, "remint forced by a retry");
                 }
             }
+            // The decision is made on what is true now, not on what was
+            // true before the wait: a stream that reached its idle window
+            // during the wait must not mint once more on its way out.
+            let idle_since = if self.watched(&name).await {
+                None
+            } else {
+                self.idle_for(&name).await
+            };
+            let seen_at = self.last_request_at(&name).await;
             if let (Some(idle_for), Some(seen_at)) = (idle_since, seen_at)
                 && idle_for >= idle
                 && self.teardown_if_idle(&name, seen_at).await
             {
                 return;
             }
-            wait = match self.mint_and_swap(&device).await {
+            next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     self.mark_live(&name).await;
                     self.reconcile_low(&name).await;
-                    self.pacing.remint
+                    Instant::now() + self.pacing.remint
                 }
                 Err(reason) => {
                     tracing::warn!(stream = %name, %reason, "stream re-mint failed");
                     self.mark_degraded(&name, reason).await;
-                    if wait >= self.pacing.remint {
+                    wait = if wait >= self.pacing.remint {
                         self.pacing.retry_base
                     } else {
                         // The first attempt waits no time at all, so the
@@ -369,7 +382,8 @@ impl Supervisor {
                         (wait * 2)
                             .max(self.pacing.retry_base)
                             .min(self.pacing.retry_max)
-                    }
+                    };
+                    Instant::now() + wait
                 }
             };
         }

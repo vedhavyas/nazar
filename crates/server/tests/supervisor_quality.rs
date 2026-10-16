@@ -307,6 +307,28 @@ async fn an_idle_tile_is_dropped() {
 }
 
 #[tokio::test]
+async fn an_idle_stream_does_not_mint_once_more_before_dying() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream wakes");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        !h.go2rtc.deletes().is_empty(),
+        "the idle stream was retired"
+    );
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        1,
+        "and it took its one mint to the grave: an idle stream must not mint once more on its way out"
+    );
+}
+
+#[tokio::test]
 async fn a_request_landing_during_teardown_gets_a_fresh_stream() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
