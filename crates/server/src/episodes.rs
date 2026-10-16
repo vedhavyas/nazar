@@ -203,7 +203,11 @@ mod tests {
         trim(&mut ledger, Duration::from_hours(48), NOON);
 
         let kept: Vec<i64> = ledger.episodes.iter().map(|entry| entry.start_ms).collect();
-        assert_eq!(kept.len(), 2, "the window's own day is kept whole: {kept:?}");
+        assert_eq!(
+            kept.len(),
+            2,
+            "the window's own day is kept whole: {kept:?}"
+        );
         assert!(
             ledger.episodes.iter().all(|entry| entry.start_ms >= cutoff),
             "and nothing before it survives"

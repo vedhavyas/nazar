@@ -61,7 +61,10 @@ fn ist_day_bounds(day: &str) -> Option<(i64, i64)> {
     let day = parts.next()?.parse::<i64>().ok()?;
     let month = parts.next()?.parse::<i64>().ok()?;
     let year = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+    if parts.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+    {
         return None;
     }
     let start = days_from_civil(year, month, day) * DAY_MS - IST_OFFSET_MS;
@@ -158,8 +161,16 @@ mod tests {
         assert_eq!(ist_day_bounds("16-10-2026-1"), None);
         // In range for the wire, but no such day: a well-formed
         // non-existent day must not silently map to another day's window.
-        assert_eq!(ist_day_bounds("31-02-2026"), None, "February has 28 in 2026");
+        assert_eq!(
+            ist_day_bounds("31-02-2026"),
+            None,
+            "February has 28 in 2026"
+        );
         assert_eq!(ist_day_bounds("31-04-2026"), None, "April has 30");
-        assert_eq!(ist_day_bounds("30-02-2028"), None, "February has 29 in 2028");
+        assert_eq!(
+            ist_day_bounds("30-02-2028"),
+            None,
+            "February has 29 in 2028"
+        );
     }
 }

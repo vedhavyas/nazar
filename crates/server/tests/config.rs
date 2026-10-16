@@ -31,7 +31,11 @@ fn the_config_lines_refuse_bad_values_and_keep_their_defaults() {
         "a line that is not a number keeps the default line"
     );
     assert_eq!(aqi_line(Some("150")), 150, "a number is honored");
-    assert_eq!(aqi_line(None), server::notify::AQI_ALERT_AT, "absence keeps the default");
+    assert_eq!(
+        aqi_line(None),
+        server::notify::AQI_ALERT_AT,
+        "absence keeps the default"
+    );
 
     assert_eq!(
         retention_days(Some("garbage")),

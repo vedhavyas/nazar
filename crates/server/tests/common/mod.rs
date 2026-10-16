@@ -206,10 +206,10 @@ fn streams_methods(
         let ops = Arc::clone(&ops);
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
-            recorded.lock().unwrap().push((
-                name.clone(),
-                params.get("src").cloned().unwrap_or_default(),
-            ));
+            recorded
+                .lock()
+                .unwrap()
+                .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
             ops.lock().unwrap().push(format!("put:{name}"));
             let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
             // A rejected PUT quotes the source back, as go2rtc's own
