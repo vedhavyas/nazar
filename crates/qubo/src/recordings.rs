@@ -85,14 +85,15 @@ pub async fn mint_vod(
     })
 }
 
-/// Sort order for the calendar's `DD-MM-YYYY` strings. A string that is
-/// not a day sorts first, where it stays visible rather than being dropped.
+/// Sort order for the calendar's `DD-MM-YYYY` strings. The key is (year,
+/// month, day): sorting the strings as written orders a 30-day window by
+/// day-of-month, interleaving the months the window crosses. A string that
+/// is not a day sorts first, where it stays visible rather than being
+/// dropped.
 fn day_key(day: &str) -> Option<(i64, i64, i64)> {
     let mut parts = day.split('-');
-    let key = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
-    parts.next().is_none().then_some(key)
+    let day = parts.next()?.parse().ok()?;
+    let month = parts.next()?.parse().ok()?;
+    let year = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((year, month, day))
 }

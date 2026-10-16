@@ -167,6 +167,30 @@ async fn a_vod_mint_asks_for_the_instant_and_carries_the_url_back() {
 }
 
 #[tokio::test]
+async fn recorded_days_sort_by_year_month_day_not_the_wire_order() {
+    let server = MockServer::start().await;
+    // A window that crosses a month boundary, as the web's 30-day window
+    // routinely does: sorting by day-of-month alone would interleave the
+    // months.
+    mount_calendar(
+        &server,
+        200,
+        r#"["02-11-2026","30-10-2026","31-10-2026","01-11-2026"]"#,
+    )
+    .await;
+
+    let days = recorded_days(&client_for(&server), &session(), &device(), 0, 1)
+        .await
+        .expect("the calendar answers");
+
+    assert_eq!(
+        days,
+        vec!["30-10-2026", "31-10-2026", "01-11-2026", "02-11-2026"],
+        "the days sort by (year, month, day), the fields in the order that decides"
+    );
+}
+
+#[tokio::test]
 async fn a_refused_calendar_carries_its_envelope() {
     let server = MockServer::start().await;
     mount_calendar(&server, 401, include_str!("fixtures/error_auth_002.json")).await;
