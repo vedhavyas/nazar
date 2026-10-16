@@ -411,6 +411,73 @@ async fn an_idle_stream_does_not_mint_once_more_before_dying() {
 /// being deleted under it) - and every await under it is bounded, so a
 /// go2rtc that accepts and then never answers wedges a status read for one
 /// timeout, never for the process's lifetime.
+/// A camera that fails, recovers, and fails again starts its backoff over:
+/// the second storm's first retry waits `retry_base`, not the grown tail of
+/// the first - otherwise a flapping camera's recovery decays toward
+/// `retry_max`.
+#[tokio::test]
+async fn a_recovered_camera_starts_its_backoff_over() {
+    let h = harness_with(Pacing {
+        remint: Duration::from_millis(300),
+        retry_base: Duration::from_millis(100),
+        retry_max: Duration::from_millis(400),
+        discovery_retry: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(30),
+    })
+    .await;
+    // Two refusals, then an answer: the loop has backed off to 200ms when
+    // the recovery lands.
+    mint_mock("high", 500, "boom".to_owned())
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock("high", 200, mint_body("high"))
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "the camera answers");
+
+    // The camera fails again at the next re-mint.
+    h.qubo.reset().await;
+    mount_mint(&h.qubo, "high", 500, "boom".to_owned()).await;
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(degraded, "the re-mint is refused");
+    let before = mint_calls(&h.qubo).await;
+
+    // From that refusal, the next attempt is one retry_base away (100ms),
+    // not the 400ms the un-reset tail would wait.
+    let soon = tokio::time::timeout(Duration::from_millis(250), async {
+        while mint_calls(&h.qubo).await == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        soon.is_ok(),
+        "the next attempt waits retry_base, not the grown tail (mints since the reset: {})",
+        mint_calls(&h.qubo).await
+    );
+}
+
 #[tokio::test]
 async fn a_wedged_go2rtc_does_not_wedge_the_lock() {
     let h = harness(Duration::from_millis(60)).await;

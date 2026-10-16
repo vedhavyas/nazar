@@ -382,6 +382,10 @@ impl Supervisor {
             next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     failed = false;
+                    // A recovered stream starts its backoff over: the next
+                    // failure waits retry_base, not the grown tail of the
+                    // storm before it.
+                    wait = Duration::ZERO;
                     self.mark_live(&name).await;
                     self.reconcile_low(&name).await;
                     Instant::now() + self.pacing.remint
@@ -390,15 +394,11 @@ impl Supervisor {
                     tracing::warn!(stream = %name, %reason, "stream re-mint failed");
                     self.mark_degraded(&name, reason).await;
                     failed = true;
-                    wait = if wait >= self.pacing.remint {
-                        self.pacing.retry_base
-                    } else {
-                        // The first attempt waits no time at all, so the
-                        // floor matters: doubling zero is still zero.
-                        (wait * 2)
-                            .max(self.pacing.retry_base)
-                            .min(self.pacing.retry_max)
-                    };
+                    // The first attempt waits no time at all, so the floor
+                    // matters: doubling zero is still zero.
+                    wait = (wait * 2)
+                        .max(self.pacing.retry_base)
+                        .min(self.pacing.retry_max);
                     Instant::now() + wait
                 }
             };
