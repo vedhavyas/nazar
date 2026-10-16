@@ -818,6 +818,29 @@ async fn the_spa_serves_index_and_revalidates_with_etags() {
         "client routes fall back to index.html"
     );
 
+    // An unknown /api path is the API's 404 envelope, never a 200 page: a
+    // client asking for data must not read the SPA instead.
+    for path in ["/api/nonsense", "/api/snaps/", "/api"] {
+        let unknown = client
+            .get(format!("{}{path}", h.base))
+            .send()
+            .await
+            .expect("unknown api path");
+        assert_eq!(
+            unknown.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is a 404"
+        );
+        assert_eq!(
+            unknown
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "{path} answers the API's own envelope"
+        );
+    }
+
     let revalidated = client
         .get(format!("{}/", h.base))
         .header(reqwest::header::IF_NONE_MATCH, etag)
