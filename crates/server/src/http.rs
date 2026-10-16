@@ -31,7 +31,9 @@ use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
 use crate::recordings::clips_for;
-use crate::supervisor::{StreamState, Supervisor, SupervisorError, VOD_PREFIX, stream_name};
+use crate::supervisor::{
+    StreamSrc, StreamState, Supervisor, SupervisorError, parse_stream_src, stream_name,
+};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
 #[derive(Embed)]
@@ -799,16 +801,10 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
         }
         // A live stream is a camera plus its quality class; a playback
         // stream is the camera under the vod- prefix. Nothing else.
-        let camera = if let Some(camera) = src.strip_prefix(VOD_PREFIX) {
-            camera.to_owned()
-        } else {
-            let Some((camera, quality)) = src.rsplit_once('-') else {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-            };
-            if !matches!(quality, "high" | "low") {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-            }
-            camera.to_owned()
+        let Some(StreamSrc::Live { camera, .. } | StreamSrc::Vod { camera }) =
+            parse_stream_src(&src)
+        else {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
         };
         let known = state
             .supervisor

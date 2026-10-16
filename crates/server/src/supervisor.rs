@@ -55,10 +55,11 @@ pub struct Pacing {
     /// is loopback - and it is what notices a dead picture before the next
     /// mint's cadence would.
     pub liveness_poll: Duration,
-    /// How long a viewer's ask keeps counting as a viewer. Must outlast
-    /// the slowest client cadence that re-asks - the HLS fallback's
-    /// playlist refresh, an away-mode tile's still interval (~10s) - and
-    /// it is what ends a stall whose viewer has gone.
+    /// How long after an ask a viewer still counts as arriving. It only
+    /// gates STARTING a run of starvation - a run already open ends on the
+    /// producer alone - so it must merely outlast the gap between the
+    /// watch's own polls with margin; silence minutes long opens nothing
+    /// and closes nothing.
     pub touch_ttl: Duration,
 }
 
@@ -90,6 +91,36 @@ pub const VOD_PREFIX: &str = "vod-";
 /// The go2rtc stream name for a camera's playback session.
 pub fn vod_name(device_id: &str) -> String {
     format!("{VOD_PREFIX}{device_id}")
+}
+
+/// A go2rtc stream source as this server names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamSrc {
+    /// A live camera's quality class.
+    Live { camera: String, quality: Quality },
+    /// A camera's playback session.
+    Vod { camera: String },
+}
+
+/// Parse a stream source: `<camera>-high`, `<camera>-low`, or
+/// `vod-<camera>`. One grammar for the proxy's validation and the viewer
+/// clock's normalization, so the two cannot drift.
+pub fn parse_stream_src(src: &str) -> Option<StreamSrc> {
+    if let Some(rest) = src.strip_prefix(VOD_PREFIX) {
+        return (!rest.is_empty()).then(|| StreamSrc::Vod {
+            camera: rest.to_owned(),
+        });
+    }
+    let (camera, quality) = src.rsplit_once('-')?;
+    let quality = match quality {
+        "high" => Quality::High,
+        "low" => Quality::Low,
+        _ => return None,
+    };
+    (!camera.is_empty()).then(|| StreamSrc::Live {
+        camera: camera.to_owned(),
+        quality,
+    })
 }
 
 /// A started playback: the stream the player asks for, and how long the
@@ -126,6 +157,67 @@ struct Tracked {
     state: StreamState,
     wake: Arc<Notify>,
     last_request: Instant,
+}
+
+/// A run of starvation: viewers are on a picture whose producer is not up.
+/// It ends when the producer connects - or, past the window, when the
+/// reason is the state - and only silence opens a new one, never closes an
+/// open one: the asker may be a tile that unmounted the moment we told it
+/// the stream is waking.
+struct Stall {
+    since: Option<Instant>,
+    reported: bool,
+    attempts: u32,
+    /// The delay before the next attempt; compounds per attempt.
+    wait: Duration,
+}
+
+impl Stall {
+    fn new() -> Self {
+        Self {
+            since: None,
+            reported: false,
+            attempts: 0,
+            wait: Duration::ZERO,
+        }
+    }
+
+    /// Start a run if none is running; the first `started` wins, so the
+    /// window measures from the first sighting, not the latest.
+    fn open(&mut self, started: Instant) -> Instant {
+        *self.since.get_or_insert(started)
+    }
+
+    /// One more attempt against the same run: the backoff compounds.
+    fn attempted(&mut self, pacing: &Pacing) {
+        self.attempts += 1;
+        self.wait = (self.wait * 2).max(pacing.retry_base).min(pacing.retry_max);
+    }
+
+    /// The producer answered: yield how long the run starved and how many
+    /// attempts it took.
+    fn close(&mut self) -> Option<(Duration, u32)> {
+        let since = self.since.take()?;
+        let out = (since.elapsed(), self.attempts);
+        self.reported = false;
+        self.attempts = 0;
+        self.wait = Duration::ZERO;
+        Some(out)
+    }
+}
+
+/// What the liveness watch can say about the stream's producer.
+enum ProducerWatch {
+    /// The producer is up: any run of starvation is over.
+    Up,
+    /// Not up, and somebody is on it: a viewer attached, or an ask fresh
+    /// enough to count - start a run at that ask's own clock.
+    Stalled(Instant),
+    /// Not up, and nobody has asked recently: nothing to judge.
+    Quiet,
+    /// go2rtc could not say: the run, if any, stands unwitnessed - an
+    /// unreadable API is not a recovery.
+    Unreadable,
 }
 
 /// The streams the server is keeping alive.
@@ -531,10 +623,7 @@ impl Supervisor {
         let idle = self.pacing.stream_idle;
         let mut next_mint = Instant::now();
         let mut failed = false;
-        // When the current run of watched-but-unconnected producers began,
-        // and whether the window's degradation has been told.
-        let mut stalled_since: Option<Instant> = None;
-        let mut degraded_reported = false;
+        let mut stall = Stall::new();
         loop {
             let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
@@ -588,34 +677,39 @@ impl Supervisor {
             let retry_due = forced && failed;
             if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
-                if self
-                    .stall_response(&name, &mut stalled_since, &mut degraded_reported)
-                    .await
-                {
+                if self.stall_response(&name, &mut stall).await {
                     failed = true;
-                    // Paced, not immediate: a starved stream replaces its
-                    // dead URL on the backoff, so a camera that is away for
-                    // minutes is not hit with a mint a second.
-                    wait = (wait * 2)
-                        .max(self.pacing.retry_base)
-                        .min(self.pacing.retry_max);
-                    next_mint = Instant::now() + wait;
+                    // Pulled forward, never pushed back: a starved stream
+                    // replaces its dead URL on the run's own backoff - so a
+                    // camera away for minutes is not hit with a mint a
+                    // second, and a backoff longer than the watch's own
+                    // poll still comes due.
+                    next_mint =
+                        next_mint.min(Instant::now() + stall.wait.max(self.pacing.retry_base));
                 }
                 continue;
+            }
+            if stall.since.is_some() {
+                stall.attempted(&self.pacing);
+                tracing::info!(
+                    stream = %name,
+                    attempt = stall.attempts,
+                    starved = ?stall.since.map(|since| since.elapsed()),
+                    "re-minting a starved stream"
+                );
             }
             next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     failed = false;
-                    // A recovered stream starts its backoff over: the next
-                    // failure waits retry_base, not the grown tail of the
-                    // storm before it. A stall already established keeps
-                    // its clock and its state - the window measures how
-                    // long viewers have been starved, not how old one URL
-                    // is - and the liveness watch is what ends it.
-                    wait = Duration::ZERO;
                     self.reconcile_low(&name).await;
-                    if stalled_since.is_none() {
-                        degraded_reported = false;
+                    if stall.since.is_none() {
+                        // A recovered stream starts its backoff over: the
+                        // next failure waits retry_base, not the grown tail
+                        // of the storm before it. While a run is open the
+                        // mint was one more attempt at a picture that has
+                        // not arrived, and the run's own backoff - not this
+                        // one - is what paces the next attempt.
+                        wait = Duration::ZERO;
                         self.mark_live(&name).await;
                     }
                     Instant::now() + self.pacing.remint
@@ -678,20 +772,24 @@ impl Supervisor {
         Ok(())
     }
 
-    /// When the stream's producer is not up while somebody is on it - the
-    /// moment that state began, as the server saw it. A viewer shows up as
-    /// a consumer once a session opens, or as the ask itself - the
-    /// proxy's sighting of a socket or a playlist request - which is the
-    /// only trace a failed attach leaves anywhere (measured live
-    /// 2026-10-16). `None` when there is nothing to judge: nobody
-    /// attached and no recent ask (the URL is still unspent, a fresh one
-    /// is what the next viewer dials), or go2rtc unreadable (the next
-    /// check will say).
-    async fn watched_but_unconnected(&self, name: &str) -> Option<Instant> {
-        let streams = self.go2rtc.streams().await.ok()?;
-        let stream = streams.iter().find(|stream| stream.name == name)?;
-        if stream.connected {
-            return None;
+    /// What the server can see of the stream's producer right now. A
+    /// viewer shows up as a consumer once a session opens, or as the ask
+    /// itself - the proxy's sighting of a socket or a playlist request -
+    /// which is the only trace a failed attach leaves anywhere (measured
+    /// live 2026-10-16). A stream entry that is gone reads as not up: the
+    /// producer is certainly not, and a mint is what brings the entry
+    /// back.
+    async fn watch_producer(&self, name: &str) -> ProducerWatch {
+        let streams = match self.go2rtc.streams().await {
+            Ok(streams) => streams,
+            Err(err) => {
+                tracing::warn!(stream = %name, %err, "the liveness watch could not read go2rtc");
+                return ProducerWatch::Unreadable;
+            }
+        };
+        let stream = streams.iter().find(|stream| stream.name == name);
+        if stream.is_some_and(|stream| stream.connected) {
+            return ProducerWatch::Up;
         }
         // The ask is the clock: the grace runs from the viewer's own
         // attempt, not from when a poll noticed it.
@@ -703,53 +801,69 @@ impl Supervisor {
             .copied()
             .filter(|at| at.elapsed() <= self.pacing.touch_ttl);
         if let Some(at) = asked {
-            return Some(at);
+            return ProducerWatch::Stalled(at);
         }
-        (stream.consumers > 0).then(Instant::now)
+        if stream.is_some_and(|stream| stream.consumers > 0) {
+            return ProducerWatch::Stalled(Instant::now());
+        }
+        ProducerWatch::Quiet
     }
 
-    /// The liveness watch, once per loop slice: a viewer on a picture whose
-    /// producer is not up can never recover on the current mint - the URL
-    /// is one-shot - so `true` asks the loop for a fresh one, on the retry
-    /// cadence and well before the next remint's. The window's degradation
-    /// is re-asserted every slice past it, so no later mint quietly
-    /// returns a starved stream to waking - the UI offers Try again only
-    /// for degraded.
-    async fn stall_response(
-        &self,
-        name: &str,
-        stalled_since: &mut Option<Instant>,
-        degraded_reported: &mut bool,
-    ) -> bool {
-        let Some(stalled) = self.watched_but_unconnected(name).await else {
-            if stalled_since.take().is_some() {
-                // The picture is back: the stall is over.
-                *degraded_reported = false;
-                self.mark_live(name).await;
+    /// The liveness watch, once per loop slice: `true` asks the loop for a
+    /// fresh mint, on the run's own backoff and well before the next
+    /// remint's cadence. A run that is open stays open through silence -
+    /// its window and its reason must still land - and only the producer
+    /// connecting closes it; an unreadable or absent producer leaves it
+    /// standing.
+    async fn stall_response(&self, name: &str, stall: &mut Stall) -> bool {
+        match self.watch_producer(name).await {
+            ProducerWatch::Up => {
+                if let Some((starved, attempts)) = stall.close() {
+                    tracing::info!(
+                        stream = %name,
+                        ?starved,
+                        attempts,
+                        "the producer connected; the stall is over"
+                    );
+                    self.mark_live(name).await;
+                }
+                false
             }
-            return false;
-        };
-        let waiting = stalled_since.get_or_insert(stalled).elapsed();
+            ProducerWatch::Unreadable => false,
+            ProducerWatch::Quiet => {
+                let Some(since) = stall.since else {
+                    return false;
+                };
+                self.stall_cadence(name, stall, since).await
+            }
+            ProducerWatch::Stalled(started) => {
+                let since = stall.open(started);
+                self.stall_cadence(name, stall, since).await
+            }
+        }
+    }
+
+    /// The cadence a starved run keeps: waking past the grace, degraded
+    /// past the window - the reason re-asserted every slice, so no later
+    /// mint quietly returns the stream to waking. The UI offers Try again
+    /// only for degraded.
+    async fn stall_cadence(&self, name: &str, stall: &mut Stall, since: Instant) -> bool {
+        let waiting = since.elapsed();
         if waiting < self.pacing.connect_grace {
             return false;
         }
         if waiting >= self.pacing.connect_window {
-            if !*degraded_reported {
+            if !stall.reported {
                 tracing::warn!(
                     stream = %name,
                     ?waiting,
                     "the producer has not connected; giving the reason"
                 );
-                *degraded_reported = true;
+                stall.reported = true;
             }
             self.mark_degraded(name, "the producer has not connected".to_owned())
                 .await;
         } else {
-            tracing::warn!(
-                stream = %name,
-                ?waiting,
-                "the producer has not connected; re-minting"
-            );
             self.mark_waking(name).await;
         }
         true
@@ -830,6 +944,19 @@ impl Supervisor {
             if !self.watched(&low).await {
                 self.drop_low_if_idle(&low, last).await;
             }
+            return;
+        }
+        // Re-asserted only when go2rtc has lost it: every PUT rewrites
+        // go2rtc's whole config on disk, and a healthy chain needs none of
+        // that on a per-slice heartbeat.
+        let present = self
+            .go2rtc
+            .streams()
+            .await
+            .is_ok_and(|streams| streams.iter().any(|stream| stream.name == low));
+        if present {
+            let live = self.status_for_name(high).await;
+            self.settle(&low, live).await;
             return;
         }
         match self.go2rtc.put_stream(&low, &low_source(high)).await {
@@ -969,12 +1096,9 @@ fn low_name_of(high: &str) -> Option<String> {
 /// the high stream behind a tile's low rendition, and nothing for a
 /// playback stream or anything unrecognized.
 fn touched_high(src: &str) -> Option<String> {
-    if src.starts_with(VOD_PREFIX) {
-        return None;
-    }
-    match src.rsplit_once('-') {
-        Some((camera, "high" | "low")) => Some(format!("{camera}-high")),
-        _ => None,
+    match parse_stream_src(src)? {
+        StreamSrc::Live { camera, .. } => Some(stream_name(&camera, Quality::High)),
+        StreamSrc::Vod { .. } => None,
     }
 }
 

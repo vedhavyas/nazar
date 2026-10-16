@@ -900,14 +900,17 @@ async fn a_degraded_stream_stays_degraded_across_attempts() {
     .await;
     assert!(degraded, "the window passes and the reason surfaces");
 
-    // Sample across a further full attempt: the state must hold.
+    // Sample across a further full attempt: the state must hold, reason
+    // and all - a mint landing mid-run must not launder it.
     let before = h.go2rtc.puts().len();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_ne!(
+        assert_eq!(
             h.supervisor.status(DEVICE_ID).await,
-            StreamState::Waking,
-            "a later attempt must not return the stream to waking"
+            StreamState::Degraded {
+                reason: "the producer has not connected".to_owned()
+            },
+            "a later attempt must not launder the reason"
         );
     }
     assert!(
@@ -925,8 +928,8 @@ async fn a_degraded_stream_stays_degraded_across_attempts() {
 async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
     let h = harness(Pacing {
         connect_window: Duration::from_millis(350),
-        retry_base: Duration::from_millis(250),
-        retry_max: Duration::from_millis(250),
+        retry_base: Duration::from_millis(20),
+        retry_max: Duration::from_millis(100),
         ..pacing(Duration::from_secs(30))
     })
     .await;
@@ -955,6 +958,12 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         degraded,
         "the window lands on its own deadline despite the refused mints: {:?}",
         h.supervisor.status(DEVICE_ID).await
+    );
+    // The premise provably ran: the refused mints actually happened.
+    assert!(
+        mint_count(&h.qubo).await >= 2,
+        "a refused mint ran mid-stall: {} mints",
+        mint_count(&h.qubo).await
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -1045,12 +1054,14 @@ async fn a_playback_ask_does_not_touch_the_live_stream() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A stall whose viewer has gone ends with the ask window: no fresh URLs
-/// are minted for an empty house.
+/// The asker can go away without the run dying: a tile unmounts its
+/// player the moment the stream reads waking, so the ask expires - and
+/// the run that ask started must still finish, at the producer or at the
+/// window, or the reason would never land on the home grid.
 #[tokio::test]
-async fn an_expired_ask_stops_the_re_minting() {
+async fn a_stall_outlives_the_ask_that_started_it() {
     let h = harness(Pacing {
-        touch_ttl: Duration::from_millis(150),
+        touch_ttl: Duration::from_millis(100),
         ..pacing(Duration::from_secs(30))
     })
     .await;
@@ -1069,19 +1080,157 @@ async fn an_expired_ask_stops_the_re_minting() {
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(reminted, "the ask heals first: {:?}", h.go2rtc.puts());
 
-    // The viewer never comes back; the ask expires and the loop stands down.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let settled = h.go2rtc.puts().len();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // No further asks, ever: the run still reaches its window (300ms,
+    // against an ask that expired at 100ms) and lands the reason.
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "the producer has not connected"
+        )
+    })
+    .await;
+    assert!(
+        degraded,
+        "the run outlives the ask that started it: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// An ask on a stream whose producer is up changes nothing: the connected
+/// short-circuit comes first, or every ask would re-mint-churn and
+/// falsely degrade a perfectly live stream.
+#[tokio::test]
+async fn a_connected_producer_ignores_a_fresh_ask() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "the attended stream is live");
+
+    h.supervisor.note_viewer_touch(&name);
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         h.go2rtc.puts().len(),
-        settled,
-        "the expired ask mints nothing more: {:?}",
+        1,
+        "a live stream is not re-minted around: {:?}",
         h.go2rtc.puts()
     );
+    assert!(is_live(&h.supervisor).await, "and it stays live");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A go2rtc that cannot answer, or that has lost the stream, is not a
+/// recovery: the run stands, the reason stands, and no read failure
+/// launders the state.
+#[tokio::test]
+async fn an_unreadable_or_missing_producer_does_not_heal() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "the producer has not connected"
+        )
+    })
+    .await;
+    assert!(degraded, "the window passes and the reason surfaces");
+
+    // The API goes unreadable: no read, no recovery - and when it reads
+    // again, the run is where it was, not restarted.
+    h.go2rtc.set_streams_error(true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        is_live(&h.supervisor).await,
-        "and the stream returns to live"
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        ),
+        "an unreadable go2rtc is not a recovery: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    h.go2rtc.set_streams_error(false);
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { .. }
+            ),
+            "the run survived the read failure, reason and all: {:?}",
+            h.supervisor.status(DEVICE_ID).await
+        );
+    }
+
+    // The stream entry is gone, as a go2rtc restart leaves it: still no
+    // recovery - the producer certainly is not up.
+    h.go2rtc.set_streams_visible(false);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        ),
+        "a lost entry is not a recovery either: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A run's re-mints pace on a compounding backoff: every mid-run mint is
+/// another attempt at a picture that has not arrived, not a reason to
+/// start the delay over.
+#[tokio::test]
+async fn a_stall_re_mints_on_a_compounding_backoff() {
+    let h = harness(Pacing {
+        retry_base: Duration::from_millis(50),
+        retry_max: Duration::from_millis(400),
+        connect_window: Duration::from_secs(5),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let reminting = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
+    assert!(reminting, "the run re-mints: {:?}", h.go2rtc.puts());
+
+    // One second at the cap: attempts land on the backoff (50ms doubling
+    // to 400ms), not on every liveness slice.
+    let before = h.go2rtc.puts().len();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let minted = h.go2rtc.puts().len() - before;
+    assert!(
+        (1..=6).contains(&minted),
+        "paced, not per-slice: {minted} re-mints in a second"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
