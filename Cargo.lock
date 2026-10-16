@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "qubo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
