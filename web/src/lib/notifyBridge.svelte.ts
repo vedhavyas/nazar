@@ -148,7 +148,11 @@ export function createNotifications(
   async function load(): Promise<void> {
     try {
       const [list, cameraNames] = await Promise.all([source.list(), source.names()]);
-      entries = list;
+      // An arrival that landed while the list was in flight is newer than
+      // anything the snapshot carries: it stays in front rather than being
+      // overwritten by the answer.
+      const seen = new Set(list.map((entry) => entry.id));
+      entries = [...entries.filter((entry) => !seen.has(entry.id)), ...list];
       names = cameraNames;
     } catch {
       // Covered by the banner; the bell just stays quiet.

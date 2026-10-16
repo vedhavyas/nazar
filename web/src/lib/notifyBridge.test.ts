@@ -85,6 +85,39 @@ test('the bell counts what arrived past the last look', async () => {
   stop();
 });
 
+test('an arrival during the boot fetch survives it', async () => {
+  let land: (() => void) | null = null;
+  let raise: ((entry: Notification) => void) | null = null;
+  const source: NotifySource = {
+    list: () =>
+      new Promise((resolve) => {
+        land = () => resolve([entry('a', 1000, 'motion')]);
+      }),
+    names: async () => ({ 'cam-1': 'Hall' }),
+    watch: (onNew) => {
+      raise = onNew;
+      return () => {
+        raise = null;
+      };
+    },
+  };
+  const notes = createNotifications(source, () => {});
+  const stop = notes.follow();
+
+  const loading = notes.load();
+  // The motion lands while the list is still in flight.
+  raise?.(entry('c', 3000, 'motion'));
+  land?.();
+  await loading;
+
+  expect(
+    notes.entries.map((each) => each.id),
+    'the arrival stays in front of the snapshot rather than being overwritten by it',
+  ).toEqual(['c', 'a']);
+  expect(notes.unread, 'and it counts').toBe(2);
+  stop();
+});
+
 test('the bell wears its count and opens the list', () => {
   const onopen = vi.fn();
   render(NotifyBell, { unread: 3, onopen });
