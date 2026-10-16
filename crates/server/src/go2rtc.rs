@@ -92,6 +92,19 @@ pub struct Go2rtc {
     config_path: PathBuf,
 }
 
+impl Clone for Go2rtc {
+    /// A second handle on the same API, without the spawned child: whoever
+    /// holds the original still owns the process.
+    fn clone(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+            http: self.http.clone(),
+            child: None,
+            config_path: PathBuf::new(),
+        }
+    }
+}
+
 impl Go2rtc {
     /// Spawn the configured binary with a generated config and talk to its
     /// loopback API. The process may take a moment to listen; callers retry
@@ -175,6 +188,27 @@ impl Go2rtc {
         }
         tracing::debug!(stream = name, "go2rtc stream dropped");
         Ok(())
+    }
+
+    /// One JPEG frame of the stream, as go2rtc's own API serves it. Free
+    /// when a producer is already running; it spawns one when none is, so
+    /// callers check for a live stream first.
+    pub async fn frame(&self, name: &str) -> Result<Vec<u8>, Go2rtcError> {
+        let response = self
+            .http
+            .get(self.api_for("/api/frame.jpeg")?)
+            .query(&[("src", name)])
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Go2rtcError::Rejected {
+                status: status.as_u16(),
+                body: snippet(&body),
+            });
+        }
+        Ok(response.bytes().await?.to_vec())
     }
 
     /// Every stream go2rtc currently holds, by name.

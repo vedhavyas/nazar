@@ -28,7 +28,7 @@ pub fn follow(
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(UnitEvent::Motion { device_id }) => {
+                Ok(UnitEvent::Motion { device_id, .. }) => {
                     // Only a camera the account actually has may take the
                     // tile: an id nothing renders would elect a hero the
                     // home cannot show.
@@ -45,7 +45,7 @@ pub fn follow(
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .motion(&device_id, Instant::now());
                 }
-                Ok(UnitEvent::Liveness { .. }) => {}
+                Ok(UnitEvent::Liveness { .. } | UnitEvent::Aqi { .. }) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::warn!(missed, "the motion follower fell behind a burst");
                 }

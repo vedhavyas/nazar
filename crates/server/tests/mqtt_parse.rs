@@ -26,11 +26,41 @@ fn a_recording_event_reads_as_motion() {
         assert_eq!(
             parse_monitor_message(&topic(CAMERA, "recordingControl"), fixture),
             Some(UnitEvent::Motion {
-                device_id: CAMERA.to_owned()
+                device_id: CAMERA.to_owned(),
+                image: None,
             }),
-            "a sighting is a motion for the hero"
+            "a sighting is a motion for the hero, with no fetchable still: the \
+             captures carry a device-local path"
         );
     }
+}
+
+#[test]
+fn a_fetchable_image_rides_along_with_motion() {
+    let payload = r#"{"devices":{"services":{"recordingControl":{"events":{"stateChanged":{"cause":"MOTION_DETECTED","imageFileName":"https://cdn.example/still.jpg"}}}}}}"#;
+    assert_eq!(
+        parse_monitor_message(&topic(CAMERA, "recordingControl"), payload),
+        Some(UnitEvent::Motion {
+            device_id: CAMERA.to_owned(),
+            image: Some("https://cdn.example/still.jpg".to_owned()),
+        }),
+        "a still the server could fetch is kept"
+    );
+}
+
+#[test]
+fn an_aqi_reading_reads_as_aqi() {
+    assert_eq!(
+        parse_monitor_message(
+            &topic("d0000000-0000-4000-8000-000000000006", "aqiStatus"),
+            include_str!("fixtures/mqtt_aqi_pm25.json"),
+        ),
+        Some(UnitEvent::Aqi {
+            device_id: "d0000000-0000-4000-8000-000000000006".to_owned(),
+            value: 15,
+        }),
+        "the reading rides as a string and comes out a number"
+    );
 }
 
 #[test]
@@ -73,9 +103,9 @@ fn a_heartbeat_reads_as_liveness() {
 fn other_services_are_not_events_yet() {
     let payload = include_str!("fixtures/mqtt_heartbeat_online.json");
     assert_eq!(
-        parse_monitor_message(&topic(CAMERA, "aqiStatus"), payload),
+        parse_monitor_message(&topic(CAMERA, "mcuSWVersion"), payload),
         None,
-        "the house listens for motion and presence, nothing else"
+        "the house listens for motion, presence and air, nothing else"
     );
 }
 

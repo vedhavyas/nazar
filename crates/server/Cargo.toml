@@ -18,6 +18,7 @@ rumqttc = { workspace = true }
 rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 # Every feature this crate's code names, including the ones its tests use
 # directly (io-util for the fake broker's sockets), rather than whatever a

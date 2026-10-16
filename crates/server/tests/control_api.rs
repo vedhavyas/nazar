@@ -15,6 +15,7 @@ use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, ControlTiming, Wiring, app};
 use server::motion::MotionOrder;
+use server::notify::{NotificationStore, Snapshots};
 use server::supervisor::{Pacing, Supervisor};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
@@ -78,6 +79,11 @@ async fn harness() -> Harness {
             go2rtc_api: go2rtc.base.to_string(),
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
+            notifications: Arc::new(NotificationStore::open(
+                data_dir.join("notifications.json"),
+                Duration::from_secs(30),
+            )),
+            snapshots: Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps")),
         },
     );
     // The poll window is a knob so a write that never lands does not cost

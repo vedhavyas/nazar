@@ -26,6 +26,7 @@ pub struct FakeApi {
     put_status: Arc<AtomicU16>,
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
+    producers: Arc<AtomicBool>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
@@ -39,16 +40,20 @@ impl FakeApi {
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
+        let producers = Arc::new(AtomicBool::new(true));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
-            &put_status,
-            &streams_visible,
-            &streams_error,
+            Knobs {
+                put_status: &put_status,
+                streams_visible: &streams_visible,
+                streams_error: &streams_error,
+                producers: &producers,
+                delete_delay: &delete_delay,
+            },
             &viewers,
-            &delete_delay,
         ));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -64,9 +69,16 @@ impl FakeApi {
             put_status,
             streams_visible,
             streams_error,
+            producers,
             viewers,
             delete_delay,
         }
+    }
+
+    /// Report every stream without a producer, as a go2rtc whose sources
+    /// are configured but not running would.
+    pub fn set_producers(&self, running: bool) {
+        self.producers.store(running, Ordering::SeqCst);
     }
 
     /// Make every DELETE take `delay` to answer, as a go2rtc under load
@@ -112,111 +124,146 @@ impl FakeApi {
     }
 }
 
+/// The answer-mode knobs a test turns, bundled so the fake's surfaces take
+/// them as one argument.
+struct Knobs<'a> {
+    put_status: &'a Arc<AtomicU16>,
+    streams_visible: &'a Arc<AtomicBool>,
+    streams_error: &'a Arc<AtomicBool>,
+    producers: &'a Arc<AtomicBool>,
+    delete_delay: &'a Arc<AtomicU64>,
+}
+
 /// The streams admin surface, as go2rtc 1.9.14 answers it.
 fn streams_routes(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
-    put_status: &Arc<AtomicU16>,
-    streams_visible: &Arc<AtomicBool>,
-    streams_error: &Arc<AtomicBool>,
+    knobs: Knobs<'_>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
-    delete_delay: &Arc<AtomicU64>,
 ) -> Router {
-    Router::new().route("/api/ws", get(echo)).route(
-        "/api/streams",
-        put({
-            let recorded = Arc::clone(puts);
-            let status = Arc::clone(put_status);
-            move |Query(params): Query<HashMap<String, String>>| {
-                let recorded = Arc::clone(&recorded);
-                let status = Arc::clone(&status);
-                async move {
-                    recorded.lock().unwrap().push((
-                        params.get("name").cloned().unwrap_or_default(),
-                        params.get("src").cloned().unwrap_or_default(),
-                    ));
-                    let code =
-                        StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
-                    // A rejected PUT quotes the source back, as
-                    // go2rtc's own refusals do - token and all.
-                    let body = if code.is_success() {
-                        String::new()
-                    } else {
-                        format!(
-                            "streams: source from insecure producer: {}",
-                            params.get("src").cloned().unwrap_or_default()
-                        )
-                    };
-                    (code, body)
+    Router::new()
+        .route(
+            "/api/frame.jpeg",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                // A still, as go2rtc serves one for a running stream.
+                match params.get("src") {
+                    Some(_) => (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                        vec![0xFF_u8, 0xD8, 0xFF, 0xE0],
+                    ),
+                    None => (
+                        StatusCode::NOT_FOUND,
+                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                        b"stream not found".to_vec(),
+                    ),
                 }
-            }
-        })
-        .delete({
-            let dropped = Arc::clone(deletes);
-            let delay = Arc::clone(delete_delay);
-            move |Query(params): Query<HashMap<String, String>>| {
-                let dropped = Arc::clone(&dropped);
-                let delay = Arc::clone(&delay);
-                async move {
-                    let millis = delay.load(Ordering::SeqCst);
-                    if millis > 0 {
-                        tokio::time::sleep(Duration::from_millis(millis)).await;
-                    }
-                    dropped
-                        .lock()
-                        .unwrap()
-                        .push(params.get("src").cloned().unwrap_or_default());
+            }),
+        )
+        .route("/api/ws", get(echo))
+        .route("/api/streams", streams_methods(puts, deletes, knobs, viewers))
+}
+
+/// The streams endpoint's three methods, as go2rtc 1.9.14 answers them.
+fn streams_methods(
+    puts: &Arc<Mutex<Vec<(String, String)>>>,
+    deletes: &Arc<Mutex<Vec<String>>>,
+    knobs: Knobs<'_>,
+    viewers: &Arc<Mutex<HashMap<String, usize>>>,
+) -> axum::routing::MethodRouter {
+    let recorded = Arc::clone(puts);
+    let status = Arc::clone(knobs.put_status);
+    let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
+        let recorded = Arc::clone(&recorded);
+        let status = Arc::clone(&status);
+        async move {
+            recorded.lock().unwrap().push((
+                params.get("name").cloned().unwrap_or_default(),
+                params.get("src").cloned().unwrap_or_default(),
+            ));
+            let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+            // A rejected PUT quotes the source back, as go2rtc's own
+            // refusals do - token and all.
+            let body = if code.is_success() {
+                String::new()
+            } else {
+                format!(
+                    "streams: source from insecure producer: {}",
+                    params.get("src").cloned().unwrap_or_default()
+                )
+            };
+            (code, body)
+        }
+    });
+    let dropped = Arc::clone(deletes);
+    let delay = Arc::clone(knobs.delete_delay);
+    let drop_stream =
+        axum::routing::delete(move |Query(params): Query<HashMap<String, String>>| {
+            let dropped = Arc::clone(&dropped);
+            let delay = Arc::clone(&delay);
+            async move {
+                let millis = delay.load(Ordering::SeqCst);
+                if millis > 0 {
+                    tokio::time::sleep(Duration::from_millis(millis)).await;
                 }
+                dropped
+                    .lock()
+                    .unwrap()
+                    .push(params.get("src").cloned().unwrap_or_default());
             }
-        })
-        .get({
-            let recorded = Arc::clone(puts);
-            let visible = Arc::clone(streams_visible);
-            let viewers = Arc::clone(viewers);
-            let error = Arc::clone(streams_error);
-            move || {
-                let recorded = Arc::clone(&recorded);
-                let visible = Arc::clone(&visible);
-                let viewers = Arc::clone(&viewers);
-                let error = Arc::clone(&error);
-                async move {
-                    // An unreadable status: what a go2rtc in trouble answers.
-                    if error.load(Ordering::SeqCst) {
-                        return String::new();
-                    }
-                    let recorded = recorded.lock().unwrap().clone();
-                    if recorded.is_empty() {
-                        return include_str!("../fixtures/streams.json").to_owned();
-                    }
-                    if !visible.load(Ordering::SeqCst) {
-                        return "{}".to_owned();
-                    }
-                    let viewers = viewers.lock().unwrap().clone();
-                    // go2rtc materializes a producer as soon as the
-                    // source is set, which is what the fixture's
-                    // unset case cannot show.
-                    let mut streams = serde_json::Map::new();
-                    for (name, source) in recorded {
-                        let watching = viewers.get(&name).copied().unwrap_or(0);
-                        // Measured shape: no viewers is `null`.
-                        let consumers = (watching > 0).then(|| {
-                            (0..watching)
-                                .map(|_| serde_json::json!({ "id": "viewer" }))
-                                .collect::<Vec<_>>()
-                        });
-                        streams.insert(
-                            name,
-                            serde_json::json!({
-                                "producers": [{ "url": source }],
-                                "consumers": consumers,
-                            }),
-                        );
-                    }
-                    serde_json::Value::Object(streams).to_string()
-                }
+        });
+    let recorded = Arc::clone(puts);
+    let visible = Arc::clone(knobs.streams_visible);
+    let viewers = Arc::clone(viewers);
+    let error = Arc::clone(knobs.streams_error);
+    let running = Arc::clone(knobs.producers);
+    let list_streams = get(move || {
+        let recorded = Arc::clone(&recorded);
+        let visible = Arc::clone(&visible);
+        let viewers = Arc::clone(&viewers);
+        let error = Arc::clone(&error);
+        let running = Arc::clone(&running);
+        async move {
+            // An unreadable status: what a go2rtc in trouble answers.
+            if error.load(Ordering::SeqCst) {
+                return String::new();
             }
-        }),
-    )
+            let recorded = recorded.lock().unwrap().clone();
+            if recorded.is_empty() {
+                return include_str!("../fixtures/streams.json").to_owned();
+            }
+            if !visible.load(Ordering::SeqCst) {
+                return "{}".to_owned();
+            }
+            let viewers = viewers.lock().unwrap().clone();
+            // go2rtc materializes a producer as soon as the source is
+            // set, which is what the fixture's unset case cannot show.
+            let mut streams = serde_json::Map::new();
+            for (name, source) in recorded {
+                let watching = viewers.get(&name).copied().unwrap_or(0);
+                // Measured shape: no viewers is `null`.
+                let consumers = (watching > 0).then(|| {
+                    (0..watching)
+                        .map(|_| serde_json::json!({ "id": "viewer" }))
+                        .collect::<Vec<_>>()
+                });
+                let held = running.load(Ordering::SeqCst);
+                streams.insert(
+                    name,
+                    serde_json::json!({
+                        "producers": if held {
+                            vec![serde_json::json!({ "url": source })]
+                        } else {
+                            Vec::new()
+                        },
+                        "consumers": consumers,
+                    }),
+                );
+            }
+            serde_json::Value::Object(streams).to_string()
+        }
+    });
+    put_stream.delete(drop_stream).get(list_streams)
 }
 
 /// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them.

@@ -10,6 +10,7 @@ use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
 use server::motion::MotionOrder;
 use server::mqtt::{FeedConfig, MqttService};
+use server::notify::{COALESCE, NotificationStore, Snapshots};
 use server::supervisor::{Pacing, Supervisor};
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,15 @@ async fn main() -> anyhow::Result<()> {
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);
+    let notifications = Arc::new(NotificationStore::open(
+        config.data_dir.join("notifications.json"),
+        COALESCE,
+    ));
+    let snapshots = Snapshots::new(
+        Go2rtc::connect(server::go2rtc::API_BASE.parse().context("the go2rtc URL")?),
+        config.data_dir.join("snaps"),
+    );
+    let _notify = server::notify::start(&events, Arc::clone(&notifications), snapshots.clone());
     let _mqtt = MqttService::start(
         qubo.clone(),
         sessions.clone(),
@@ -66,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
             go2rtc_api: server::go2rtc::API_BASE.to_owned(),
             events,
             motion,
+            notifications,
+            snapshots,
         },
     );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT))
