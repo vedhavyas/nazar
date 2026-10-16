@@ -126,6 +126,13 @@ pub struct P2pConfig {
     pub aes_mode: media::AesMode,
     /// The `streamSourceQuality` requested of the camera.
     pub quality: signaling::StreamQuality,
+    /// The broker host and port; the defaults are the app's own, and the
+    /// seam exists so the broker leg can run against a loopback double.
+    pub broker_host: String,
+    pub broker_port: u16,
+    /// Whether the broker connection speaks TLS (the cloud's does; a
+    /// loopback double does not).
+    pub broker_tls: bool,
     /// Stands in for Build.MANUFACTURER_MODEL in the broker clientId.
     pub device_name: String,
 }
@@ -144,6 +151,9 @@ impl Default for P2pConfig {
             handshake_timeout: Duration::from_secs(10),
             aes_mode: media::AesMode::CtrCont,
             quality: signaling::StreamQuality::High,
+            broker_host: BROKER_HOST.to_owned(),
+            broker_port: BROKER_PORT,
+            broker_tls: true,
             device_name: "nazar".to_owned(),
         }
     }
@@ -389,7 +399,7 @@ impl P2pEngine {
     /// answer window must not lose the answer, which is exactly what the
     /// reference's paho on_connect does.
     fn connect_broker(&self, session: &Session, unit: &str, monitor_topic: &str) -> Broker {
-        let options = broker_options(session, unit, &self.config.device_name);
+        let options = broker_options(session, unit, &self.config);
         let (client, mut eventloop) = rumqttc::AsyncClient::new(options, BROKER_CAPACITY);
         let (answers_tx, answers) = mpsc::channel::<(String, String)>(8);
         let subscribe_client = client.clone();
@@ -414,8 +424,11 @@ impl P2pEngine {
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::debug!(%err, "the p2p broker event loop ended");
-                        return;
+                        // rumqttc's poll reconnects on its next call (its
+                        // own contract), and the reference's paho does the
+                        // same - so a blip must not end the leg; keep
+                        // polling and the ConnAck above re-subscribes.
+                        tracing::debug!(%err, "the p2p broker connection dropped; polling on");
                     }
                 }
             }
@@ -620,17 +633,21 @@ fn spawn_teardown(
     });
 }
 
-fn broker_options(session: &Session, unit: &str, device_name: &str) -> rumqttc::MqttOptions {
+fn broker_options(session: &Session, unit: &str, config: &P2pConfig) -> rumqttc::MqttOptions {
     let mut options = rumqttc::MqttOptions::new(
-        signaling::client_id(device_name, unit, "SimpleMQTTClient"),
-        BROKER_HOST,
-        BROKER_PORT,
+        signaling::client_id(&config.device_name, unit, "SimpleMQTTClient"),
+        &config.broker_host,
+        config.broker_port,
     );
     options.set_credentials(session.uuid.clone(), session.access_token.clone());
     options.set_keep_alive(BROKER_KEEP_ALIVE);
-    // The platform's own TLS, as the server's feed uses (rumqttc's rustls
-    // path pins a webpki line with unpatched advisories).
-    options.set_transport(rumqttc::Transport::Tls(rumqttc::TlsConfiguration::Native));
+    options.set_transport(if config.broker_tls {
+        // The platform's own TLS, as the server's feed uses (rumqttc's
+        // rustls path pins a webpki line with unpatched advisories).
+        rumqttc::Transport::Tls(rumqttc::TlsConfiguration::Native)
+    } else {
+        rumqttc::Transport::Tcp
+    });
     options
 }
 
