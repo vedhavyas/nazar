@@ -8,7 +8,7 @@
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,13 +40,21 @@ pub struct Pacing {
     /// the stream is re-minted. A fresh mint connects in about a second
     /// (measured 2026-10-16); this is several times that.
     pub connect_grace: Duration,
-    /// How long the loop keeps re-minting a producer that never connects
-    /// before surfacing degraded - the camera's push can lag for minutes
-    /// (measured 52s on the hub 2026-10-16), and the reason must outlast
-    /// the lag. Deliberately under `stream_idle`: a stream nobody watches
-    /// is torn down on that window, and a reason that only appears after
-    /// the teardown would never reach anyone.
+    /// How long a watched producer may stay unconnected before the stream
+    /// surfaces degraded - the camera's push can lag for minutes (measured
+    /// 52s on the hub 2026-10-16), so the window must outlast the lag. The
+    /// watch evaluates it on every `liveness_poll` slice, so with the
+    /// defaults the reason lands about 90s into the stall. Deliberately
+    /// under `stream_idle`: a stream nobody watches is torn down on that
+    /// window and a reason that only appeared after the teardown would
+    /// reach nobody - while a watched stream is never torn down at all,
+    /// so the reason keeps its whole margin in front of it.
     pub connect_window: Duration,
+    /// How often, while waiting between mints, the loop asks go2rtc
+    /// whether a watched stream's producer is actually up. Cheap - the API
+    /// is loopback - and it is what notices a dead picture before the next
+    /// mint's cadence would.
+    pub liveness_poll: Duration,
 }
 
 impl Default for Pacing {
@@ -59,6 +67,7 @@ impl Default for Pacing {
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_secs(8),
             connect_window: Duration::from_secs(90),
+            liveness_poll: Duration::from_secs(2),
         }
     }
 }
@@ -71,20 +80,6 @@ pub fn stream_name(device_id: &str, quality: Quality) -> String {
 
 /// A playback stream is a camera's name under this prefix: `vod-<device>`.
 pub const VOD_PREFIX: &str = "vod-";
-
-/// How often a connecting producer is polled during its grace.
-const CONNECT_POLL: Duration = Duration::from_millis(400);
-
-/// What one mint attempt found.
-enum MintAttempt {
-    /// The producer connected: the stream is live.
-    Connected,
-    /// go2rtc holds the entry, but its source has not connected. The
-    /// camera may be slow (a push can lag minutes) or the URL may already
-    /// be spent - it is one-shot - and either way this attempt's URL is
-    /// done.
-    Unconnected,
-}
 
 /// The go2rtc stream name for a camera's playback session.
 pub fn vod_name(device_id: &str) -> String {
@@ -142,11 +137,6 @@ pub struct Supervisor {
     /// When discovery last ran, so a refused session is re-tried on a
     /// cadence rather than on every gated request.
     last_discovery: Arc<Mutex<Option<Instant>>>,
-    /// The streams narar holds its own consumer on, one per tracked loop:
-    /// go2rtc stops a producer the moment nothing consumes it, so the hold
-    /// is what keeps one up between mints - and it must not read as a
-    /// viewer when the idle rule counts consumers.
-    holds: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Supervisor {
@@ -160,7 +150,6 @@ impl Supervisor {
             devices: Arc::new(RwLock::new(Vec::new())),
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
-            holds: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -290,7 +279,9 @@ impl Supervisor {
     ///
     /// `retry` is the person's intent - a Try again - and only it skips the
     /// loop's backoff; a page that keeps asking must not hammer a camera
-    /// that is down.
+    /// that is down. A stale-live stream needs no retry from the person:
+    /// the loop's own liveness watch re-mints the moment a watched
+    /// producer is found down, and Try again is for the degraded case.
     pub async fn ensure(
         &self,
         device_id: &str,
@@ -514,13 +505,10 @@ impl Supervisor {
         let idle = self.pacing.stream_idle;
         let mut next_mint = Instant::now();
         let mut failed = false;
-        // When the current run of unconnected producers began, and whether
-        // the window's degradation has been told: one reason, not one per
-        // re-mint.
-        let mut unconnected_since: Option<Instant> = None;
+        // When the current run of watched-but-unconnected producers began,
+        // and whether the window's degradation has been told.
+        let mut stalled_since: Option<Instant> = None;
         let mut degraded_reported = false;
-        // The standing consumer keeping the producer up between mints.
-        let mut hold: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
@@ -532,13 +520,16 @@ impl Supervisor {
             };
             // Waited until the mint is due, or until the idle window is
             // reached - whichever comes first, so a viewer who leaves is
-            // noticed without waiting out a re-mint.
+            // noticed without waiting out a re-mint. Sliced, so the
+            // producer's health is checked while waiting too, not only
+            // when the next mint comes due.
             let sleep_for = match idle_since {
                 Some(idle_for) => next_mint
                     .saturating_duration_since(now)
                     .min(idle.saturating_sub(idle_for)),
                 None => next_mint.saturating_duration_since(now).min(idle),
-            };
+            }
+            .min(self.pacing.liveness_poll);
             let forced = tokio::select! {
                 () = tokio::time::sleep(sleep_for) => false,
                 () = wake.notified() => {
@@ -559,7 +550,6 @@ impl Supervisor {
                 && idle_for >= idle
                 && self.teardown_if_idle(&name, seen_at).await
             {
-                self.release_hold(&name, &mut hold);
                 return;
             }
             // A wake that is not due to mint is only a re-check: the mint
@@ -572,65 +562,47 @@ impl Supervisor {
             let retry_due = forced && failed;
             if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
-                continue;
-            }
-            next_mint = match self.mint_and_swap(&device, &mut hold).await {
-                Ok(MintAttempt::Connected) => {
-                    failed = false;
-                    unconnected_since = None;
-                    degraded_reported = false;
-                    // A recovered stream starts its backoff over: the next
-                    // failure waits retry_base, not the grown tail of the
-                    // storm before it.
-                    wait = Duration::ZERO;
-                    self.mark_live(&name).await;
-                    self.reconcile_low(&name).await;
-                    Instant::now() + self.pacing.remint
-                }
-                Ok(MintAttempt::Unconnected) => {
-                    // A fresh URL is minted on the retry cadence, not the
-                    // remint's: the URL is one-shot, and waiting minutes
-                    // for the next mint would leave a viewer on a dead
-                    // stream that reads live.
+                if self
+                    .stall_response(&name, &mut stalled_since, &mut degraded_reported)
+                    .await
+                {
                     failed = true;
-                    let since = *unconnected_since.get_or_insert_with(Instant::now);
-                    let waiting = since.elapsed();
-                    if waiting >= self.pacing.connect_window {
-                        // The window has passed: the reason is the state
-                        // now, re-asserted every attempt so no later wake
-                        // quietly returns it to waking - the UI offers Try
-                        // again only for a degraded stream.
-                        if !degraded_reported {
-                            tracing::warn!(
-                                stream = %name,
-                                ?waiting,
-                                "the producer has not connected; giving the reason"
-                            );
-                            degraded_reported = true;
-                        }
-                        self.mark_degraded(&name, "the producer has not connected".to_owned())
-                            .await;
-                    } else {
-                        tracing::warn!(
-                            stream = %name,
-                            ?waiting,
-                            "the producer has not connected; re-minting"
-                        );
-                        self.mark_waking(&name).await;
-                    }
-                    // The first attempt waits no time at all, so the floor
-                    // matters: doubling zero is still zero.
+                    // Paced, not immediate: a starved stream replaces its
+                    // dead URL on the backoff, so a camera that is away for
+                    // minutes is not hit with a mint a second.
                     wait = (wait * 2)
                         .max(self.pacing.retry_base)
                         .min(self.pacing.retry_max);
-                    Instant::now() + wait
+                    next_mint = Instant::now() + wait;
+                }
+                continue;
+            }
+            next_mint = match self.mint_and_swap(&device).await {
+                Ok(()) => {
+                    failed = false;
+                    // A recovered stream starts its backoff over: the next
+                    // failure waits retry_base, not the grown tail of the
+                    // storm before it. A stall already established keeps
+                    // its clock and its state - the window measures how
+                    // long viewers have been starved, not how old one URL
+                    // is - and the liveness watch is what ends it.
+                    wait = Duration::ZERO;
+                    self.reconcile_low(&name).await;
+                    if stalled_since.is_none() {
+                        degraded_reported = false;
+                        self.mark_live(&name).await;
+                    }
+                    Instant::now() + self.pacing.remint
                 }
                 Err(reason) => {
                     tracing::warn!(stream = %name, %reason, "stream re-mint failed");
                     self.mark_degraded(&name, reason).await;
                     failed = true;
-                    unconnected_since = None;
-                    degraded_reported = false;
+                    // The starvation clock is not restarted: a refused mint
+                    // is another way the picture is dead, not a fresh
+                    // window, and the reason must not flicker away from the
+                    // person's Try again on a blip. Only the mint-failure
+                    // backoff restarts.
                     wait = (wait * 2)
                         .max(self.pacing.retry_base)
                         .min(self.pacing.retry_max);
@@ -644,11 +616,7 @@ impl Supervisor {
     /// stream's own name, so a viewer's stream URL survives re-mints. A mint
     /// the gateway turns away spends the stored refresh token once and runs
     /// again before the refusal is believed.
-    async fn mint_and_swap(
-        &self,
-        device: &Device,
-        hold: &mut Option<tokio::task::JoinHandle<()>>,
-    ) -> Result<MintAttempt, String> {
+    async fn mint_and_swap(&self, device: &Device) -> Result<(), String> {
         let name = stream_name(&device.device_id, Quality::High);
         let mint = match self
             .with_fresh_session(|session| async move {
@@ -667,47 +635,79 @@ impl Supervisor {
             .put_stream(&name, &live_source(&mint.url))
             .await
             .map_err(|err| redact(&err.to_string()))?;
-        // The standing consumer, taken once and kept until the loop ends:
-        // go2rtc stops a producer the moment its last consumer leaves, so
-        // starting one is not enough - without the hold the producer dies
-        // seconds after the check, the state still says live, and a viewer
-        // attaching later re-dials a spent one-shot URL.
-        if hold.is_none() {
-            let response = self
-                .go2rtc
-                .hold(&name)
-                .await
-                .map_err(|err| redact(&err.to_string()))?;
-            self.holds
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(name.clone());
-            *hold = Some(tokio::spawn(async move {
-                let mut response = response;
-                // Drain and discard: the read itself is the consumer.
-                while matches!(response.chunk().await, Ok(Some(_))) {}
-            }));
+        // No liveness check here: go2rtc keeps no producer while nothing
+        // consumes the stream, and the minted URL stays unspent until a
+        // viewer is the one to dial it. Whether the picture is actually up
+        // is the loop's liveness watch to judge, from the consumers' side.
+        let held = self
+            .go2rtc
+            .streams()
+            .await
+            .map_err(|err| redact(&err.to_string()))?
+            .iter()
+            .any(|stream| stream.name == name && stream.live);
+        if !held {
+            return Err("go2rtc did not take the stream".to_owned());
         }
-        // Live means the producer is actually connected, not that go2rtc
-        // holds an entry: an entry whose ffmpeg the camera is refusing
-        // reads identically otherwise, and believing the entry is what
-        // leaves a dead stream marked live.
-        let deadline = Instant::now() + self.pacing.connect_grace;
-        loop {
-            let streams = self
-                .go2rtc
-                .streams()
-                .await
-                .map_err(|err| redact(&err.to_string()))?;
-            match streams.iter().find(|stream| stream.name == name) {
-                None => return Err("go2rtc did not take the stream".to_owned()),
-                Some(stream) if stream.connected => return Ok(MintAttempt::Connected),
-                Some(_) if Instant::now() >= deadline => {
-                    return Ok(MintAttempt::Unconnected);
-                }
-                Some(_) => tokio::time::sleep(CONNECT_POLL).await,
+        Ok(())
+    }
+
+    /// When the stream's producer is not up while viewers are attached -
+    /// the moment that state began, as `now`. `None` when there is nothing
+    /// to judge: no consumers (the URL is still unspent, a fresh one is
+    /// what any viewer dials), or go2rtc unreadable (the next check will
+    /// say).
+    async fn watched_but_unconnected(&self, name: &str) -> Option<Instant> {
+        let streams = self.go2rtc.streams().await.ok()?;
+        let stream = streams.iter().find(|stream| stream.name == name)?;
+        (stream.consumers > 0 && !stream.connected).then(Instant::now)
+    }
+
+    /// The liveness watch, once per loop slice: a viewer on a picture whose
+    /// producer is not up can never recover on the current mint - the URL
+    /// is one-shot - so `true` asks the loop for a fresh one, on the retry
+    /// cadence and well before the next remint's. The window's degradation
+    /// is re-asserted every slice past it, so no later mint quietly
+    /// returns a starved stream to waking - the UI offers Try again only
+    /// for degraded.
+    async fn stall_response(
+        &self,
+        name: &str,
+        stalled_since: &mut Option<Instant>,
+        degraded_reported: &mut bool,
+    ) -> bool {
+        let Some(stalled) = self.watched_but_unconnected(name).await else {
+            if stalled_since.take().is_some() {
+                // The picture is back: the stall is over.
+                *degraded_reported = false;
+                self.mark_live(name).await;
             }
+            return false;
+        };
+        let waiting = stalled_since.get_or_insert(stalled).elapsed();
+        if waiting < self.pacing.connect_grace {
+            return false;
         }
+        if waiting >= self.pacing.connect_window {
+            if !*degraded_reported {
+                tracing::warn!(
+                    stream = %name,
+                    ?waiting,
+                    "the producer has not connected; giving the reason"
+                );
+                *degraded_reported = true;
+            }
+            self.mark_degraded(name, "the producer has not connected".to_owned())
+                .await;
+        } else {
+            tracing::warn!(
+                stream = %name,
+                ?waiting,
+                "the producer has not connected; re-minting"
+            );
+            self.mark_waking(name).await;
+        }
+        true
     }
 
     /// Drop the stream only if the entry this loop decided about is still
@@ -827,33 +827,12 @@ impl Supervisor {
     /// the stream: a late teardown beats a wrong one.
     async fn watched(&self, name: &str) -> bool {
         let low = low_name_of(name);
-        // narar's own standing consumer is not a viewer: without the
-        // subtraction, the hold that keeps the producer up would also keep
-        // every stream from ever reading as idle.
-        let ours = usize::from(
-            self.holds
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(name),
-        );
         self.go2rtc.streams().await.map_or(true, |streams| {
             streams.iter().any(|stream| {
-                let held = if stream.name == name { ours } else { 0 };
-                stream.consumers > held
+                stream.consumers > 0
                     && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
             })
         })
-    }
-
-    /// Drop the stream's standing consumer, if one is up.
-    fn release_hold(&self, name: &str, hold: &mut Option<tokio::task::JoinHandle<()>>) {
-        if let Some(task) = hold.take() {
-            task.abort();
-        }
-        self.holds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(name);
     }
 
     /// How long since the stream was last asked for, if it is still known.

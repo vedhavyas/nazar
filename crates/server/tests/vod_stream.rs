@@ -80,6 +80,7 @@ async fn harness(stream_idle: Duration) -> Harness {
             stream_idle,
             connect_grace: Duration::from_millis(50),
             connect_window: Duration::from_millis(300),
+            liveness_poll: Duration::from_millis(50),
         },
     );
     let snapshots = Snapshots::new(

@@ -46,6 +46,7 @@ fn pacing(remint: Duration) -> Pacing {
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),
         connect_window: Duration::from_millis(300),
+        liveness_poll: Duration::from_millis(50),
     }
 }
 
@@ -316,6 +317,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),
         connect_window: Duration::from_millis(300),
+        liveness_poll: Duration::from_millis(50),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -631,10 +633,9 @@ async fn mount_mint_ladder(server: &MockServer, tokens: &[&str]) {
     }
 }
 
-/// A go2rtc entry is not liveness: a producer whose source never connects
-/// is re-minted with a fresh URL, fast. The URL is one-shot, and waiting
-/// for the four-minute remint would leave a viewer staring at a dead
-/// stream the API calls live.
+/// A watched producer whose source never connects is re-minted with a
+/// fresh URL, fast: the URL is one-shot, and waiting for the four-minute
+/// remint would leave a viewer staring at a dead stream.
 #[tokio::test]
 async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
     // A window far past the assertions: this test pins the re-minting, not
@@ -648,13 +649,16 @@ async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one", "two", "three"]).await;
     mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
-    h.go2rtc
-        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
+    // A viewer on the picture: that is what makes the stall the loop's
+    // business.
+    h.go2rtc.set_viewers(&name, 1);
 
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
     assert!(reminted, "the loop keeps minting: {:?}", h.go2rtc.puts());
@@ -665,16 +669,20 @@ async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
     assert_eq!(
         h.supervisor.status(DEVICE_ID).await,
         StreamState::Waking,
-        "an unconnected producer is not live"
+        "a starved viewer reads waking, not live"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// The state stays waking while the producer is away, and flips live when
-/// it connects.
+/// The state stays waking while a watched producer is away, and flips live
+/// when a fresh mint's source connects.
 #[tokio::test]
 async fn the_state_stays_waking_until_the_producer_connects() {
-    let h = harness(pacing(Duration::from_secs(30))).await;
+    let h = harness(Pacing {
+        connect_window: Duration::from_secs(5),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
     mount_discovery(&h.qubo).await;
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one", "two"]).await;
@@ -686,27 +694,34 @@ async fn the_state_stays_waking_until_the_producer_connects() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
 
+    let waking = common::eventually(|| async {
+        h.supervisor.status(DEVICE_ID).await == StreamState::Waking
+    })
+    .await;
+    assert!(waking, "a starved viewer reads waking");
+
+    // The watch mints fresh while the producer is away: the URL it holds
+    // is spent, so waiting out the next cadence would starve the viewer.
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
-    assert!(reminted, "the loop re-mints while unconnected");
-    assert_eq!(
-        h.supervisor.status(DEVICE_ID).await,
-        StreamState::Waking,
-        "not live while the producer is away"
+    assert!(
+        reminted,
+        "a fresh URL went out while the producer was away: {:?}",
+        h.go2rtc.puts()
     );
 
     h.go2rtc.connect_producer(&name);
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
-    assert!(live, "a connected producer flips the state live");
+    assert!(live, "the picture's return flips the state live");
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A producer that stops answering demotes the stream from live to waking:
-/// the stale-live class this fix exists for.
+/// A watched producer that stops answering demotes the stream from live to
+/// waking: the stale-live class this fix exists for.
 #[tokio::test]
 async fn a_stalled_producer_leaves_live_and_reads_waking() {
-    // A remint soon after the stall, and a window far enough away that the
-    // wake is what the assertions see.
+    // A window far enough away that the wake is what the assertions see.
     let h = harness(Pacing {
         connect_window: Duration::from_secs(5),
         ..pacing(Duration::from_millis(200))
@@ -716,6 +731,7 @@ async fn a_stalled_producer_leaves_live_and_reads_waking() {
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one", "two"]).await;
     mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
@@ -724,8 +740,8 @@ async fn a_stalled_producer_leaves_live_and_reads_waking() {
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the stream is live first");
 
-    h.go2rtc
-        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+    h.go2rtc.set_viewers(&name, 1);
+    h.go2rtc.disconnect_producer(&name);
     let waking = common::eventually(|| async {
         h.supervisor.status(DEVICE_ID).await == StreamState::Waking
     })
@@ -738,8 +754,8 @@ async fn a_stalled_producer_leaves_live_and_reads_waking() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A producer that takes its time is waited for through the grace: the URL
-/// is not re-minted around a source that is merely slow.
+/// A watched producer that takes its time is waited for through the grace:
+/// the URL is not re-minted around a source that is merely slow.
 #[tokio::test]
 async fn a_slow_producer_connects_within_the_grace() {
     let h = harness(Pacing {
@@ -751,33 +767,33 @@ async fn a_slow_producer_connects_within_the_grace() {
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one"]).await;
     mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
-    h.go2rtc.connect_after(
-        &stream_name(DEVICE_ID, Quality::High),
-        Duration::from_millis(100),
-    );
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.connect_after(&name, Duration::from_millis(100));
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
 
-    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
-    assert!(live, "a producer that takes 100ms still lands live");
+    // The producer needs its moment; no re-mint may cut it short.
+    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(
         h.go2rtc.puts().len(),
         1,
-        "and the URL was never re-minted around it: {:?}",
+        "the slow source was never re-minted around: {:?}",
         h.go2rtc.puts()
     );
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "and it does land live");
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A viewer who attaches long after the open still finds the producer up:
-/// the standing consumer keeps it there, where a touch's short consumer
-/// would let go2rtc stop it - and the spent one-shot URL cannot be
-/// re-dialled.
+/// A viewer attaching after the URL's one dial - a reopen, a second device
+/// - finds nothing on it, and the liveness watch mints fresh: the C1 repro
+/// end to end, and the heal a person never has to ask for.
 #[tokio::test]
-async fn a_late_viewer_finds_the_producer_still_up() {
+async fn a_late_viewer_heals_through_a_fresh_mint() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     mount_discovery(&h.qubo).await;
     h.supervisor.refresh_devices().await.expect("discovery");
@@ -789,35 +805,26 @@ async fn a_late_viewer_finds_the_producer_still_up() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
-    assert!(live, "the stream is live");
 
-    // A quiet window, then a viewer: the producer must still be connected,
-    // and no second mint may have gone out.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The first viewer attaches and leaves: the URL is spent.
     h.go2rtc.set_viewers(&name, 1);
-    let page: serde_json::Value =
-        reqwest::get(h.go2rtc.base.join("api/streams").expect("the fake's url"))
-            .await
-            .expect("the fake answers")
-            .json()
-            .await
-            .expect("json");
-    assert!(
-        page[&name]["producers"][0]["remote_addr"].is_string(),
-        "the producer is still connected after the quiet window: {page}"
-    );
-    assert_eq!(
-        h.go2rtc.puts().len(),
-        1,
-        "and the late viewer never re-dialled the spent URL: {:?}",
-        h.go2rtc.puts()
-    );
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "the first viewer's picture is up");
+    h.go2rtc.set_viewers(&name, 0);
+
+    // The late viewer: the spent URL cannot connect, so the watch mints
+    // fresh, and the picture comes up on the second URL.
+    h.go2rtc.set_viewers(&name, 1);
+    let mints = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(mints, "a fresh mint went out: {:?}", h.go2rtc.puts());
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "and the late viewer's picture is up");
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A producer that never connects degrades with the reason once the
-/// window passes - and the loop keeps trying rather than giving up.
+/// A watcher starved past the window reads degraded with the reason - and
+/// the state stays degraded across the loop's later re-mints, so the UI's
+/// Try again survives them.
 #[tokio::test]
 async fn a_producer_that_never_connects_degrades_after_the_window() {
     let h = harness(pacing(Duration::from_secs(30))).await;
@@ -825,15 +832,25 @@ async fn a_producer_that_never_connects_degrades_after_the_window() {
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one", "two"]).await;
     mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
-    h.go2rtc
-        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
 
     let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "the producer has not connected"
+        )
+    })
+    .await;
+    assert!(degraded, "the window passes and the reason surfaces");
+
+    let persisted = common::eventually(|| async {
         h.go2rtc.puts().len() >= 3
             && matches!(
                 h.supervisor.status(DEVICE_ID).await,
@@ -842,9 +859,51 @@ async fn a_producer_that_never_connects_degrades_after_the_window() {
     })
     .await;
     assert!(
-        degraded,
-        "the window passes, the reason surfaces, and the loop keeps minting: {:?}",
+        persisted,
+        "and a later re-mint does not launder it: {:?}",
         h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A mint that fails mid-starvation is another way the picture is dead,
+/// not a new window: the starvation clock keeps running, so the reason
+/// lands on its own deadline and the Try again affordance does not
+/// flicker away on a blip.
+#[tokio::test]
+async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
+    let h = harness(Pacing {
+        connect_window: Duration::from_millis(350),
+        retry_base: Duration::from_millis(250),
+        retry_max: Duration::from_millis(250),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    // The first mint lands; every re-mint from then on is refused.
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "the producer has not connected"
+        )
+    })
+    .await;
+    assert!(
+        degraded,
+        "the window lands on its own deadline despite the refused mints: {:?}",
+        h.supervisor.status(DEVICE_ID).await
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
