@@ -53,6 +53,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  delete (window as { __TAURI__?: unknown }).__TAURI__;
 });
 
 test('the bell counts what arrived past the last look', async () => {
@@ -158,6 +159,23 @@ test('the shell is asked first, and falls back when the command is absent', asyn
   // Nowhere permitted: nothing, said plainly.
   FakeNotification.permission = 'default';
   expect(await notify('Motion at Hall', ''), 'no shell, no permission: nothing').toBe('none');
+});
+
+test('every shape a shell may expose is a shell', async () => {
+  // The other two globals a Tauri shell may carry, each on its own: the v2
+  // global-injection shape, and v1's flat one. Trimming the probe chain to
+  // any single shape must not leave the suite green.
+  const shapes = [
+    { shape: '__TAURI__.core.invoke', shell: { __TAURI__: { core: { invoke: vi.fn(async () => null) } } } },
+    { shape: '__TAURI__.invoke', shell: { __TAURI__: { invoke: vi.fn(async () => null) } } },
+  ];
+  for (const { shape, shell } of shapes) {
+    Object.assign(window, shell);
+    FakeNotification.made = [];
+    expect(await notify('Motion at Hall', ''), `the ${shape} shape is a shell`).toBe('shell');
+    expect(FakeNotification.made.length, 'and the browser stays out of its way').toBe(0);
+    delete (window as { __TAURI__?: unknown }).__TAURI__;
+  }
 });
 
 test('an arrival is told through the bridge where it is permitted', async () => {
