@@ -20,8 +20,13 @@
     /** Told when the picture was not there: 'start' for a socket that never
      * negotiated (and no HLS to fall back to), 'frozen' for one that
      * stopped, 'hls' for a fallback that took over, 'recovered' for a
-     * picture that was started again on coming back to the tab. */
-    onsettled?: (state: 'start' | 'frozen' | 'hls' | 'recovered') => void;
+     * picture that was started again on coming back to the tab. The
+     * playhead rides along where one exists, in seconds: a re-ask belongs
+     * where the person actually was, not where the stream began. */
+    onsettled?: (
+      state: 'start' | 'frozen' | 'hls' | 'recovered',
+      playhead?: number,
+    ) => void;
   } = $props();
 
   /** How long a first frame may take before WebRTC is given up on. */
@@ -121,9 +126,9 @@
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
     // dead stream leaves the last one. No first frame inside the window,
     // then no advancing clock, are the two signals a person can act on.
-    const stall = (state: 'start' | 'frozen') => {
+    const stall = (state: 'start' | 'frozen', playhead?: number) => {
       void engageFallback().then((taken) => {
-        onsettled?.(taken ? 'hls' : state);
+        onsettled?.(taken ? 'hls' : state, playhead);
       });
     };
     let timer: ReturnType<typeof setTimeout> | null = setTimeout(
@@ -133,16 +138,24 @@
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
     let playing = false;
+    /** The person paused it; a standing clock is their doing. */
+    let paused = false;
     /** Where the clock stood when the tab was hidden, if it had started. */
     let awayAt = -1;
 
     const tick = () => {
       const video = player.querySelector('video');
       if (!video) return;
+      if (paused) {
+        // A paused player is not a frozen one: the clock stands still
+        // because the person asked it to.
+        lastTime = video.currentTime;
+        return;
+      }
       if (video.currentTime <= lastTime) {
         if (watching) clearInterval(watching);
         watching = null;
-        stall('frozen');
+        stall('frozen', video.currentTime);
         return;
       }
       lastTime = video.currentTime;
@@ -153,9 +166,13 @@
     };
     const onplaying = () => {
       playing = true;
+      paused = false;
       if (timer) clearTimeout(timer);
       timer = null;
       watch();
+    };
+    const onpause = () => {
+      paused = true;
     };
 
     // A background tab is not a stalled picture: Chromium throttles it and
@@ -176,7 +193,7 @@
       if (!playing || (awayAt >= 0 && here <= awayAt)) {
         fallback = false;
         rebuilt += 1;
-        onsettled?.('recovered');
+        onsettled?.('recovered', here >= 0 ? here : undefined);
         return;
       }
       // Still the same picture: watch it again from where it stands.
@@ -187,12 +204,14 @@
 
     const video = player.querySelector('video');
     video?.addEventListener('playing', onplaying);
+    video?.addEventListener('pause', onpause);
     document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
       if (timer) clearTimeout(timer);
       if (watching) clearInterval(watching);
       video?.removeEventListener('playing', onplaying);
+      video?.removeEventListener('pause', onpause);
       document.removeEventListener('visibilitychange', onVisibility);
       player.remove();
     };
