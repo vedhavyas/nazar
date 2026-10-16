@@ -401,6 +401,7 @@ async fn camera_ptz(
         Some(lane) => {
             let envelope = p2p_control_envelope(
                 &id,
+                device.controller_id.as_deref(),
                 "panTiltControl",
                 "horizontalVerticalPostion",
                 &target_text,
@@ -495,26 +496,41 @@ async fn camera_privacy(
 /// The reason every unconfirmed write comes back with.
 const NOT_APPLIED: &str = "not applied";
 
-/// The command envelope for the P2P data channel (`docs/qubo-protocol.md`
-/// 6.7): the same service write the MQTT path publishes, wrapped in the
-/// captured `command` shape with the top-level device id and timestamp.
-fn p2p_control_envelope(device_id: &str, service: &str, attribute: &str, value: &str) -> Value {
+/// The data-channel control envelope, in captured frame 1886's own
+/// skeleton (`docs/qubo-protocol.md` 6.7): the `command` wrapper, the
+/// device block with its `handleName` (the camera's controllerUUID, when
+/// the listing carries one), and the top-level device id + timestamp. The
+/// inner form is the service write our M2 path proved live - the app's own
+/// absolute-move builder (`LiveCameraViewFragment.C.a`) emits exactly
+/// `services.panTiltControl.{instanceId, attributes}`; the capture's
+/// `commands.startPan` is its directional-button twin.
+fn p2p_control_envelope(
+    device_id: &str,
+    handle_name: Option<&str>,
+    service: &str,
+    attribute: &str,
+    value: &str,
+) -> Value {
     let mut attributes = serde_json::Map::new();
     attributes.insert(attribute.to_owned(), json!(value));
     let mut services = serde_json::Map::new();
     services.insert(
         service.to_owned(),
-        json!({ "attributes": attributes, "instanceId": 0 }),
+        json!({ "instanceId": 0, "attributes": attributes }),
     );
+    let mut devices = serde_json::Map::new();
+    devices.insert("deviceUUID".to_owned(), json!(device_id));
+    if let Some(handle_name) = handle_name {
+        devices.insert("handleName".to_owned(), json!(handle_name));
+    }
+    devices.insert("services".to_owned(), Value::Object(services));
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
         .unwrap_or_default();
     json!({
-        "command": {
-            "devices": { "deviceUUID": device_id, "services": services }
-        },
+        "command": { "devices": devices },
         "deviceUUID": device_id,
         "timestamp": timestamp,
     })
