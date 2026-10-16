@@ -878,8 +878,15 @@ fn to_browser(message: tokio_tungstenite::tungstenite::Message) -> Message {
 }
 
 /// The SPA: real assets, then `index.html` for client routes.
+///
+/// A path under `/api` is never a client route: an unknown one answers the
+/// API's own 404 envelope, so a client asking for data never reads a 200
+/// page instead (an id-less `/api/snaps/`, say).
 async fn spa(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    if path == "api" || path.starts_with("api/") {
+        return ApiError::new(StatusCode::NOT_FOUND, "not found").into_response();
+    }
     let path = if path.is_empty() { "index.html" } else { path };
     if let Some(asset) = asset(path, &headers) {
         return asset;
