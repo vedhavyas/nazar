@@ -170,9 +170,7 @@ impl P2pEngine {
             "/monitor/{}/{}/p2pStreaming",
             device.unit_id, device.device_id
         );
-        let mut broker = self
-            .connect_broker(session, &device.unit_id, &monitor_topic)
-            .await?;
+        let mut broker = self.connect_broker(session, &device.unit_id, &monitor_topic);
 
         // From here on the camera may learn of this session, so every exit -
         // an error return, or the caller's bound dropping this future
@@ -355,19 +353,27 @@ impl P2pEngine {
 
     /// The engine's own broker connection (the app's SimpleMQTTClient role):
     /// the start call and the camera's answer ride one session-scoped
-    /// connection this engine owns and tears down.
-    async fn connect_broker(
-        &self,
-        session: &Session,
-        unit: &str,
-        monitor_topic: &str,
-    ) -> Result<Broker, P2pError> {
+    /// connection this engine owns and tears down. The subscription is
+    /// re-issued on every connect - a clean session's blip inside the
+    /// answer window must not lose the answer, which is exactly what the
+    /// reference's paho on_connect does.
+    fn connect_broker(&self, session: &Session, unit: &str, monitor_topic: &str) -> Broker {
         let options = broker_options(session, unit, &self.config.device_name);
         let (client, mut eventloop) = rumqttc::AsyncClient::new(options, BROKER_CAPACITY);
         let (answers_tx, answers) = mpsc::channel::<(String, String)>(8);
+        let subscribe_client = client.clone();
+        let monitor_topic = monitor_topic.to_owned();
         let pump = tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Incoming::ConnAck(_))) => {
+                        if let Err(err) = subscribe_client
+                            .subscribe(monitor_topic.clone(), QoS::ExactlyOnce)
+                            .await
+                        {
+                            tracing::debug!(%err, "the p2p broker re-subscribe failed");
+                        }
+                    }
                     Ok(rumqttc::Event::Incoming(rumqttc::Incoming::Publish(message))) => {
                         let topic = message.topic.clone();
                         let payload = String::from_utf8_lossy(&message.payload).into_owned();
@@ -383,15 +389,11 @@ impl P2pEngine {
                 }
             }
         });
-        client
-            .subscribe(monitor_topic, QoS::ExactlyOnce)
-            .await
-            .map_err(|err| P2pError::Broker(err.to_string()))?;
-        Ok(Broker {
+        Broker {
             client,
             pump,
             answers,
-        })
+        }
     }
 
     /// Wait for the camera's answer to our session, bounded; `None` on the
