@@ -34,6 +34,14 @@ export interface MotionHero {
   hero: string | null;
 }
 
+/** One recorded segment of a day: when a motion episode began, and the
+ * still kept for it when one was. */
+export interface Clip {
+  id: string;
+  start_ms: number;
+  snapshot_url: string | null;
+}
+
 /** A told entry's shape on the wire; the air reading rides only on an aqi
  * entry. */
 interface Told {
@@ -106,6 +114,17 @@ export const api = {
       { method: 'POST' },
     ),
   hero: () => call<MotionHero>('/api/motion/hero'),
+  recordedDays: (id: string, from: number, to: number) =>
+    call<{ days: string[] }>(`/api/cameras/${id}/recordings/days?from=${from}&to=${to}`),
+  recordings: (id: string, day: string) =>
+    call<{ clips: Clip[] }>(`/api/cameras/${id}/recordings?day=${encodeURIComponent(day)}`),
+  playback: (id: string, timestamp: number) =>
+    call<{ stream: string; expires_in: number }>(`/api/cameras/${id}/playback`, {
+      method: 'POST',
+      body: JSON.stringify({ timestamp }),
+    }),
+  playbackStop: (id: string) =>
+    call<void>(`/api/cameras/${id}/playback`, { method: 'DELETE' }),
   notifications: () => call<{ notifications: Notification[] }>('/api/notifications'),
   ptz: (id: string, dx: number, dy: number) =>
     call<PtzResult>(`/api/cameras/${id}/ptz`, { method: 'POST', body: JSON.stringify({ dx, dy }) }),
