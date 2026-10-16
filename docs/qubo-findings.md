@@ -771,3 +771,13 @@ ours never drew a reply. In order:
 - Everything the client does is reversible/local except the MQTT publish and the two REST
   calls - all of which the app itself does on every call. Every run ends with an
   endP2pCall teardown.
+
+## 2026-10-16 run: the hub's genuine login (M6 Task 2 pre-check)
+
+Ran the reference flow against the hub's own OTP login (fresh that morning, from the server's session file) - the first arm attempt from a session minted by OUR server rather than the CLI's own login.
+
+- Allocation v3: HTTP 200 (relay 13.203.165.201:40552), device-access-token 200, STUN via Qubo's coturn, candidates as the capture shapes them.
+- The camera answered: `p2pCallStarted` in about a second; its direct probe reached the caller and was acked (`0101`) - the camera's own UDP path works live on this LAN.
+- The relay never engaged in 10.0s despite a byte-faithful register; endP2pCall torn down cleanly.
+
+Read: the relay gate is still shut for our session class, even freshly minted by the server. The camera-side half demonstrably works up to the relay wait. The kill-switch decision (M6 Task 2 Step 3) runs with the ported Rust engine and the server's own arm path before any conclusion - this run is a strong early signal, not the verdict.
