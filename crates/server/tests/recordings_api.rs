@@ -232,19 +232,21 @@ async fn a_day_that_is_not_a_day_is_refused() {
     let h = harness(episodes_with(&json!([]))).await;
     mount_discovery(&h.qubo).await;
 
-    let bad = client()
-        .get(format!(
-            "{}/api/cameras/{CAMERA}/recordings?day=2026-10-16",
-            h.base
-        ))
-        .send()
-        .await
-        .expect("the answer");
-    assert_eq!(
-        bad.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "a day the calendar never sent is a 400, not an empty list"
-    );
+    for wrong in ["2026-10-16", "31-02-2026"] {
+        let bad = client()
+            .get(format!(
+                "{}/api/cameras/{CAMERA}/recordings?day={wrong}",
+                h.base
+            ))
+            .send()
+            .await
+            .expect("the answer");
+        assert_eq!(
+            bad.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{wrong} is a 400, not an empty list or another day's window"
+        );
+    }
 
     let missing = client()
         .get(format!("{}/api/cameras/{CAMERA}/recordings", h.base))
