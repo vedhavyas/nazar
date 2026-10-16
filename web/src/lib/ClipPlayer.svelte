@@ -15,11 +15,14 @@
   }
 
   /** A wall-clock hour and minute in IST, whatever the browser's own zone
-   * is: the day picker's days are IST days, so the times must be too. */
+   * is: the day picker's days are IST days, so the times must be too. The
+   * minute comes off the whole-minute count - rounding the seconds would
+   * carry :59.6 into ":60". */
   export function clockOf(at: number): string {
     const inDay = (((at + (5 * 60 + 30) * 60_000) % DAY_MS) + DAY_MS) % DAY_MS;
-    const h = Math.floor(inDay / 3_600_000);
-    const m = Math.round(((inDay % 3_600_000) / 60_000) % 60);
+    const minutes = Math.floor(inDay / 60_000);
+    const h = Math.floor(minutes / 60) % 24;
+    const m = minutes % 60;
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
   }
 </script>

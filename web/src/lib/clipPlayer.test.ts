@@ -7,7 +7,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeAll, expect, test, vi } from 'vitest';
 
-import ClipPlayer, { timestampAt } from './ClipPlayer.svelte';
+import ClipPlayer, { clockOf, timestampAt } from './ClipPlayer.svelte';
 import Recordings from '../routes/Recordings.svelte';
 
 class StubPlayer extends HTMLElement {
@@ -100,6 +100,13 @@ test('a scrub re-mints at the position it lands on', async () => {
   });
 
   expect(timestampAt(DAY_START, 0.5), 'halfway through the day').toBe(DAY_START + 12 * HOUR);
+  expect(
+    clockOf(DAY_START + 59 * 60_000 + 59_600),
+    'a minute short of the hour never reads as :60',
+  ).toBe('00:59');
+  expect(clockOf(DAY_START + 23 * HOUR + 59 * 60_000), 'and the last minute is still its own').toBe(
+    '23:59',
+  );
 
   const scrub = screen.getByTestId('scrub') as HTMLInputElement;
   await fireEvent.change(scrub, { target: { value: '500' } });
