@@ -30,6 +30,9 @@
 
   let stage = $state<HTMLDivElement | null>(null);
   let attempt = $state(0);
+  /** The server is still waking this stream: the player's start window is
+   * held until its own word says otherwise. */
+  let waiting = $state(false);
 
   const audioKey = () => `nazar.audio.${id}`;
 
@@ -68,8 +71,27 @@
   /** Ask the server for this camera's stream of the chosen quality. */
   async function start() {
     const started = await api.watch(id, quality);
+    // A freshly minted stream can wake for up to the server's own window;
+    // the screen otherwise reads the state once, so it keeps reading
+    // while the waking lasts - the player's window must not run against
+    // a stream the server is still bringing up.
+    waiting = true;
     stream = started.stream;
     attempt += 1;
+    void waitOutWaking();
+  }
+
+  async function waitOutWaking() {
+    while (waiting) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      if (!waiting) return;
+      try {
+        const page = await api.cameras();
+        waiting = page.cameras.find((entry) => entry.id === id)?.state === 'waking';
+      } catch {
+        waiting = false;
+      }
+    }
   }
 
   /** The tab came back and the picture did not follow: a long absence can
@@ -220,8 +242,10 @@
         <Player
           {stream}
           {attempt}
+          {waiting}
           muted={!listening}
           onsettled={(state) => {
+            waiting = false;
             if (state === 'recovered') void recover();
           }}
         />

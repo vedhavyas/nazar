@@ -58,6 +58,47 @@ function open() {
   return { onlocked };
 }
 
+test('the screen holds the player window while the server is waking', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  let state = 'waking';
+  const mock = vi.fn(async (url: string) => {
+    if (url === '/api/cameras') {
+      return json({
+        cameras: [{ id: 'cam-1', name: 'Hall', state, reason: null }],
+        needsLogin: false,
+      });
+    }
+    if (url.startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    return json({ privacy: false });
+  });
+  vi.stubGlobal('fetch', mock);
+  const onlocked = vi.fn();
+  render(Camera, { id: 'cam-1', onback: vi.fn(), onlocked });
+
+  await vi.advanceTimersByTimeAsync(100);
+  expect(document.querySelector('video-rtc'), 'the player is mounted').toBeTruthy();
+
+  // The server keeps waking well past the player's window: nothing is
+  // declared, and no fallback is negotiated for a stream with no picture.
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(
+    document.querySelector('script[src="/hls.min.js"]'),
+    'the start window did not run against a waking stream',
+  ).toBeNull();
+
+  // The state arrives live: the window opens and, with no picture, fires.
+  state = 'live';
+  await vi.advanceTimersByTimeAsync(5000);
+  await vi.advanceTimersByTimeAsync(13000);
+  expect(
+    document.querySelector('script[src="/hls.min.js"]'),
+    'and it runs once the waking is over',
+  ).toBeTruthy();
+});
+
 test('the picture arrives muted, and the toggle is what unmutes it', async () => {
   vi.useFakeTimers();
   stubServer();

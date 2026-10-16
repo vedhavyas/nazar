@@ -4,9 +4,11 @@
 // @vitest-environment jsdom
 
 import { cleanup, render, screen } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { afterEach, beforeAll, expect, test, vi } from 'vitest';
 
 import CameraTile from './CameraTile.svelte';
+import TileHost from './TileHost.svelte';
 
 /** The vendored player's contract, in miniature: it grows a video on
  * connect, which is the element the tile watches. */
@@ -239,6 +241,29 @@ test('a waking tile does not run the player start window', async () => {
     screen.queryByText(/did not start/),
     'and nothing was declared a failure for a stream the server is still bringing up',
   ).toBeNull();
+});
+
+test('leaving waking keeps the same player and opens the window', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const onwatch = vi.fn();
+  const { component } = render(TileHost, { onwatch });
+  const player = document.querySelector('video-rtc');
+  expect(player, 'the waking player').toBeTruthy();
+
+  (component as unknown as { settle: () => void }).settle();
+  await tick();
+  expect(
+    document.querySelector('video-rtc'),
+    'the same element persists across waking -> live: the flip must not rebuild it',
+  ).toBe(player);
+
+  await vi.advanceTimersByTimeAsync(12000);
+  await failVendoredPlayer();
+  expect(
+    screen.getByText(/did not start/),
+    'and the window runs from the moment the state is live',
+  ).toBeTruthy();
 });
 
 test('a live tile carries no still', () => {
