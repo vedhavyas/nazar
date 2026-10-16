@@ -465,6 +465,97 @@ async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
 }
 
 #[tokio::test]
+async fn an_unlanded_armed_move_reports_not_applied() {
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    // The shadow never reaches the target: the read-back must say so even
+    // though the write itself rode the engine.
+    mount_control(&h.qubo, vec!["10,10"]).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the fast lane armed");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 10, "dy": 5 }))
+        .send()
+        .await
+        .expect("the call");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["ok"], json!(false), "an unmoved camera is not ok");
+    assert_eq!(
+        body["reason"],
+        json!("not applied"),
+        "the read-back's verdict is the contract's"
+    );
+    assert_eq!(
+        body["position"],
+        json!({ "x": 10, "y": 10 }),
+        "the last position the shadow reported comes back"
+    );
+    assert_eq!(
+        h.lane.session().controls().len(),
+        1,
+        "the write still rode the engine"
+    );
+}
+
+#[tokio::test]
+async fn a_dead_sessions_camera_routes_ptz_back_to_rest() {
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    mount_control(&h.qubo, vec!["10,10", "20,15"]).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the fast lane armed");
+
+    // The session dies while its entry is still in the map (the lookup
+    // filters on alive; nothing has pruned it yet).
+    h.lane.session().shutdown();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 10, "dy": 5 }))
+        .send()
+        .await
+        .expect("the call");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let bodies = command_bodies(&h.qubo).await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "the REST write went out for the camera of a dead session"
+    );
+    assert_eq!(
+        bodies[0]["payload"]["devices"]["services"]["panTiltControl"]["attributes"]["horizontalVerticalPostion"],
+        json!("20,15"),
+        "the REST write carries the target position"
+    );
+    assert_eq!(
+        h.lane.session().controls().len(),
+        0,
+        "no engine control for the dead session"
+    );
+}
+
+#[tokio::test]
 async fn a_second_stream_reuses_the_camera_session() {
     let h = harness(
         FakeLane::new(),
