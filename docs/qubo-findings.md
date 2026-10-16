@@ -787,3 +787,31 @@ Read: the relay gate is still shut for our session class, even freshly minted by
 The ported Rust engine (byte-vector-reviewed) ran against a second fresh hub login, with the SDK's SYN beat held for the whole window (`--hold-beat`). Same shape one layer down: allocation 200 (relay 13.204.183.153:48532), token 200, candidates offered, `startP2pCall` published, the camera answered `p2pCallStarted` in ~3s with its candidates - then `Handshake { timeout: 10s, relay_engaged: false }`. The beat did not move it.
 
 **Conclusion, three independent runs deep:** the relay pairs only sessions its own side recognises as the official SDK's - a server-side arming policy nothing reachable from outside the app reproduces, beating or no beating. The fast lane is closed for this client class; the cloud path stands as the design's primary and fully carries live view.
+
+## 2026-10-16: phone-OTP hour boundary - ENFORCED at the wire
+
+Ved asked for a real measurement of the "one hour" claim (two live sessions, both minted through the phone-OTP verify with the app's own request shape):
+
+- Session A: minted 09:21:00Z, exp 10:21:00Z. Probed 10:30:59Z (+9min past exp) -> **HTTP 401 `ERR_AUTH_002` "User Token expired, Access denied"**.
+- Session B: minted 09:41:50Z, exp 10:41:50Z. Probed 10:30:59Z (inside its hour) -> **HTTP 200 served**.
+- The hub independently confirms: holding session A, its MQTT monitor feed was refused from 10:23:18Z ("User Token expired, Access denied") ~2min past expiry, with no self-recovery.
+
+So for tokens minted by the raw OTP routes (v1 phone/login+verify, v4 v1-verify), iat+3600 is a HARD server-side boundary - the hour is not a client-side convention. Both raw routes also return NO refreshToken field (measured today on the app's exact request shape: response keys are `email, name, token, uuid`).
+
+That does NOT yet explain Ved's long-lived app sessions: the app's native layer holds refresh machinery (`MobileUserManager.getRefreshToken()`, `/auth/refresh`, "refresh token from cloud" strings, and the app stores `KEY_REFRESH_TOKEN`/`ServerInfo.saveUserInformation(uuid, accessToken, refreshToken)` after OTP login). Something in the app path obtains a durable credential the raw REST verify does not - under investigation via the emulator (log in through the real app, watch what tokens get minted/stored).
+
+## 2026-10-16: the app-side answer - OTP DOES mint a durable refreshToken (Ved was right)
+
+Ved's pushback ("OTP is not short-lived... without actually properly testing") was correct. Instrument: the rootable emulator (google_apis userdebug, `adb root` works), the real app (v3.3.42, pulled APKs), frida for the root-check bypass - then the app's private data read directly as root.
+
+**What the app holds after a phone-OTP login** (read from `/data/user/0/com.hero.iot/` minutes after the login, verbatim):
+
+- `databases/hero_iot.db`, `user` table: `accessToken` (JWT, sub `USER`, iat+3600), **`refreshToken` (JWT, sub `USER_REFRESH`, exp-iat = 180 days)**, `mqttPassword` (PBKDF2$sha256$901$...), `accountType` `GM`, `gmLoginId` `<family-email>`, phone, uuid `10000000-...`, `isdCode +91`.
+- `shared_prefs/com.hero.iot_preferences.xml`: `userUUID`, **`refreshToken`**, `subscriberKey` (a 1h sub `USER` JWT), `username` `uuid:expiry`; other keys empty until login commits.
+- `shared_prefs/hero_iot_pref.xml` (encrypted store): `is_login=true`, encrypted `access_token`/`login_type`/`user_id` (the `access_token` here is a different, longer value - EncryptedSharedPreferences ciphertext).
+
+**Where it comes from.** The verify response on the wire is a LIST of account profiles - one per account the phone maps to (Ved's number: `10000000-...`/<family-email> and `10000000-...`/<family-email>), each carrying a 1h `token`, no refreshToken. The app then shows "Choose your profile"; picking one runs a native `MobileUserManager.userPhoneLogin(UserDto)` (native log string "Post user Phone Login url : %s"; decompile: the fragment's profile-select handler calls it and `ServerInfo.saveUserInformation(uuid, accessToken, refreshToken)` follows), and THAT response carries the durable pair. The refreshToken's iat matches the verify moment, and the prefs commit at the pick - consistent with: mint at profile-select, commit on pick.
+
+**Candidates probed against the mint URL (all ruled out so far):** `POST /user/login?system=USER` -> `ERR_SM_014 Invalid account type`; `system=GM` (v4 and v1, minimal and full UserDto, with and without session headers) -> HTTP 500 `ERR_UNKNOWN_001`; `system=CS` -> email login semantics (`ERR_SM_004`); `PUT /users/{uuid}/phone` -> `Phone already registered` (the update-phone route); `PUT /user/phone?tempUUID=` -> `ERR_SM_026 User not registered` (registration temp-user route). The exact call is the open item; the capture is armed (frida hook on `MobileUserManager.userPhoneLogin` logging the UserDto fields and the raw response body) and runs on the next login cycle once the OTP send budget reopens (it was exhausted 11:56Z, next send ~12:56Z).
+
+**Instrument note (root detection).** The app refuses to run on a rooted device: `BaseActivity.onCreate` runs a vendored RootBeer fork whose PATH-scan found `/system/xbin/su` ("Device is untrusted", toast + finish, plus a non-cancelable dialog from the splash). Defeated for instrumentation only: frida 16.7.19 (17.x crashes on this Android 11 emulator, sigchain assertion) + hooks on `com.scottyab.rootbeer.RootBeer.isRooted`, `java.io.File.exists` for `*/su` paths, and the toast/finish pair. The app under test is the genuine APK; nothing was repacked. Also of note: `pm clear` resets runtime permissions, so they must be re-granted (`pm grant`) before the app will pass its own permission flow.
