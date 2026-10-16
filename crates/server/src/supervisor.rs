@@ -8,7 +8,7 @@
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,7 +43,9 @@ pub struct Pacing {
     /// How long the loop keeps re-minting a producer that never connects
     /// before surfacing degraded - the camera's push can lag for minutes
     /// (measured 52s on the hub 2026-10-16), and the reason must outlast
-    /// the lag.
+    /// the lag. Deliberately under `stream_idle`: a stream nobody watches
+    /// is torn down on that window, and a reason that only appears after
+    /// the teardown would never reach anyone.
     pub connect_window: Duration,
 }
 
@@ -56,7 +58,7 @@ impl Default for Pacing {
             discovery_retry: Duration::from_secs(5),
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_secs(8),
-            connect_window: Duration::from_secs(240),
+            connect_window: Duration::from_secs(90),
         }
     }
 }
@@ -140,6 +142,11 @@ pub struct Supervisor {
     /// When discovery last ran, so a refused session is re-tried on a
     /// cadence rather than on every gated request.
     last_discovery: Arc<Mutex<Option<Instant>>>,
+    /// The streams narar holds its own consumer on, one per tracked loop:
+    /// go2rtc stops a producer the moment nothing consumes it, so the hold
+    /// is what keeps one up between mints - and it must not read as a
+    /// viewer when the idle rule counts consumers.
+    holds: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Supervisor {
@@ -153,6 +160,7 @@ impl Supervisor {
             devices: Arc::new(RwLock::new(Vec::new())),
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
+            holds: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -511,6 +519,8 @@ impl Supervisor {
         // re-mint.
         let mut unconnected_since: Option<Instant> = None;
         let mut degraded_reported = false;
+        // The standing consumer keeping the producer up between mints.
+        let mut hold: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
@@ -549,6 +559,7 @@ impl Supervisor {
                 && idle_for >= idle
                 && self.teardown_if_idle(&name, seen_at).await
             {
+                self.release_hold(&name, &mut hold);
                 return;
             }
             // A wake that is not due to mint is only a re-check: the mint
@@ -563,7 +574,7 @@ impl Supervisor {
                 self.reconcile_low(&name).await;
                 continue;
             }
-            next_mint = match self.mint_and_swap(&device).await {
+            next_mint = match self.mint_and_swap(&device, &mut hold).await {
                 Ok(MintAttempt::Connected) => {
                     failed = false;
                     unconnected_since = None;
@@ -580,16 +591,32 @@ impl Supervisor {
                     // A fresh URL is minted on the retry cadence, not the
                     // remint's: the URL is one-shot, and waiting minutes
                     // for the next mint would leave a viewer on a dead
-                    // stream that reads live. The state stays waking until
-                    // the window for a lagging push passes.
-                    tracing::warn!(stream = %name, "the producer has not connected; re-minting");
-                    self.mark_waking(&name).await;
+                    // stream that reads live.
                     failed = true;
                     let since = *unconnected_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= self.pacing.connect_window && !degraded_reported {
+                    let waiting = since.elapsed();
+                    if waiting >= self.pacing.connect_window {
+                        // The window has passed: the reason is the state
+                        // now, re-asserted every attempt so no later wake
+                        // quietly returns it to waking - the UI offers Try
+                        // again only for a degraded stream.
+                        if !degraded_reported {
+                            tracing::warn!(
+                                stream = %name,
+                                ?waiting,
+                                "the producer has not connected; giving the reason"
+                            );
+                            degraded_reported = true;
+                        }
                         self.mark_degraded(&name, "the producer has not connected".to_owned())
                             .await;
-                        degraded_reported = true;
+                    } else {
+                        tracing::warn!(
+                            stream = %name,
+                            ?waiting,
+                            "the producer has not connected; re-minting"
+                        );
+                        self.mark_waking(&name).await;
                     }
                     // The first attempt waits no time at all, so the floor
                     // matters: doubling zero is still zero.
@@ -617,7 +644,11 @@ impl Supervisor {
     /// stream's own name, so a viewer's stream URL survives re-mints. A mint
     /// the gateway turns away spends the stored refresh token once and runs
     /// again before the refusal is believed.
-    async fn mint_and_swap(&self, device: &Device) -> Result<MintAttempt, String> {
+    async fn mint_and_swap(
+        &self,
+        device: &Device,
+        hold: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<MintAttempt, String> {
         let name = stream_name(&device.device_id, Quality::High);
         let mint = match self
             .with_fresh_session(|session| async move {
@@ -636,17 +667,26 @@ impl Supervisor {
             .put_stream(&name, &live_source(&mint.url))
             .await
             .map_err(|err| redact(&err.to_string()))?;
-        // The producer is asked to start now, not at the first viewer. A
-        // minted URL is one-shot, and the first viewer's own attempt is
-        // exactly the one that can die on a cold camera - with nothing
-        // left to notice it if the start waits for them.
-        if let Err(err) = self.go2rtc.touch(&name).await {
-            tracing::warn!(
-                stream = %name,
-                reason = %redact(&err.to_string()),
-                "the producer could not be asked to start"
-            );
-            return Ok(MintAttempt::Unconnected);
+        // The standing consumer, taken once and kept until the loop ends:
+        // go2rtc stops a producer the moment its last consumer leaves, so
+        // starting one is not enough - without the hold the producer dies
+        // seconds after the check, the state still says live, and a viewer
+        // attaching later re-dials a spent one-shot URL.
+        if hold.is_none() {
+            let response = self
+                .go2rtc
+                .hold(&name)
+                .await
+                .map_err(|err| redact(&err.to_string()))?;
+            self.holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(name.clone());
+            *hold = Some(tokio::spawn(async move {
+                let mut response = response;
+                // Drain and discard: the read itself is the consumer.
+                while matches!(response.chunk().await, Ok(Some(_))) {}
+            }));
         }
         // Live means the producer is actually connected, not that go2rtc
         // holds an entry: an entry whose ffmpeg the camera is refusing
@@ -787,12 +827,33 @@ impl Supervisor {
     /// the stream: a late teardown beats a wrong one.
     async fn watched(&self, name: &str) -> bool {
         let low = low_name_of(name);
+        // narar's own standing consumer is not a viewer: without the
+        // subtraction, the hold that keeps the producer up would also keep
+        // every stream from ever reading as idle.
+        let ours = usize::from(
+            self.holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(name),
+        );
         self.go2rtc.streams().await.map_or(true, |streams| {
             streams.iter().any(|stream| {
-                stream.consumers > 0
+                let held = if stream.name == name { ours } else { 0 };
+                stream.consumers > held
                     && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
             })
         })
+    }
+
+    /// Drop the stream's standing consumer, if one is up.
+    fn release_hold(&self, name: &str, hold: &mut Option<tokio::task::JoinHandle<()>>) {
+        if let Some(task) = hold.take() {
+            task.abort();
+        }
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     /// How long since the stream was last asked for, if it is still known.

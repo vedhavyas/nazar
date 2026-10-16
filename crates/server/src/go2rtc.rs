@@ -244,16 +244,16 @@ impl Go2rtc {
             .collect())
     }
 
-    /// Ask go2rtc to start the stream's producer without a viewer: the HLS
-    /// master playlist request spawns it and registers no consumer
-    /// (measured against go2rtc 1.9.14). Without this the producer starts
-    /// only when the first viewer attaches - and that first attempt is
-    /// exactly the one that can die on a cold camera, with nothing left to
-    /// notice it.
-    pub async fn touch(&self, name: &str) -> Result<(), Go2rtcError> {
+    /// Hold a consumer on the stream for as long as the caller keeps the
+    /// response: a running read is the only thing that keeps go2rtc's
+    /// producer up. Measured on go2rtc 1.9.14: an HLS request's consumer
+    /// is removed by the 5s keepalive and its producer then stops, so a
+    /// check that merely starts a producer leaves it dead moments later -
+    /// and the minted URL, being one-shot, is spent by the attempt.
+    pub async fn hold(&self, name: &str) -> Result<reqwest::Response, Go2rtcError> {
         let response = self
             .http
-            .get(self.api_for("/api/stream.m3u8")?)
+            .get(self.api_for("/api/stream.mpegts")?)
             .query(&[("src", name)])
             .send()
             .await?;
@@ -265,7 +265,7 @@ impl Go2rtc {
                 body: snippet(&text),
             });
         }
-        Ok(())
+        Ok(response)
     }
 
     /// Kill the spawned process, if this instance owns one.
