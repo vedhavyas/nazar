@@ -159,6 +159,24 @@ fn air_is_told_only_past_the_line() {
 }
 
 #[test]
+fn the_air_line_can_be_moved() {
+    let dir = temp_dir("notify-aqi-line");
+    let store =
+        Arc::new(NotificationStore::open(dir.join("notifications.json"), COALESCE).with_aqi(120));
+    let start = Instant::now();
+
+    assert!(
+        store.push(&aqi("purifier", 80), start).is_none(),
+        "under the moved line is quiet, where the default line would be loud"
+    );
+    assert!(
+        store.push(&aqi("purifier", 120), start).is_some(),
+        "the moved line itself is told"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_store_survives_a_restart() {
     let dir = temp_dir("notify-restart");
     {

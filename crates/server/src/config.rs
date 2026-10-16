@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use qubo::ServiceProvider;
 
+use crate::notify::AQI_ALERT_AT;
+
 /// Everything the server needs from its environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,12 +23,14 @@ pub struct Config {
     /// One WebRTC candidate viewers can reach, `ip:port`. Empty means
     /// go2rtc's own discovery, which finds container-internal addresses.
     pub webrtc_candidates: Option<String>,
+    /// The PM2.5 reading worth a notification.
+    pub aqi_alert_at: u32,
 }
 
 impl Config {
     /// Read the environment: `DATA_DIR` (default `/data`), `GO2RTC_BIN`
     /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`,
-    /// `NAZAR_WEBRTC_CANDIDATES`.
+    /// `NAZAR_WEBRTC_CANDIDATES`, `NAZAR_AQI_ALERT_AT`.
     pub fn from_env() -> Self {
         Self {
             data_dir: var("DATA_DIR").unwrap_or_else(|| "/data".to_owned()).into(),
@@ -39,6 +43,15 @@ impl Config {
             service_provider: var("QUBO_SP")
                 .map_or_else(ServiceProvider::default, ServiceProvider::new),
             webrtc_candidates: var("NAZAR_WEBRTC_CANDIDATES"),
+            aqi_alert_at: var("NAZAR_AQI_ALERT_AT").map_or(AQI_ALERT_AT, |raw| {
+                raw.parse().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        value = %raw,
+                        "NAZAR_AQI_ALERT_AT is not a number; keeping the default line"
+                    );
+                    AQI_ALERT_AT
+                })
+            }),
         }
     }
 

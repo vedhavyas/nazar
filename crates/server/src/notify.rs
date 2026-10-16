@@ -27,6 +27,7 @@ const ANNOUNCE_CAPACITY: usize = 64;
 
 /// A PM2.5 reading at or above this is worth a notification. The plan names
 /// the kind but no number; 60 is the CPCB line between moderate and poor.
+/// `NAZAR_AQI_ALERT_AT` moves the line without a rebuild.
 pub const AQI_ALERT_AT: u32 = 60;
 
 /// How long one kind's burst is one notification: the plan's 30 seconds.
@@ -94,6 +95,7 @@ impl Inner {
         event: &UnitEvent,
         now: Instant,
         window: Duration,
+        aqi_alert_at: u32,
     ) -> Option<Notification> {
         let (device_id, kind) = match event {
             UnitEvent::Motion { device_id, .. } => (device_id.clone(), Kind::Motion),
@@ -102,7 +104,7 @@ impl Inner {
                 if *online { Kind::Online } else { Kind::Offline },
             ),
             UnitEvent::Aqi { device_id, value } => {
-                if *value < AQI_ALERT_AT {
+                if *value < aqi_alert_at {
                     return None;
                 }
                 (device_id.clone(), Kind::Aqi { value: *value })
@@ -148,6 +150,7 @@ fn now_ms() -> i64 {
 pub struct NotificationStore {
     path: PathBuf,
     window: Duration,
+    aqi_alert_at: u32,
     inner: Mutex<Inner>,
     tx: broadcast::Sender<Notification>,
 }
@@ -167,6 +170,7 @@ impl NotificationStore {
         Self {
             path,
             window,
+            aqi_alert_at: AQI_ALERT_AT,
             inner: Mutex::new(Inner {
                 ledger,
                 seen: HashMap::new(),
@@ -176,10 +180,17 @@ impl NotificationStore {
         }
     }
 
+    /// Tell at a different PM2.5 line than the default.
+    #[must_use]
+    pub fn with_aqi(mut self, at: u32) -> Self {
+        self.aqi_alert_at = at;
+        self
+    }
+
     /// Record an event. `None` when it fell inside a burst already told.
     pub fn push(&self, event: &UnitEvent, now: Instant) -> Option<Notification> {
         let mut inner = self.lock();
-        let made = inner.record(event, now, self.window);
+        let made = inner.record(event, now, self.window, self.aqi_alert_at);
         self.save(&inner);
         made
     }

@@ -13,6 +13,7 @@ fn config_in(dir: &std::path::Path) -> Config {
         ffmpeg_bin: "ffmpeg".into(),
         service_provider: qubo::ServiceProvider::default(),
         webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
     }
 }
 
