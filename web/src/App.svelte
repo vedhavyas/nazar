@@ -8,8 +8,9 @@
   import Home from './routes/Home.svelte';
   import Login from './routes/Login.svelte';
   import Notifications from './routes/Notifications.svelte';
+  import Recordings from './routes/Recordings.svelte';
 
-  type Screen = 'checking' | 'login' | 'home' | 'camera' | 'notifications';
+  type Screen = 'checking' | 'login' | 'home' | 'camera' | 'notifications' | 'recordings';
 
   let screen = $state<Screen>('checking');
   let openId = $state<string | null>(null);
@@ -56,7 +57,14 @@
 {:else if screen === 'login'}
   <Login onloggedin={() => (screen = 'home')} />
 {:else if screen === 'camera' && openId}
-  <Camera id={openId} onback={() => (screen = 'home')} onlocked={() => (screen = 'login')} />
+  <Camera
+    id={openId}
+    onback={() => (screen = 'home')}
+    onlocked={() => (screen = 'login')}
+    onrecordings={() => (screen = 'recordings')}
+  />
+{:else if screen === 'recordings' && openId}
+  <Recordings id={openId} onback={() => (screen = 'camera')} onlocked={() => (screen = 'login')} />
 {:else if screen === 'notifications'}
   <Notifications
     entries={notes.entries}

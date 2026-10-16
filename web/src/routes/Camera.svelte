@@ -5,8 +5,17 @@
   import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
 
-  let { id, onback, onlocked }: { id: string; onback: () => void; onlocked: () => void } =
-    $props();
+  let {
+    id,
+    onback,
+    onlocked,
+    onrecordings,
+  }: {
+    id: string;
+    onback: () => void;
+    onlocked: () => void;
+    onrecordings?: () => void;
+  } = $props();
 
   let camera = $state<CameraInfo | null>(null);
   let quality = $state<Quality>('high');
@@ -224,6 +233,9 @@
     <button class="btn" onclick={() => setQuality(quality === 'high' ? 'low' : 'high')}>
       {quality === 'high' ? 'High quality' : 'Low quality'}
     </button>
+    {#if onrecordings}
+      <button class="btn" onclick={onrecordings}>Recordings</button>
+    {/if}
     <button class="btn" onclick={togglePrivacy} aria-pressed={privacy === true}>
       {#if privacy === null}
         Privacy
