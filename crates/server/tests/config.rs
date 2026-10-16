@@ -13,6 +13,10 @@ fn config_in(dir: &std::path::Path) -> Config {
         ffmpeg_bin: "ffmpeg".into(),
         service_provider: qubo::ServiceProvider::default(),
         webrtc_candidates: None,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     }
 }
 

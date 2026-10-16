@@ -107,6 +107,10 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
         service_provider: ServiceProvider::default(),
         webrtc_candidates: Some("198.51.100.1:8555".to_owned()),
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -164,6 +168,10 @@ async fn no_webrtc_section_without_a_configured_candidate() {
         ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
         service_provider: ServiceProvider::default(),
         webrtc_candidates: None,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");

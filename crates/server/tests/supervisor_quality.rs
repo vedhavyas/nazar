@@ -41,6 +41,7 @@ fn pacing(stream_idle: Duration) -> Pacing {
         retry_max: Duration::from_secs(30),
         discovery_retry: Duration::from_secs(30),
         stream_idle,
+        arm_timeout: Duration::from_secs(15),
     }
 }
 

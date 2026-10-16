@@ -395,14 +395,34 @@ async fn camera_ptz(
         })?;
     let target = (x + step.dx, y + step.dy);
     let target_text = format!("{},{}", target.0, target.1);
-    write_service(
-        &state.qubo,
-        &session,
-        &device,
-        "panTiltControl",
-        &[("horizontalVerticalPostion", target_text.as_str())],
-    )
-    .await?;
+    // A fast-lane session carries the move over its data channel, as the
+    // app does; the REST write is the path when nothing is armed.
+    match state.supervisor.fast_lane_for(&id).await {
+        Some(lane) => {
+            let envelope = p2p_control_envelope(
+                &id,
+                "panTiltControl",
+                "horizontalVerticalPostion",
+                &target_text,
+            );
+            lane.control(envelope).map_err(|err| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("the fast lane refused the move: {err}"),
+                )
+            })?;
+        }
+        None => {
+            write_service(
+                &state.qubo,
+                &session,
+                &device,
+                "panTiltControl",
+                &[("horizontalVerticalPostion", target_text.as_str())],
+            )
+            .await?;
+        }
+    }
     drop(held);
 
     let landed = await_position(&state, &device, &session, target).await?;
@@ -474,6 +494,31 @@ async fn camera_privacy(
 
 /// The reason every unconfirmed write comes back with.
 const NOT_APPLIED: &str = "not applied";
+
+/// The command envelope for the P2P data channel (`docs/qubo-protocol.md`
+/// 6.7): the same service write the MQTT path publishes, wrapped in the
+/// captured `command` shape with the top-level device id and timestamp.
+fn p2p_control_envelope(device_id: &str, service: &str, attribute: &str, value: &str) -> Value {
+    let mut attributes = serde_json::Map::new();
+    attributes.insert(attribute.to_owned(), json!(value));
+    let mut services = serde_json::Map::new();
+    services.insert(
+        service.to_owned(),
+        json!({ "attributes": attributes, "instanceId": 0 }),
+    );
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or_default();
+    json!({
+        "command": {
+            "devices": { "deviceUUID": device_id, "services": services }
+        },
+        "deviceUUID": device_id,
+        "timestamp": timestamp,
+    })
+}
 
 /// Read the shadow until it reports `target`, within the control window;
 /// the last position seen, matched or not.

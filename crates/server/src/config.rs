@@ -21,12 +21,25 @@ pub struct Config {
     /// One WebRTC candidate viewers can reach, `ip:port`. Empty means
     /// go2rtc's own discovery, which finds container-internal addresses.
     pub webrtc_candidates: Option<String>,
+    /// Cameras that try the P2P fast lane before the cloud mint
+    /// (`NAZAR_PREFER_P2P`, comma-separated device ids).
+    pub prefer_p2p: Vec<String>,
+    /// The app-side identity the fast lane borrows: the unit's `mobile`
+    /// device and the Android-ID-style `srcDeviceId`. The defaults are the
+    /// captured phone's own (`NAZAR_P2P_SELF_DEVICE`, `NAZAR_P2P_SRC_DEVICE_ID`).
+    pub p2p_self_device: String,
+    pub p2p_src_device_id: String,
+    /// The camera's controllerUUID for the device-access-token dest
+    /// (`NAZAR_P2P_CAMERA_CONTROLLER`); `None` reads it from the device
+    /// listing.
+    pub p2p_camera_controller: Option<String>,
 }
 
 impl Config {
     /// Read the environment: `DATA_DIR` (default `/data`), `GO2RTC_BIN`
     /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`,
-    /// `NAZAR_WEBRTC_CANDIDATES`.
+    /// `NAZAR_WEBRTC_CANDIDATES`, and the fast-lane set
+    /// (`NAZAR_PREFER_P2P`, `NAZAR_P2P_*`).
     pub fn from_env() -> Self {
         Self {
             data_dir: var("DATA_DIR").unwrap_or_else(|| "/data".to_owned()).into(),
@@ -39,6 +52,18 @@ impl Config {
             service_provider: var("QUBO_SP")
                 .map_or_else(ServiceProvider::default, ServiceProvider::new),
             webrtc_candidates: var("NAZAR_WEBRTC_CANDIDATES"),
+            prefer_p2p: var("NAZAR_PREFER_P2P").map_or_else(Vec::new, |list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
+            p2p_self_device: var("NAZAR_P2P_SELF_DEVICE")
+                .unwrap_or_else(|| "d0000000-0000-4000-8000-000000000002".to_owned()),
+            p2p_src_device_id: var("NAZAR_P2P_SRC_DEVICE_ID")
+                .unwrap_or_else(|| "<mobile-id>".to_owned()),
+            p2p_camera_controller: var("NAZAR_P2P_CAMERA_CONTROLLER"),
         }
     }
 

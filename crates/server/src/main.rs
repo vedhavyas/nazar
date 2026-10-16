@@ -33,6 +33,24 @@ async fn main() -> anyhow::Result<()> {
     );
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
     let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
+    // The fast lane is opt-in per camera; without a preference the server
+    // never arms it and the cloud path is the only one.
+    let supervisor = if config.prefer_p2p.is_empty() {
+        supervisor
+    } else {
+        let lane = server::fast_lane::EngineLane::new(
+            qubo.clone(),
+            sessions.clone(),
+            qubo::p2p::P2pIdentity {
+                self_device: config.p2p_self_device.clone(),
+                src_device_id: config.p2p_src_device_id.clone(),
+                camera_controller: config.p2p_camera_controller.clone(),
+            },
+            qubo::p2p::P2pConfig::default(),
+            config.data_dir.clone(),
+        );
+        supervisor.with_fast_lane(Arc::new(lane), config.prefer_p2p.clone())
+    };
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);

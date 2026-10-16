@@ -1,0 +1,398 @@
+//! Fast-lane wiring: the cloud path is the floor (a failed or over-bound
+//! arm falls back to the mint), PTZ rides the engine while a session is
+//! armed, and one fast-lane session serves a camera however many of its
+//! streams ask.
+
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use qubo::{Quality, QuboClient, Session, SessionStore};
+use server::events::EventBus;
+use server::go2rtc::Go2rtc;
+use server::http::{AppState, ControlTiming, Wiring, app};
+use server::motion::MotionOrder;
+use server::supervisor::{LaneSession, Pacing, StreamState, Supervisor};
+use tokio::net::TcpListener;
+
+use common::{FakeApi, FakeLane};
+
+const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
+const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
+const ENTITY: &str = "30000000-0000-4000-8000-000000000001";
+const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
+const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
+const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const SHADOW_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/entities/30000000-0000-4000-8000-000000000001/devices/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01/shadow";
+const COMMAND_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/entities/30000000-0000-4000-8000-000000000001/devices/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01/command";
+
+static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+struct Harness {
+    base: String,
+    qubo: MockServer,
+    go2rtc: FakeApi,
+    supervisor: Supervisor,
+    lane: Arc<FakeLane>,
+}
+
+/// A harness with the fast lane installed for `prefer`; `remint` is the
+/// loop's re-mint cadence (long, unless a test watches a re-arm happen).
+async fn harness(
+    lane: FakeLane,
+    prefer: Vec<String>,
+    arm_timeout: Duration,
+    remint: Duration,
+) -> Harness {
+    let qubo = MockServer::start().await;
+    let go2rtc = FakeApi::start().await;
+    let data_dir = std::env::temp_dir().join(format!(
+        "nazar-fast-lane-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    let sessions = SessionStore::new(data_dir.join("session.json"));
+    sessions
+        .save(&Session {
+            access_token: "token-abc".to_owned(),
+            uuid: "user-uuid-1".to_owned(),
+            email: None,
+        })
+        .expect("a stored session");
+    let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
+    let lane = Arc::new(lane);
+    let supervisor = Supervisor::new(
+        client.clone(),
+        sessions.clone(),
+        Go2rtc::connect(go2rtc.base.clone()),
+        Pacing {
+            remint,
+            retry_base: Duration::from_millis(20),
+            retry_max: Duration::from_millis(200),
+            discovery_retry: Duration::from_secs(30),
+            stream_idle: Duration::from_secs(120),
+            arm_timeout,
+        },
+    )
+    .with_fast_lane(
+        Arc::clone(&lane) as Arc<dyn server::supervisor::Lane>,
+        prefer,
+    );
+
+    let mut state = AppState::new(
+        "test",
+        Wiring {
+            sessions,
+            qubo: client,
+            supervisor: supervisor.clone(),
+            go2rtc_api: go2rtc.base.to_string(),
+            events: EventBus::new(),
+            motion: Arc::new(std::sync::Mutex::new(MotionOrder::new())),
+        },
+    );
+    state.control = ControlTiming {
+        poll_every: Duration::from_millis(10),
+        window: Duration::from_millis(80),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let base = format!("http://{}", listener.local_addr().expect("the address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.expect("serves");
+    });
+
+    mount_discovery(&qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({
+                "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}_CAMERA_VOD0?token=cloud"),
+                "sessionId": "session-1",
+            })
+            .to_string(),
+        ))
+        .mount(&qubo)
+        .await;
+    supervisor.refresh_devices().await.expect("discovery");
+
+    Harness {
+        base,
+        qubo,
+        go2rtc,
+        supervisor,
+        lane,
+    }
+}
+
+async fn mount_discovery(server: &MockServer) {
+    mount_json(
+        server,
+        UNITS_PATH,
+        json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
+    )
+    .await;
+    mount_json(
+        server,
+        DEVICES_PATH,
+        json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01", "entityUUID": ENTITY }] })
+            .to_string(),
+    )
+    .await;
+}
+
+async fn mount_json(server: &MockServer, route: &str, body: String) {
+    Mock::given(method("GET"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+/// A shadow carrying the pan/tilt position, then the same write twice more.
+fn shadow(ptz: &str) -> String {
+    format!(
+        r#"{{"services":[{{"service":"panTiltControl","attributes":{{"horizontalVerticalPostion":{{"value":"{ptz}"}}}}}}]}}"#
+    )
+}
+
+async fn mount_control(server: &MockServer, positions: Vec<&str>) {
+    let bodies: Vec<String> = positions.into_iter().map(shadow).collect();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_mock = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .and(path(SHADOW_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            let at = calls_mock
+                .fetch_add(1, Ordering::SeqCst)
+                .min(bodies.len() - 1);
+            ResponseTemplate::new(200).set_body_string(bodies[at].clone())
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(COMMAND_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string("SUCCESS_UM_006"))
+        .mount(server)
+        .await;
+}
+
+async fn command_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .expect("the requests")
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .map(|request| serde_json::from_slice(&request.body).expect("a json body"))
+        .collect()
+}
+
+async fn is_live(supervisor: &Supervisor) -> bool {
+    matches!(
+        supervisor.status_for(DEVICE_ID, Quality::High).await,
+        StreamState::Live { .. }
+    )
+}
+
+/// A cloud-minted source: the fallback's own shape.
+fn is_cloud_source(source: &str) -> bool {
+    source.contains("rtsps://") || source.contains("token=cloud")
+}
+
+#[tokio::test]
+async fn an_arm_failure_falls_back_to_the_cloud_mint() {
+    let h = harness(
+        FakeLane::failing("the relay stayed silent"),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the stream goes live through the cloud path");
+    let puts = h.go2rtc.puts();
+    assert!(
+        puts.iter()
+            .any(|(name, source)| name == &format!("{DEVICE_ID}-high") && is_cloud_source(source)),
+        "the cloud mint's source is what reached go2rtc: {puts:?}"
+    );
+    assert_eq!(h.lane.arms(), 1, "the fast lane was attempted once");
+}
+
+#[tokio::test]
+async fn a_hanging_arm_falls_back_within_the_bound() {
+    let h = harness(
+        FakeLane::hanging(Duration::from_secs(30)),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_millis(200),
+        Duration::from_secs(30),
+    )
+    .await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+
+    // The arm hangs for 30s; the bound is 200ms. Only the bound firing
+    // inside the ~2s poll window can make the cloud source appear.
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the bound fired and the cloud path took over");
+    let puts = h.go2rtc.puts();
+    assert!(
+        puts.iter()
+            .any(|(name, source)| name == &format!("{DEVICE_ID}-high") && is_cloud_source(source)),
+        "the fallback's source reached go2rtc: {puts:?}"
+    );
+    assert_eq!(
+        h.lane.arms(),
+        1,
+        "the fast lane was still only attempted once"
+    );
+}
+
+#[tokio::test]
+async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    mount_control(&h.qubo, vec!["10,10", "20,15", "20,15"]).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the fast lane armed");
+    assert!(
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(_, source)| source.contains("nazar-fake.sdp")),
+        "the session's own source reached go2rtc"
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", h.base))
+        .json(&json!({ "dx": 10, "dy": 5 }))
+        .send()
+        .await
+        .expect("the call");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let controls = h.lane.session().controls();
+    assert_eq!(controls.len(), 1, "the move rode the data channel");
+    assert_eq!(
+        controls[0]["command"]["devices"]["services"]["panTiltControl"]["attributes"]["horizontalVerticalPostion"],
+        json!("20,15"),
+        "the envelope carries the same absolute position the REST path writes"
+    );
+    assert!(
+        command_bodies(&h.qubo).await.is_empty(),
+        "no REST write went out while the session was armed"
+    );
+
+    // Without the fast lane, the same call is the REST write as before.
+    let rest = harness(
+        FakeLane::new(),
+        Vec::new(),
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    mount_control(&rest.qubo, vec!["10,10", "20,15", "20,15"]).await;
+    rest.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let up = common::eventually(|| async { is_live(&rest.supervisor).await }).await;
+    assert!(up, "the cloud path serves the stream");
+    assert_eq!(rest.lane.arms(), 0, "a camera not in prefer_p2p never arms");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/cameras/{DEVICE_ID}/ptz", rest.base))
+        .json(&json!({ "dx": 10, "dy": 5 }))
+        .send()
+        .await
+        .expect("the call");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let bodies = command_bodies(&rest.qubo).await;
+    assert_eq!(bodies.len(), 1, "the REST write went out");
+    assert_eq!(
+        bodies[0]["payload"]["devices"]["services"]["panTiltControl"]["attributes"]["horizontalVerticalPostion"],
+        json!("20,15"),
+        "the REST write carries the target position"
+    );
+}
+
+#[tokio::test]
+async fn a_second_stream_reuses_the_camera_session() {
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    // Both qualities ask at once: the two loops race into the arm-or-reuse
+    // decision, and exactly one arm may come out of it.
+    let (high, low) = tokio::join!(
+        h.supervisor.ensure(DEVICE_ID, Quality::High, false),
+        h.supervisor.ensure(DEVICE_ID, Quality::Low, false),
+    );
+    high.expect("ensure accepts");
+    low.expect("ensure accepts");
+
+    let both_live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ) && matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(both_live, "both streams go live");
+    assert_eq!(
+        h.lane.arms(),
+        1,
+        "one fast-lane session per camera, never two"
+    );
+    let puts = h.go2rtc.puts();
+    for quality in ["high", "low"] {
+        let name = format!("{DEVICE_ID}-{quality}");
+        assert!(
+            puts.iter()
+                .any(|(stream, source)| stream == &name && source.contains("nazar-fake.sdp")),
+            "the {quality} stream is fed by the one session: {puts:?}"
+        );
+    }
+
+    // A session that ended is not reused: the next ask arms afresh.
+    h.lane.session().shutdown();
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("ensure accepts");
+    let rearmed = common::eventually(|| async { h.lane.arms() == 2 }).await;
+    assert!(rearmed, "a dead session is replaced, not reused");
+}

@@ -111,6 +111,7 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
+            arm_timeout: Duration::from_secs(15),
         },
     );
     let events = EventBus::new();

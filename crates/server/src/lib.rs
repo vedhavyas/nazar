@@ -6,6 +6,7 @@
 // subscriber, anyhow).
 pub mod config;
 pub mod events;
+pub mod fast_lane;
 pub mod go2rtc;
 pub mod http;
 pub mod motion;

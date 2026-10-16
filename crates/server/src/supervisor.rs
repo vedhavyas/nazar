@@ -8,12 +8,15 @@
 //! may hold two streams at once: the hero's high one, and a tile's low one
 //! which is dropped once nobody has asked for it for a while.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live};
+use serde_json::Value;
 use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, live_source};
@@ -32,6 +35,10 @@ pub struct Pacing {
     /// How long a stream may go both unasked-for and unwatched before it
     /// is dropped. A stream anyone is watching is never idle.
     pub stream_idle: Duration,
+    /// The bound on one fast-lane arm attempt; past it the cloud path
+    /// takes over. The engine's stages can sum past this on a bad network,
+    /// so the bound cancels rather than waits.
+    pub arm_timeout: Duration,
 }
 
 impl Default for Pacing {
@@ -42,8 +49,34 @@ impl Default for Pacing {
             retry_max: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(5),
             stream_idle: Duration::from_secs(120),
+            arm_timeout: Duration::from_secs(15),
         }
     }
+}
+
+/// A boxed future: the shape the [`Lane`] seam hands between tasks.
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The fast lane as the supervisor drives it: one seam, so the live engine
+/// and the tests' fake both fit.
+pub trait Lane: Send + Sync + 'static {
+    /// Arm a session for the camera. The supervisor bounds this with
+    /// [`Pacing::arm_timeout`] and falls back to the cloud path on failure.
+    fn arm(&self, device: Device) -> BoxFuture<Result<Arc<dyn LaneSession>, String>>;
+}
+
+/// An armed fast-lane session, as the supervisor uses it.
+pub trait LaneSession: Send + Sync + 'static {
+    /// The go2rtc source for `name` that reads this session's decrypted
+    /// media; every stream name gets its own reader.
+    fn source_for(&self, name: &str) -> Result<String, String>;
+    /// Send one control envelope over the session's data channel.
+    fn control(&self, envelope: Value) -> Result<(), String>;
+    /// Whether the session is still up.
+    fn alive(&self) -> bool;
+    /// End the session (`endP2pCall`); called when the camera's last stream
+    /// is torn down.
+    fn shutdown(&self);
 }
 
 /// The go2rtc stream name for a camera's quality class; the browser asks
@@ -95,6 +128,15 @@ pub struct Supervisor {
     /// When discovery last ran, so a refused session is re-tried on a
     /// cadence rather than on every gated request.
     last_discovery: Arc<Mutex<Option<Instant>>>,
+    /// The fast lane, when the deployment enables it.
+    lane: Option<Arc<dyn Lane>>,
+    /// Cameras that try the fast lane before the cloud mint.
+    prefer_p2p: Arc<HashSet<String>>,
+    /// The armed fast-lane session per camera - one, never two.
+    armed: Arc<RwLock<HashMap<String, Arc<dyn LaneSession>>>>,
+    /// Serializes arm-or-reuse decisions, so two streams for one camera
+    /// asking at the same moment cannot both arm.
+    arm_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Supervisor {
@@ -108,7 +150,61 @@ impl Supervisor {
             devices: Arc::new(RwLock::new(Vec::new())),
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
+            lane: None,
+            prefer_p2p: Arc::new(HashSet::new()),
+            armed: Arc::new(RwLock::new(HashMap::new())),
+            arm_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Enable the fast lane: cameras in `prefer` try it before the cloud
+    /// mint, and a failure or an over-bound arm falls back without the
+    /// viewer noticing.
+    #[must_use]
+    pub fn with_fast_lane(mut self, lane: Arc<dyn Lane>, prefer: Vec<String>) -> Self {
+        self.lane = Some(lane);
+        self.prefer_p2p = Arc::new(prefer.into_iter().collect());
+        self
+    }
+
+    /// The camera's live fast-lane session, when one is armed; in-session
+    /// controls ride it, and the REST path resumes when it ends.
+    pub async fn fast_lane_for(&self, device_id: &str) -> Option<Arc<dyn LaneSession>> {
+        let session = self.armed.read().await.get(device_id).cloned()?;
+        session.alive().then_some(session)
+    }
+
+    /// The camera's fast-lane session, arming one if none is live: one
+    /// session per camera, and a second ask reuses it rather than stacking.
+    async fn lane_session(
+        &self,
+        lane: &Arc<dyn Lane>,
+        device: &Device,
+    ) -> Result<Arc<dyn LaneSession>, String> {
+        let _serialized = self.arm_lock.lock().await;
+        if let Some(session) = self.fast_lane_for(&device.device_id).await {
+            return Ok(session);
+        }
+        let session = tokio::time::timeout(self.pacing.arm_timeout, lane.arm(device.clone()))
+            .await
+            .map_err(|_| format!("the fast-lane arm exceeded {:?}", self.pacing.arm_timeout))??;
+        self.armed
+            .write()
+            .await
+            .insert(device.device_id.clone(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    /// The session's source for this stream: the armed session when live,
+    /// else a fresh (bounded) arm. Any failure is the caller's fallback.
+    async fn lane_source(
+        &self,
+        lane: &Arc<dyn Lane>,
+        device: &Device,
+        name: &str,
+    ) -> Result<String, String> {
+        let session = self.lane_session(lane, device).await?;
+        session.source_for(name)
     }
 
     /// Whether a refused session's re-discovery is worth trying yet.
@@ -322,9 +418,25 @@ impl Supervisor {
     }
 
     /// One mint, handed straight to go2rtc. The source swaps under the
-    /// stream's own name, so a viewer's stream URL survives re-mints.
+    /// stream's own name, so a viewer's stream URL survives re-mints. A
+    /// camera set to prefer the fast lane tries it first; any fast-lane
+    /// failure (arm refused, over its bound, or the session ended) falls
+    /// back to the cloud mint within the loop's own retry cadence.
     async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), String> {
         let name = stream_name(&device.device_id, quality);
+        if let Some(lane) = &self.lane
+            && self.prefer_p2p.contains(&device.device_id)
+        {
+            match self.lane_source(lane, device, &name).await {
+                Ok(source) => {
+                    tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
+                    return self.put_and_confirm(&name, &source).await;
+                }
+                Err(reason) => {
+                    tracing::info!(stream = %name, %reason, "fast lane unavailable; using the cloud path");
+                }
+            }
+        }
         let session = self
             .sessions
             .load()
@@ -337,15 +449,22 @@ impl Supervisor {
                 return Err(redact(&err.to_string()));
             }
         };
+        self.put_and_confirm(&name, &live_source(&mint.url)).await?;
+        self.needs_login.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Hand the source to go2rtc and confirm it took. Live means go2rtc
+    /// actually holds a producer for the stream, not that a PUT was
+    /// acknowledged. Measured 2026-10-15: the producer appears when the
+    /// source is set and ffmpeg starts on the first viewer, so a held
+    /// producer is the strongest liveness the API exposes - frames being on
+    /// screen stays the tile's own business.
+    async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), String> {
         self.go2rtc
-            .put_stream(&name, &live_source(&mint.url))
+            .put_stream(name, source)
             .await
             .map_err(|err| redact(&err.to_string()))?;
-        // Live means go2rtc actually holds a producer for the stream, not
-        // that a PUT was acknowledged. Measured 2026-10-15: the producer
-        // appears when the source is set and ffmpeg starts on the first
-        // viewer, so a held producer is the strongest liveness the API
-        // exposes - frames being on screen stays the tile's own business.
         let held = self
             .go2rtc
             .streams()
@@ -356,7 +475,6 @@ impl Supervisor {
         if !held {
             return Err("go2rtc did not take the stream".to_owned());
         }
-        self.needs_login.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -386,12 +504,30 @@ impl Supervisor {
     /// Drop a stream nobody asked for: go2rtc's copy and the tracked
     /// entry. No reference shows an API that releases a minted session -
     /// it expires on its own - so dropping the stream is the whole release.
+    /// The camera's fast-lane session ends with its last stream.
     async fn teardown(&self, name: &str) {
         if let Err(err) = self.go2rtc.delete_stream(name).await {
             tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
         }
         self.state.write().await.remove(name);
         tracing::info!(stream = name, "idle tile stream dropped");
+        let Some((device_id, _)) = name.rsplit_once('-') else {
+            return;
+        };
+        let prefix = format!("{device_id}-");
+        let remaining = self
+            .state
+            .read()
+            .await
+            .keys()
+            .any(|key| key.starts_with(&prefix));
+        if !remaining && let Some(session) = self.armed.write().await.remove(device_id) {
+            session.shutdown();
+            tracing::info!(
+                camera = device_id,
+                "fast-lane session ended with its last stream"
+            );
+        }
     }
 
     /// Whether go2rtc has a viewer on the stream. An API that cannot say
