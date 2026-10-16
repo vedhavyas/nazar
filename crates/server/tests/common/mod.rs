@@ -57,6 +57,7 @@ impl FakeLane {
                 controls: Mutex::new(Vec::new()),
                 alive: AtomicBool::new(true),
                 released: Mutex::new(Vec::new()),
+                source_refused: AtomicBool::new(false),
             }),
             arms: Arc::new(AtomicUsize::new(0)),
             armed_devices: Arc::new(Mutex::new(Vec::new())),
@@ -99,9 +100,21 @@ pub struct FakeSession {
     pub controls: Mutex<Vec<Value>>,
     pub alive: AtomicBool,
     pub released: Mutex<Vec<String>>,
+    source_refused: AtomicBool,
 }
 
 impl FakeSession {
+    /// Make `source_for` refuse, as a session whose reader cannot be wired
+    /// would.
+    pub fn refuse_source(&self) {
+        self.source_refused.store(true, Ordering::SeqCst);
+    }
+
+    /// Let `source_for` answer normally again.
+    pub fn allow_source(&self) {
+        self.source_refused.store(false, Ordering::SeqCst);
+    }
+
     pub fn controls(&self) -> Vec<Value> {
         self.controls.lock().unwrap().clone()
     }
@@ -139,6 +152,9 @@ impl Lane for FakeLane {
 
 impl LaneSession for FakeSession {
     fn source_for(&self, _name: &str) -> Result<String, String> {
+        if self.source_refused.load(Ordering::SeqCst) {
+            return Err("the fake session refused a source".to_owned());
+        }
         if self.alive() {
             Ok(self.source.clone())
         } else {

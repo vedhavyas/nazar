@@ -1172,7 +1172,10 @@ impl Supervisor {
                         }
                     },
                     Err(reason) => {
+                        // The session could not serve a source: end it, so
+                        // its pump and camera call do not run unreferenced.
                         tracing::info!(stream = %name, %reason, "the fast-lane session ended; using the cloud path");
+                        session.shutdown();
                         self.armed.write().await.remove(&device.device_id);
                     }
                 },
