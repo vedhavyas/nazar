@@ -17,9 +17,10 @@ pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::Ep
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ws::Message;
 use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -41,9 +42,13 @@ pub struct FakeApi {
     /// a source and reads no `remote_addr`, as a go2rtc whose ffmpeg cannot
     /// reach the camera. Empty means every held producer is connected.
     unconnected: Arc<Mutex<HashSet<String>>>,
-    /// Streams whose producer has been started: go2rtc spawns one on the
-    /// first playlist request (a touch or a viewer).
-    touched: Arc<Mutex<HashSet<String>>>,
+    /// The live consumers of `/api/stream.mpegts`, by stream: count and
+    /// when the first one attached. A producer is up only while a consumer
+    /// is, which is the whole point of the endpoint.
+    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    /// Per-stream delay between a consumer attaching and the producer
+    /// connecting, for tests that need a slow source.
+    connect_after: Arc<Mutex<HashMap<String, Duration>>>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
@@ -62,11 +67,12 @@ impl FakeApi {
         let streams_error = Arc::new(AtomicBool::new(false));
         let producers = Arc::new(AtomicBool::new(true));
         let unconnected = Arc::new(Mutex::new(HashSet::new()));
-        let touched = Arc::new(Mutex::new(HashSet::new()));
+        let holds = Arc::new(Mutex::new(HashMap::new()));
+        let connect_after = Arc::new(Mutex::new(HashMap::new()));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
         let ops = Arc::new(Mutex::new(Vec::new()));
-        let app = hls_routes(&touched).merge(streams_routes(
+        let app = hls_routes(&holds).merge(streams_routes(
             &puts,
             &deletes,
             &Knobs {
@@ -75,7 +81,8 @@ impl FakeApi {
                 streams_error: &streams_error,
                 producers: &producers,
                 unconnected: &unconnected,
-                touched: &touched,
+                holds: &holds,
+                connect_after: &connect_after,
                 delete_delay: &delete_delay,
                 ops: &ops,
             },
@@ -97,7 +104,8 @@ impl FakeApi {
             streams_error,
             producers,
             unconnected,
-            touched,
+            holds,
+            connect_after,
             viewers,
             delete_delay,
             ops,
@@ -126,6 +134,15 @@ impl FakeApi {
     /// answered does.
     pub fn connect_producer(&self, name: &str) {
         self.unconnected.lock().unwrap().remove(name);
+    }
+
+    /// The stream's producer connects `delay` after its first consumer
+    /// attaches, as a slow camera's push does.
+    pub fn connect_after(&self, name: &str, delay: Duration) {
+        self.connect_after
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), delay);
     }
 
     /// Make every DELETE take `delay` to answer, as a go2rtc under load
@@ -179,7 +196,8 @@ struct Knobs<'a> {
     streams_error: &'a Arc<AtomicBool>,
     producers: &'a Arc<AtomicBool>,
     unconnected: &'a Arc<Mutex<HashSet<String>>>,
-    touched: &'a Arc<Mutex<HashSet<String>>>,
+    holds: &'a Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    connect_after: &'a Arc<Mutex<HashMap<String, Duration>>>,
     delete_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
 }
@@ -273,36 +291,46 @@ fn streams_methods(
                 }
             }
         });
-    let list_streams = list_streams_handler(
-        Arc::clone(puts),
-        Arc::clone(knobs.streams_visible),
-        Arc::clone(viewers),
-        Arc::clone(knobs.streams_error),
-        Arc::clone(knobs.producers),
-        Arc::clone(knobs.unconnected),
-        Arc::clone(knobs.touched),
-    );
+    let list_streams = list_streams_handler(StreamsAnswer {
+        recorded: Arc::clone(puts),
+        visible: Arc::clone(knobs.streams_visible),
+        viewers: Arc::clone(viewers),
+        error: Arc::clone(knobs.streams_error),
+        running: Arc::clone(knobs.producers),
+        unconnected: Arc::clone(knobs.unconnected),
+        holds: Arc::clone(knobs.holds),
+        connect_after: Arc::clone(knobs.connect_after),
+    });
     put_stream.delete(drop_stream).get(list_streams)
 }
 
-/// The `GET /api/streams` answer, as go2rtc 1.9.14 shapes it.
-fn list_streams_handler(
+/// Everything the `GET /api/streams` answer reads; bundled, because eight
+/// handles as eight arguments is a clippy verdict.
+#[derive(Clone)]
+struct StreamsAnswer {
     recorded: Arc<Mutex<Vec<(String, String)>>>,
     visible: Arc<AtomicBool>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
     error: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     unconnected: Arc<Mutex<HashSet<String>>>,
-    touched: Arc<Mutex<HashSet<String>>>,
-) -> axum::routing::MethodRouter {
+    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    connect_after: Arc<Mutex<HashMap<String, Duration>>>,
+}
+
+/// The `GET /api/streams` answer, as go2rtc 1.9.14 shapes it.
+fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
     get(move || {
-        let recorded = Arc::clone(&recorded);
-        let visible = Arc::clone(&visible);
-        let viewers = Arc::clone(&viewers);
-        let error = Arc::clone(&error);
-        let running = Arc::clone(&running);
-        let unconnected = Arc::clone(&unconnected);
-        let touched = Arc::clone(&touched);
+        let StreamsAnswer {
+            recorded,
+            visible,
+            viewers,
+            error,
+            running,
+            unconnected,
+            holds,
+            connect_after,
+        } = state.clone();
         async move {
             // An unreadable status: what a go2rtc in trouble answers.
             if error.load(Ordering::SeqCst) {
@@ -316,25 +344,35 @@ fn list_streams_handler(
                 return "{}".to_owned();
             }
             let viewers = viewers.lock().unwrap().clone();
+            let holds = holds.lock().unwrap().clone();
+            let connect_after = connect_after.lock().unwrap().clone();
             // go2rtc materializes a producer as soon as the source is set.
             let mut streams = serde_json::Map::new();
             for (name, source) in recorded {
                 let watching = viewers.get(&name).copied().unwrap_or(0);
-                // Measured shape: no viewers is `null`.
-                let consumers = (watching > 0).then(|| {
-                    (0..watching)
+                let (holding, since) = holds
+                    .get(&name)
+                    .map_or((0, None), |(count, at)| (*count, Some(*at)));
+                // The mpegts connections are consumers, as go2rtc counts
+                // them: present for exactly as long as they are held.
+                let total = watching + holding;
+                // Measured shape: no consumers is `null`.
+                let consumers = (total > 0).then(|| {
+                    (0..total)
                         .map(|_| serde_json::json!({ "id": "viewer" }))
                         .collect::<Vec<_>>()
                 });
-                let held = running.load(Ordering::SeqCst);
-                // Connects once started AND the source answers; the
-                // deny-list is the camera turning the ffmpeg away.
-                let connected = touched.lock().unwrap().contains(&name)
+                let running_now = running.load(Ordering::SeqCst);
+                // Connects once a consumer is holding it AND the source
+                // answers; the deny-list is the camera turning the ffmpeg
+                // away, and `connect_after` is a slow push.
+                let delay = connect_after.get(&name).copied().unwrap_or_default();
+                let connected = since.is_some_and(|at| at.elapsed() >= delay)
                     && !unconnected.lock().unwrap().contains(&name);
                 streams.insert(
                     name,
                     serde_json::json!({
-                        "producers": if held {
+                        "producers": if running_now {
                             // Connected carries a peer address; waiting does not.
                             let mut producer = serde_json::json!({ "url": source });
                             if connected {
@@ -353,29 +391,73 @@ fn list_streams_handler(
     })
 }
 
-/// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them.
-fn hls_routes(touched: &Arc<Mutex<HashSet<String>>>) -> Router {
-    let touched = Arc::clone(touched);
+/// A live consumer on the fake's mpegts stream: counted while it lives,
+/// released when the connection drops - the moment go2rtc stops a producer
+/// whose last consumer has left.
+struct HoldGuard {
+    name: String,
+    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+}
+
+impl HoldGuard {
+    fn attach(&self) {
+        let mut holds = self.holds.lock().unwrap();
+        holds
+            .entry(self.name.clone())
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, Instant::now()));
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        let mut holds = self.holds.lock().unwrap();
+        if let Some((count, _)) = holds.get_mut(&self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                holds.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them, plus the
+/// mpegts endpoint a standing consumer rides.
+fn hls_routes(holds: &Arc<Mutex<HashMap<String, (usize, Instant)>>>) -> Router {
+    let holds = Arc::clone(holds);
     Router::new()
         .route(
             "/api/stream.m3u8",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                // go2rtc's master playlist: the media playlist is a part.
+                match params.get("src") {
+                    Some(_) => (
+                        StatusCode::OK,
+                        "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
+                    ),
+                    None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
+                }
+            }),
+        )
+        .route(
+            "/api/stream.mpegts",
             get(move |Query(params): Query<HashMap<String, String>>| {
-                let touched = Arc::clone(&touched);
+                let holds = Arc::clone(&holds);
                 async move {
-                    // go2rtc's master playlist: the media playlist is a
-                    // part - and the request is what spawns the stream's
-                    // producer (measured against go2rtc 1.9.14), so the
-                    // fake starts one here too.
-                    match params.get("src") {
-                        Some(src) => {
-                            touched.lock().unwrap().insert(src.clone());
-                            (
-                                StatusCode::OK,
-                                "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
-                            )
-                        }
-                        None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
-                    }
+                    let Some(src) = params.get("src").cloned() else {
+                        return (StatusCode::NOT_FOUND, Body::empty());
+                    };
+                    let guard = HoldGuard { name: src, holds };
+                    guard.attach();
+                    // An endless body, holding the guard: the stream lives
+                    // until the client's connection drops.
+                    let endless = futures_util::stream::poll_fn(move |_| {
+                        let _ = &guard;
+                        std::task::Poll::<
+                            Option<Result<Vec<u8>, std::convert::Infallible>>,
+                        >::Pending
+                    });
+                    (StatusCode::OK, Body::from_stream(endless))
                 }
             }),
         )
