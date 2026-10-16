@@ -52,6 +52,24 @@ fn store_in(dir: &std::path::Path) -> Arc<NotificationStore> {
     ))
 }
 
+/// The preserved copies of `stem`'s log, under whatever names `preserve`
+/// gave them.
+fn backups(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("the scratch dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(&format!("{stem}.")) && name.ends_with(".bak")
+                })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 fn motion(device: &str) -> UnitEvent {
     UnitEvent::Motion {
         device_id: device.to_owned(),
@@ -241,10 +259,39 @@ fn an_unreadable_bell_log_is_kept_aside_not_overwritten() {
 
     let store = Arc::new(NotificationStore::open(path.clone(), COALESCE));
     assert!(store.list().is_empty(), "an unreadable log starts empty");
+    let kept = backups(&dir, "notifications");
+    assert_eq!(kept.len(), 1, "the original is kept aside: {kept:?}");
     assert_eq!(
-        std::fs::read_to_string(dir.join("notifications.bak")).expect("the original is kept"),
+        std::fs::read_to_string(&kept[0]).expect("the original is kept aside"),
         "{ not json at all",
         "the unreadable bytes survive the next save"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bell_log_that_cannot_be_read_is_kept_aside_too() {
+    let dir = temp_dir("notify-unreadable");
+    let path = dir.join("notifications.json");
+    // A directory where the ledger should be: reading it fails, and the
+    // path is not missing - the next save would overwrite whatever is
+    // there.
+    std::fs::create_dir(&path).expect("a directory in the log's place");
+    std::fs::write(path.join("evidence.txt"), "what was here").expect("evidence inside");
+
+    let store = Arc::new(NotificationStore::open(path.clone(), COALESCE));
+    assert!(store.list().is_empty(), "an unreadable log starts empty");
+
+    let kept = backups(&dir, "notifications");
+    assert_eq!(
+        kept.len(),
+        1,
+        "the unreadable path is kept aside: {kept:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(kept[0].join("evidence.txt")).expect("the kept evidence"),
+        "what was here",
+        "with what was in it"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
