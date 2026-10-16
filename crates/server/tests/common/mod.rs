@@ -41,6 +41,9 @@ pub struct FakeApi {
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
+    /// Every streams-admin operation in arrival order, `put:<name>` and
+    /// `delete:<name>`: the order tests otherwise cannot see.
+    ops: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeApi {
@@ -53,6 +56,7 @@ impl FakeApi {
         let producers = Arc::new(AtomicBool::new(true));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
+        let ops = Arc::new(Mutex::new(Vec::new()));
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
@@ -62,6 +66,7 @@ impl FakeApi {
                 streams_error: &streams_error,
                 producers: &producers,
                 delete_delay: &delete_delay,
+                ops: &ops,
             },
             &viewers,
         ));
@@ -82,7 +87,14 @@ impl FakeApi {
             producers,
             viewers,
             delete_delay,
+            ops,
         }
+    }
+
+    /// The streams-admin operations received so far, in arrival order, as
+    /// `put:<name>` and `delete:<name>`.
+    pub fn ops(&self) -> Vec<String> {
+        self.ops.lock().unwrap().clone()
     }
 
     /// Report every stream without a producer, as a go2rtc whose sources
@@ -142,6 +154,7 @@ struct Knobs<'a> {
     streams_error: &'a Arc<AtomicBool>,
     producers: &'a Arc<AtomicBool>,
     delete_delay: &'a Arc<AtomicU64>,
+    ops: &'a Arc<Mutex<Vec<String>>>,
 }
 
 /// The streams admin surface, as go2rtc 1.9.14 answers it.
@@ -186,14 +199,18 @@ fn streams_methods(
 ) -> axum::routing::MethodRouter {
     let recorded = Arc::clone(puts);
     let status = Arc::clone(knobs.put_status);
+    let ops = Arc::clone(knobs.ops);
     let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
         let recorded = Arc::clone(&recorded);
         let status = Arc::clone(&status);
+        let ops = Arc::clone(&ops);
         async move {
+            let name = params.get("name").cloned().unwrap_or_default();
             recorded.lock().unwrap().push((
-                params.get("name").cloned().unwrap_or_default(),
+                name.clone(),
                 params.get("src").cloned().unwrap_or_default(),
             ));
+            ops.lock().unwrap().push(format!("put:{name}"));
             let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
             // A rejected PUT quotes the source back, as go2rtc's own
             // refusals do - token and all.
@@ -210,19 +227,23 @@ fn streams_methods(
     });
     let dropped = Arc::clone(deletes);
     let delay = Arc::clone(knobs.delete_delay);
+    let ops = Arc::clone(knobs.ops);
     let drop_stream =
         axum::routing::delete(move |Query(params): Query<HashMap<String, String>>| {
             let dropped = Arc::clone(&dropped);
             let delay = Arc::clone(&delay);
+            let ops = Arc::clone(&ops);
             async move {
+                // Recorded on arrival, not on answer: a slow DELETE is
+                // still an operation that happened when it was sent, and
+                // the op order is what some tests read.
+                let src = params.get("src").cloned().unwrap_or_default();
+                dropped.lock().unwrap().push(src.clone());
+                ops.lock().unwrap().push(format!("delete:{src}"));
                 let millis = delay.load(Ordering::SeqCst);
                 if millis > 0 {
                     tokio::time::sleep(Duration::from_millis(millis)).await;
                 }
-                dropped
-                    .lock()
-                    .unwrap()
-                    .push(params.get("src").cloned().unwrap_or_default());
             }
         });
     let recorded = Arc::clone(puts);
