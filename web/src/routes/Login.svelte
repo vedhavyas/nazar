@@ -108,7 +108,9 @@
         </button>
       {/if}
       {#if step !== 'phone'}
-        <button class="btn" type="button" onclick={changeNumber}>Change number</button>
+        <button class="btn" type="button" disabled={busy} onclick={changeNumber}>
+          Change number
+        </button>
       {/if}
     </p>
     {#if error}
