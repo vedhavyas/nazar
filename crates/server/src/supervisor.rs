@@ -984,6 +984,15 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_default_window_lands_before_the_idle_teardown() {
+        let pacing = Pacing::default();
+        assert!(
+            pacing.connect_window < pacing.stream_idle,
+            "the degradation must surface while a stream nobody asks for is still alive"
+        );
+    }
+
     #[tokio::test]
     async fn a_teardown_stands_down_for_a_request_that_landed_meanwhile() {
         let supervisor = quiet_supervisor();

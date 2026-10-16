@@ -866,6 +866,55 @@ async fn a_producer_that_never_connects_degrades_after_the_window() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// Past the window the reason sticks across further attempts: an attempt
+/// that lands unconnected must not return the stream to waking, which
+/// would take the UI's Try again away.
+#[tokio::test]
+async fn a_degraded_stream_stays_degraded_across_attempts() {
+    let h = harness(Pacing {
+        connect_window: Duration::from_millis(300),
+        ..pacing(Duration::from_millis(200))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two", "three"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "the producer has not connected"
+        )
+    })
+    .await;
+    assert!(degraded, "the window passes and the reason surfaces");
+
+    // Sample across a further full attempt: the state must hold.
+    let before = h.go2rtc.puts().len();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_ne!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Waking,
+            "a later attempt must not return the stream to waking"
+        );
+    }
+    assert!(
+        h.go2rtc.puts().len() > before,
+        "an attempt ran inside the sample window"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// A mint that fails mid-starvation is another way the picture is dead,
 /// not a new window: the starvation clock keeps running, so the reason
 /// lands on its own deadline and the Try again affordance does not

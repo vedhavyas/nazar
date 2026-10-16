@@ -418,6 +418,33 @@ async fn an_idle_stream_does_not_mint_once_more_before_dying() {
     );
 }
 
+/// Everything the stream owned goes with it: a stream re-registered after
+/// its teardown gets its own full idle window again, not a shorter one
+/// inherited from the retired loop.
+#[tokio::test]
+async fn a_re_registered_stream_is_retired_again() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream wakes");
+    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
+    assert!(retired, "the idle stream is retired");
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("a fresh stream wakes");
+    let again = common::eventually(|| async { h.go2rtc.deletes().len() >= 2 }).await;
+    assert!(
+        again,
+        "and the re-registered stream is retired on its own window: {:?}",
+        h.go2rtc.deletes()
+    );
+}
+
 /// The teardown holds the state lock across its deletes on purpose (a
 /// request landing then must spawn fresh, not be told Live about a stream
 /// being deleted under it) - and every await under it is bounded, so a
