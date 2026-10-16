@@ -1,15 +1,16 @@
 name: Release shells
 
-# The desktop shell's release artifacts: the signed update tarball, its
-# signature, and latest.json - published to vedhavyas/nazar-releases, whose
-# releases are public so an installed app can reach them from anywhere.
+# The shells' release artifacts, built on a v* tag: the signed desktop
+# tarball (built and signed on macOS), the release-signed arm64 APK (built
+# on Linux), and the latest.json that names both - published to
+# vedhavyas/nazar-releases, whose releases are public so an installed app
+# can reach them from anywhere.
 #
 # A tag WITHOUT a suffix publishes; a `-test` tag is a dry run that only
 # uploads workflow artifacts, so the tag space can never collide with a
 # real version and no half-signed release can appear. A tag that does not
-# name the shell crate's own version is the server's cut, and the desktop
-# half skips rather than fail its signature check. The Android half joins
-# these steps when that shell ships.
+# name the shell crate's own version is the server's cut, and the shell
+# jobs skip rather than fail their version checks.
 
 on:
   push:
@@ -34,11 +35,11 @@ jobs:
             echo "shell=true" >> "$GITHUB_OUTPUT"
           else
             echo "shell=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${GITHUB_REF_NAME} is not the shell's version ($shell_version); the desktop release is skipped"
+            echo "::notice::${GITHUB_REF_NAME} is not the shell's version ($shell_version); the shell release is skipped"
           fi
 
   desktop:
-    name: desktop bundle, signature and manifest
+    name: desktop bundle and signature
     needs: shell
     if: needs.shell.outputs.shell == 'true'
     runs-on: macos-latest
@@ -72,17 +73,118 @@ jobs:
         run: npm --prefix web run tauri -- build --bundles app --ci -- --locked
       - name: The signature is from the pinned key, for this version
         run: python3 scripts/check_updater_signature.py . ${{ steps.version.outputs.version }}
-      - name: The manifest names what was built
-        run: python3 scripts/update_manifest.py . ${{ steps.version.outputs.version }}
-      - name: Keep the dry run's artifacts
-        if: endsWith(github.ref_name, '-test')
+      - name: Keep the app for the release job
         uses: actions/upload-artifact@v4
         with:
-          name: nazar-desktop-${{ github.ref_name }}
+          name: nazar-desktop
+          if-no-files-found: error
           path: |
             web/src-tauri/target/release/bundle/macos/nazar.app.tar.gz
             web/src-tauri/target/release/bundle/macos/nazar.app.tar.gz.sig
-            web/src-tauri/target/release/bundle/latest.json
+
+  android:
+    name: android release APK
+    needs: shell
+    if: needs.shell.outputs.shell == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web/src-tauri
+      - name: Version from the tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version%-test}" >> "$GITHUB_OUTPUT"
+      - name: The Android toolchain
+        run: |
+          # The runner ships the SDK and an NDK; the CLI honours NDK_HOME
+          # first, and the arm64 target is the only ABI the APK carries.
+          rustup target add aarch64-linux-android
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: The release keystore, from secrets
+        env:
+          KEYSTORE: ${{ secrets.NAZAR_ANDROID_KEYSTORE }}
+          STORE_PASSWORD: ${{ secrets.NAZAR_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.NAZAR_ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p "$HOME/.android"
+          printf '%s' "$KEYSTORE" | base64 --decode > "$HOME/.android/nazar-release.keystore"
+          chmod 600 "$HOME/.android/nazar-release.keystore"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=nazar\nkeyPassword=%s\n' \
+            "$HOME/.android/nazar-release.keystore" "$STORE_PASSWORD" "$KEY_PASSWORD" \
+            > web/src-tauri/gen/android/app/key.properties
+          chmod 600 web/src-tauri/gen/android/app/key.properties
+      - run: npm --prefix web ci
+      - name: Build the release APK
+        run: npm --prefix web run tauri -- android build --apk --ci --target aarch64
+      - name: The APK is this version, arm64, signed by the recorded key
+        run: |
+          set -euo pipefail
+          built=web/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+          tools=$(dirname "$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -1)")
+          got=$("$tools/aapt2" dump badging "$built" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p")
+          [ "$got" = "${{ steps.version.outputs.version }}" ] || {
+            echo "[ERROR] the built APK is version $got, expected ${{ steps.version.outputs.version }}"; exit 1; }
+          abi=$("$tools/aapt2" dump badging "$built" | sed -n 's/^native-code: //p' | tr -d "'")
+          [ "$abi" = "arm64-v8a" ] || { echo "[ERROR] native code '$abi', expected arm64-v8a"; exit 1; }
+          signed=$("$tools/apksigner" verify --print-certs "$built" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z')
+          want=$(tr -d '[:space:]' < web/src-tauri/gen/android/release-keystore.sha256)
+          [ "$signed" = "$want" ] || {
+            echo "[ERROR] the APK signer $signed is not the recorded release key $want"; exit 1; }
+          echo "[OK] the APK is ${got}, arm64-v8a, signed by the recorded key"
+      - name: Stage it with the other artifacts' names
+        run: |
+          out=web/src-tauri/target/release/bundle/android
+          mkdir -p "$out"
+          cp web/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk \
+            "$out/nazar-${{ steps.version.outputs.version }}-arm64.apk"
+      - name: Keep the APK for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: nazar-android
+          if-no-files-found: error
+          path: web/src-tauri/target/release/bundle/android/nazar-${{ steps.version.outputs.version }}-arm64.apk
+
+  release:
+    name: manifest and publish
+    needs: [shell, desktop, android]
+    if: needs.shell.outputs.shell == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Version from the tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version%-test}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: nazar-desktop
+          path: web/src-tauri/target/release/bundle/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: nazar-android
+          path: web/src-tauri/target/release/bundle/android
+      - name: The manifest names both halves
+        run: python3 scripts/update_manifest.py . ${{ steps.version.outputs.version }}
+      - name: Keep the dry run's manifest
+        if: endsWith(github.ref_name, '-test')
+        uses: actions/upload-artifact@v4
+        with:
+          name: nazar-manifest-${{ github.ref_name }}
+          if-no-files-found: error
+          path: web/src-tauri/target/release/bundle/latest.json
       - name: Publish the release
         if: ${{ !endsWith(github.ref_name, '-test') }}
         env:
@@ -97,4 +199,33 @@ jobs:
             --generate-notes \
             "$bundle/macos/nazar.app.tar.gz" \
             "$bundle/macos/nazar.app.tar.gz.sig" \
+            "$bundle/android/nazar-${{ steps.version.outputs.version }}-arm64.apk" \
             "$bundle/latest.json"
+      - name: The published URLs answer, and latest.json names this release
+        if: ${{ !endsWith(github.ref_name, '-test') }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          release="https://github.com/vedhavyas/nazar-releases/releases/download/$GITHUB_REF_NAME"
+          for asset in latest.json nazar.app.tar.gz nazar.app.tar.gz.sig "nazar-${VERSION}-arm64.apk"; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L "$release/$asset")
+            [ "$code" = "200" ] || { echo "[ERROR] $release/$asset answered $code"; exit 1; }
+            echo "[OK] $asset answers 200"
+          done
+          curl -fsSL "https://github.com/vedhavyas/nazar-releases/releases/latest/download/latest.json" -o /tmp/latest.json
+          python3 - <<'PY'
+          import json
+          import os
+
+          manifest = json.load(open("/tmp/latest.json"))
+          version = os.environ["VERSION"]
+          assert manifest["version"] == version, manifest["version"]
+          urls = [
+              manifest["platforms"]["darwin-aarch64"]["url"],
+              manifest["android"]["url"],
+          ]
+          for url in urls:
+              assert f"/download/v{version}/" in url, url
+          print(f"[OK] latest.json is {version} and names this release for both shells")
+          PY

@@ -24,10 +24,12 @@ class UpdateManifestTest(unittest.TestCase):
         self.root = Path(scratch.name)
         self.bundle = self.root / "web/src-tauri/target/release/bundle"
         (self.bundle / "macos").mkdir(parents=True)
+        (self.bundle / "android").mkdir(parents=True)
         # Stand-ins: the contents only have to exist, because what the test
         # pins is which file each name resolves to.
         (self.bundle / "macos/nazar.app.tar.gz").write_bytes(b"the app tarball")
         (self.bundle / "macos/nazar.app.tar.gz.sig").write_text(SIGNATURE)
+        (self.bundle / "android/nazar-9.9.9-arm64.apk").write_bytes(b"the apk")
 
     def run_generator(self) -> "subprocess.CompletedProcess[str]":
         return subprocess.run(
@@ -70,6 +72,27 @@ class UpdateManifestTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("nazar.app.tar.gz.sig", result.stderr)
+        self.assertFalse((self.bundle / "latest.json").exists())
+
+    def test_writes_the_android_block(self) -> None:
+        result = self.run_generator()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        # Beside `platforms`, not inside it: a platforms entry must carry a
+        # signature, and the APK has none.
+        self.assertEqual(
+            self.manifest()["android"]["url"],
+            f"{RELEASE}/nazar-9.9.9-arm64.apk",
+        )
+        self.assertIn("android", result.stdout)
+
+    def test_refuses_a_missing_apk_by_name(self) -> None:
+        (self.bundle / "android/nazar-9.9.9-arm64.apk").unlink()
+
+        result = self.run_generator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nazar-9.9.9-arm64.apk", result.stderr)
         self.assertFalse((self.bundle / "latest.json").exists())
 
 

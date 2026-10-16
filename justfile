@@ -247,3 +247,78 @@ smoke-m2:
     @echo "6. open a camera: drag the picture to pan (watch the request rate stay"
     @echo "   at or under four a second), flip privacy and see the shadow's answer,"
     @echo "   switch quality, press Listen for sound, and take a snapshot"
+
+# Cut a release: bump both manifests (the workspace and the shell crate, so
+# the tag names the version every check reads back), commit, tag, push. CI
+# then builds, signs and publishes the desktop tarball, the APK and
+# latest.json; `just publish <version>` verifies what landed once it has.
+# nazar's cuts ride branches - main only ever moves deliberately - so the
+# tag goes up with whatever branch HEAD is on.
+release version:
+    @if ! cargo set-version --help >/dev/null 2>&1; then \
+        echo "[ERROR] cargo set-version not available - run: cargo install cargo-edit" >&2; \
+        exit 1; \
+    fi
+    @if [ -n "$(git status --porcelain)" ]; then \
+        echo "[ERROR] working tree dirty - commit or stash before releasing" >&2; \
+        exit 1; \
+    fi
+    @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
+        echo "[ERROR] tag v{{version}} already exists" >&2; \
+        exit 1; \
+    fi
+    cargo set-version --workspace {{version}}
+    cargo set-version --manifest-path web/src-tauri/Cargo.toml {{version}}
+    cargo update --workspace
+    git add Cargo.toml Cargo.lock web/src-tauri/Cargo.toml web/src-tauri/Cargo.lock
+    git commit -m "release v{{version}}"
+    # `-m` so the tag carries a message: tag.gpgSign is on, and signing
+    # needs one.
+    git tag -m "v{{version}}" "v{{version}}"
+    git push --follow-tags origin HEAD
+    @echo
+    @echo "[OK] released v{{version}}: both manifests bumped, tagged and pushed"
+    @echo "     CI is building and publishing now; verify with 'just publish {{version}}' once it lands"
+
+# What a release owes after CI has published it: every asset answers on its
+# own URL, and latest.json names this release for both shells. Run it after
+# the release workflow turns green - before that, a 404 is CI still building.
+publish version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if ! git ls-remote --exit-code --tags origin "v{{version}}" >/dev/null 2>&1; then
+        echo "[ERROR] tag v{{version}} is not on origin - push it first" >&2
+        exit 1
+    fi
+
+    release="https://github.com/vedhavyas/nazar-releases/releases/download/v{{version}}"
+    for asset in latest.json nazar.app.tar.gz nazar.app.tar.gz.sig "nazar-{{version}}-arm64.apk"; do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' -L "$release/$asset")
+        [ "$code" = "200" ] || {
+            echo "[ERROR] $release/$asset answered $code - is the release still building?" >&2
+            exit 1
+        }
+        echo "[OK] $asset answers 200"
+    done
+
+    tmp=$(mktemp)
+    curl -fsSL "$release/latest.json" -o "$tmp"
+    python3 - "$tmp" "{{version}}" <<'PY'
+    import json
+    import sys
+
+    manifest = json.load(open(sys.argv[1]))
+    version = sys.argv[2]
+    if manifest["version"] != version:
+        raise SystemExit(f"[ERROR] latest.json is {manifest['version']}, expected {version}")
+    urls = [
+        manifest["platforms"]["darwin-aarch64"]["url"],
+        manifest["android"]["url"],
+    ]
+    for url in urls:
+        if f"/download/v{version}/" not in url:
+            raise SystemExit(f"[ERROR] latest.json names {url}, not this release")
+    print(f"[OK] latest.json is {version} and names this release for both shells")
+    PY
+    rm -f "$tmp"
