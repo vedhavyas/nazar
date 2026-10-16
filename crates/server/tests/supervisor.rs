@@ -49,6 +49,7 @@ fn pacing(remint: Duration) -> Pacing {
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
         warm_idle: Duration::from_secs(60),
+        arm_timeout: Duration::from_secs(15),
     }
 }
 
@@ -322,6 +323,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
         warm_idle: Duration::from_secs(60),
+        arm_timeout: Duration::from_secs(15),
     })
     .await;
     mount_discovery(&h.qubo).await;

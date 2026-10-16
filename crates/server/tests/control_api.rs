@@ -74,6 +74,7 @@ async fn harness() -> Harness {
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
             warm_idle: Duration::from_secs(60),
+            arm_timeout: Duration::from_secs(15),
         },
     );
     let mut state = AppState::new(

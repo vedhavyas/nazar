@@ -15,6 +15,10 @@ fn config_in(dir: &std::path::Path) -> Config {
         webrtc_candidates: None,
         aqi_alert_at: server::notify::AQI_ALERT_AT,
         episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     }
 }
 

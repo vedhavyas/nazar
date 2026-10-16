@@ -15,7 +15,9 @@ pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::Ep
 }
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,123 @@ use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, put};
+use serde_json::Value;
 use tokio::net::TcpListener;
+
+use qubo::Device;
+use server::supervisor::{Lane, LaneSession};
+
+/// The fast lane as the tests drive it: the arm outcome is scripted, arms
+/// are counted, and the session records the control envelopes it is handed.
+pub struct FakeLane {
+    session: Arc<FakeSession>,
+    arms: Arc<AtomicUsize>,
+    outcome: Arc<Mutex<FakeOutcome>>,
+}
+
+#[derive(Clone)]
+enum FakeOutcome {
+    Ok,
+    Fail(&'static str),
+    Hang(Duration),
+}
+
+impl FakeLane {
+    fn with(outcome: FakeOutcome) -> Self {
+        Self {
+            session: Arc::new(FakeSession {
+                source: "ffmpeg:/tmp/nazar-fake.sdp#input=nazar".to_owned(),
+                controls: Mutex::new(Vec::new()),
+                alive: AtomicBool::new(true),
+            }),
+            arms: Arc::new(AtomicUsize::new(0)),
+            outcome: Arc::new(Mutex::new(outcome)),
+        }
+    }
+
+    /// An engine that arms instantly.
+    pub fn new() -> Self {
+        Self::with(FakeOutcome::Ok)
+    }
+
+    /// An engine whose arm always fails with `reason`.
+    pub fn failing(reason: &'static str) -> Self {
+        Self::with(FakeOutcome::Fail(reason))
+    }
+
+    /// An engine whose arm takes `delay` (a caller's bound has to cut it).
+    pub fn hanging(delay: Duration) -> Self {
+        Self::with(FakeOutcome::Hang(delay))
+    }
+
+    pub fn arms(&self) -> usize {
+        self.arms.load(Ordering::SeqCst)
+    }
+
+    pub fn session(&self) -> Arc<FakeSession> {
+        Arc::clone(&self.session)
+    }
+}
+
+/// The session a [`FakeLane`] hands out.
+pub struct FakeSession {
+    pub source: String,
+    pub controls: Mutex<Vec<Value>>,
+    pub alive: AtomicBool,
+}
+
+impl FakeSession {
+    pub fn controls(&self) -> Vec<Value> {
+        self.controls.lock().unwrap().clone()
+    }
+}
+
+impl Lane for FakeLane {
+    fn arm(
+        &self,
+        _device: Device,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn LaneSession>, String>> + Send>> {
+        self.arms.fetch_add(1, Ordering::SeqCst);
+        // A fresh arm hands back a live session, whatever a previous one's
+        // fate was: the real engine never returns a dead one.
+        self.session.alive.store(true, Ordering::SeqCst);
+        let outcome = self.outcome.lock().unwrap().clone();
+        let session: Arc<dyn LaneSession> = self.session.clone();
+        Box::pin(async move {
+            match outcome {
+                FakeOutcome::Ok => Ok(session),
+                FakeOutcome::Fail(reason) => Err(reason.to_owned()),
+                FakeOutcome::Hang(delay) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(session)
+                }
+            }
+        })
+    }
+}
+
+impl LaneSession for FakeSession {
+    fn source_for(&self, _name: &str) -> Result<String, String> {
+        if self.alive() {
+            Ok(self.source.clone())
+        } else {
+            Err("the session ended".to_owned())
+        }
+    }
+
+    fn control(&self, envelope: Value) -> Result<(), String> {
+        self.controls.lock().unwrap().push(envelope);
+        Ok(())
+    }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn shutdown(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A fake go2rtc API: records the stream PUTs and DELETEs it receives and
 /// answers GETs with the shape measured from go2rtc 1.9.14.

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod episodes;
 pub mod events;
+pub mod fast_lane;
 pub mod go2rtc;
 pub mod http;
 pub mod motion;

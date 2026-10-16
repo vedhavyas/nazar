@@ -157,6 +157,10 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         webrtc_candidates: Some("198.51.100.1:8555".to_owned()),
         aqi_alert_at: server::notify::AQI_ALERT_AT,
         episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -222,6 +226,10 @@ async fn no_webrtc_section_without_a_configured_candidate() {
         webrtc_candidates: None,
         aqi_alert_at: server::notify::AQI_ALERT_AT,
         episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
