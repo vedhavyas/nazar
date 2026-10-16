@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use qubo::ServiceProvider;
 
@@ -36,6 +37,10 @@ pub struct Config {
     /// The `Login-Device-Name` header the SDK's stream client sends - the
     /// phone's unit device name (`NAZAR_P2P_LOGIN_DEVICE_NAME`).
     pub p2p_login_device_name: String,
+    /// The fast-lane arm bound in seconds (`NAZAR_P2P_ARM_TIMEOUT`); the
+    /// default 15s is a product bound - the live wiring round raises it when
+    /// a slow genuine-login answer needs the room.
+    pub p2p_arm_timeout: Duration,
 }
 
 impl Config {
@@ -69,6 +74,9 @@ impl Config {
             p2p_camera_controller: var("NAZAR_P2P_CAMERA_CONTROLLER"),
             p2p_login_device_name: var("NAZAR_P2P_LOGIN_DEVICE_NAME")
                 .unwrap_or_else(|| "MobileApp_<mobile-id>".to_owned()),
+            p2p_arm_timeout: var("NAZAR_P2P_ARM_TIMEOUT")
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .map_or_else(|| Duration::from_secs(15), Duration::from_secs),
         }
     }
 
