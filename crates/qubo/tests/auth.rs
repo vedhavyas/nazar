@@ -10,6 +10,9 @@
 //! (`message` as an array) is live-captured. What these tests pin is that
 //! whatever code and message the gateway sends survive into `QuboError`.
 //!
+//! `otp_verify_two.json` is the verify shape for a number that maps to two
+//! accounts (the response is a per-number LIST); its values are synthesized.
+//!
 //! `gm_login.json` carries the GM v4 login's response keys
 //! (docs/qubo-google-login.md §3; live-verified 2026-10-14 that the route
 //! returns a refreshToken), and `refresh.json` the refresh response's
@@ -85,7 +88,7 @@ async fn request_otp_posts_the_phone_for_a_code() {
 }
 
 #[tokio::test]
-async fn verify_otp_sends_the_pending_login_session_and_returns_the_session() {
+async fn verify_otp_sends_the_pending_login_session_and_returns_the_profiles() {
     let server = MockServer::start().await;
     mount_json(
         &server,
@@ -106,21 +109,28 @@ async fn verify_otp_sends_the_pending_login_session_and_returns_the_session() {
     request_otp(&client, "9876543210")
         .await
         .expect("request ok");
-    let session = verify_otp(&client, "9876543210", "123456")
+    let profiles = verify_otp(&client, "9876543210", "123456")
         .await
         .expect("the code verifies");
 
-    let profiles = fixture(include_str!("fixtures/otp_verify.json"));
-    let profile = &profiles[0];
+    let payload = fixture(include_str!("fixtures/otp_verify.json"));
+    let profile = &payload[0];
+    assert_eq!(profiles.len(), 1, "the number maps to one account");
+    let got = &profiles[0];
     assert_eq!(
-        session.access_token, profile["accessToken"],
+        got.access_token, profile["accessToken"],
         "access token comes from the profile"
     );
-    assert_eq!(session.uuid, profile["uuid"], "uuid comes from the profile");
+    assert_eq!(got.uuid, profile["uuid"], "uuid comes from the profile");
     assert_eq!(
-        session.email.as_deref(),
+        got.email.as_deref(),
         profile["email"].as_str(),
         "email comes from the profile"
+    );
+    assert_eq!(
+        got.name.as_deref(),
+        profile["name"].as_str(),
+        "name comes from the profile"
     );
 
     let requests = server.received_requests().await.expect("recorded requests");
@@ -158,14 +168,62 @@ async fn verify_accepts_a_single_profile_object() {
     request_otp(&client, "9876543210")
         .await
         .expect("request ok");
-    let session = verify_otp(&client, "9876543210", "123456")
+    let profiles = verify_otp(&client, "9876543210", "123456")
         .await
         .expect("a single profile object verifies");
+    assert_eq!(profiles.len(), 1, "the object form is a one-profile list");
     assert_eq!(
-        session.uuid,
+        profiles[0].uuid,
         profile_uuid(),
         "the profile is read from the object form"
     );
+}
+
+#[tokio::test]
+async fn verify_returns_every_profile_the_number_maps_to() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        REQUEST_PATH,
+        200,
+        include_str!("fixtures/otp_request.json"),
+    )
+    .await;
+    mount_json(
+        &server,
+        VERIFY_PATH,
+        200,
+        include_str!("fixtures/otp_verify_two.json"),
+    )
+    .await;
+
+    let client = client_for(&server);
+    request_otp(&client, "9876543210")
+        .await
+        .expect("request ok");
+    let profiles = verify_otp(&client, "9876543210", "123456")
+        .await
+        .expect("the code verifies");
+
+    let fixture = fixture(include_str!("fixtures/otp_verify_two.json"));
+    let entries = fixture.as_array().expect("a profile array");
+    assert_eq!(
+        profiles.len(),
+        2,
+        "both accounts come back, not just the first"
+    );
+    for (got, entry) in profiles.iter().zip(entries) {
+        assert_eq!(got.uuid, entry["uuid"], "each profile keeps its uuid");
+        assert_eq!(
+            got.email.as_deref(),
+            entry["email"].as_str(),
+            "each profile keeps its email"
+        );
+        assert_eq!(
+            got.access_token, entry["accessToken"],
+            "each profile keeps its own token"
+        );
+    }
 }
 
 #[tokio::test]
@@ -204,10 +262,10 @@ async fn verify_refuses_a_different_phone_than_the_pending_code() {
         other => panic!("expected Auth, got {other:?}"),
     }
 
-    let session = verify_otp(&client, "9876543210", "123456")
+    let profiles = verify_otp(&client, "9876543210", "123456")
         .await
         .expect("the code still works for its own number");
-    assert_eq!(session.uuid, profile_uuid(), "the right number logs in");
+    assert_eq!(profiles[0].uuid, profile_uuid(), "the right number logs in");
 }
 
 #[tokio::test]
@@ -280,10 +338,10 @@ async fn a_rejected_verify_can_be_retried_with_the_same_login_session() {
         .await
         .expect_err("the first attempt fails");
 
-    let session = verify_otp(&client, "9876543210", "123456")
+    let profiles = verify_otp(&client, "9876543210", "123456")
         .await
         .expect("the retry with the same login session succeeds");
-    assert_eq!(session.uuid, profile_uuid(), "the retry logs in");
+    assert_eq!(profiles[0].uuid, profile_uuid(), "the retry logs in");
 }
 
 fn profile_uuid() -> String {

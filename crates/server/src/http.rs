@@ -314,7 +314,20 @@ async fn login_verify(
     State(state): State<AppState>,
     Json(body): Json<VerifyRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let session = verify_otp(&state.qubo, &body.phone, &body.code).await?;
+    let profiles = verify_otp(&state.qubo, &body.phone, &body.code).await?;
+    // The family account is the first profile the number maps to.
+    let Some(profile) = profiles.into_iter().next() else {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "the login returned no account profile",
+        ));
+    };
+    let session = Session {
+        access_token: profile.access_token,
+        uuid: profile.uuid,
+        email: profile.email,
+        refresh_token: profile.refresh_token,
+    };
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
         .await?

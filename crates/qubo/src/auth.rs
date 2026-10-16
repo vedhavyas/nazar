@@ -13,18 +13,22 @@ const DEVICE_ATTRIBUTE: &str = "Nazar";
 /// The family account is an Indian number.
 const ISD_CODE: &str = "+91";
 
-/// An account profile from the verify response.
-#[derive(Debug, Deserialize)]
+/// An account profile from a login response. A phone number can map to
+/// more than one Qubo account, and the verify response carries them all
+/// (spec §3.4).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Profile {
+pub struct AccountProfile {
     #[serde(alias = "token")]
-    access_token: String,
+    pub access_token: String,
     #[serde(alias = "userUUID", alias = "userId")]
-    uuid: String,
+    pub uuid: String,
     #[serde(default)]
-    email: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    refresh_token: Option<String>,
+    pub email: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 /// The refresh response (spec §3.2): the access token is required, and the
@@ -46,8 +50,8 @@ struct OtpRequestResponse {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum VerifyResponse {
-    Profiles(Vec<Profile>),
-    Profile(Box<Profile>),
+    Profiles(Vec<AccountProfile>),
+    Profile(Box<AccountProfile>),
 }
 
 /// Send an SMS OTP to `phone`. The login session id the gateway returns is
@@ -68,13 +72,14 @@ pub async fn request_otp(client: &QuboClient, phone: &str) -> Result<(), QuboErr
     Ok(())
 }
 
-/// Exchange `code` for an account session. A failed attempt keeps the
-/// login session, so the code can be retried.
+/// Exchange `code` for the account profiles the number maps to: one for
+/// most numbers, several when the phone holds more than one account. A
+/// failed attempt keeps the login session, so the code can be retried.
 pub async fn verify_otp(
     client: &QuboClient,
     phone: &str,
     code: &str,
-) -> Result<Session, QuboError> {
+) -> Result<Vec<AccountProfile>, QuboError> {
     let pending = client.pending_login().ok_or(QuboError::Auth {
         code: None,
         message: "no OTP was requested for this client".to_owned(),
@@ -102,23 +107,19 @@ pub async fn verify_otp(
     });
     let response = client.post_json(&path, &body, None).await?;
 
-    // The account's first profile is the family account.
-    let profile = match serde_json::from_value::<VerifyResponse>(response)? {
-        VerifyResponse::Profiles(profiles) => profiles.into_iter().next(),
-        VerifyResponse::Profile(profile) => Some(*profile),
+    let profiles = match serde_json::from_value::<VerifyResponse>(response)? {
+        VerifyResponse::Profiles(profiles) => profiles,
+        VerifyResponse::Profile(profile) => vec![*profile],
     };
-    let profile = profile.ok_or(QuboError::Auth {
-        code: None,
-        message: "the login returned no account profile".to_owned(),
-    })?;
+    if profiles.is_empty() {
+        return Err(QuboError::Auth {
+            code: None,
+            message: "the login returned no account profile".to_owned(),
+        });
+    }
 
     client.clear_pending_login();
-    Ok(Session {
-        access_token: profile.access_token,
-        uuid: profile.uuid,
-        email: profile.email,
-        refresh_token: profile.refresh_token,
-    })
+    Ok(profiles)
 }
 
 /// Exchange a Google ID token for a Qubo session (the app's own `system=GM`
@@ -136,7 +137,7 @@ pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Sessio
     let response = client
         .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &body)
         .await?;
-    let profile: Profile = serde_json::from_value(response)?;
+    let profile: AccountProfile = serde_json::from_value(response)?;
     Ok(Session {
         access_token: profile.access_token,
         uuid: profile.uuid,
