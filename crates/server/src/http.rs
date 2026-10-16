@@ -819,6 +819,11 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
         if !known {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
         }
+        // The ask is the server's own sighting of a viewer: go2rtc traces
+        // nothing of an attach whose producer never starts, so the
+        // supervisor's liveness watch runs off this as well as off the
+        // consumers a live session registers.
+        state.supervisor.note_viewer_touch(&src);
         if rest == PROXY_WS_PATH {
             format!("{base}/api/ws?src={src}")
         } else {
