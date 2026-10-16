@@ -38,6 +38,11 @@ fn the_config_lines_refuse_bad_values_and_keep_their_defaults() {
         EPISODE_RETENTION_DAYS,
         "a line that is not a number keeps the default window"
     );
+    assert_eq!(
+        retention_days(Some("0")),
+        EPISODE_RETENTION_DAYS,
+        "zero days would silently disable the timeline, so it keeps the default"
+    );
     assert_eq!(retention_days(Some("7")), 7, "a window is honored");
     assert_eq!(retention_days(None), EPISODE_RETENTION_DAYS);
 }
