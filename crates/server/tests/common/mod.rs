@@ -56,6 +56,7 @@ impl FakeLane {
                 source: "ffmpeg:/tmp/nazar-fake.sdp#input=nazar".to_owned(),
                 controls: Mutex::new(Vec::new()),
                 alive: AtomicBool::new(true),
+                released: Mutex::new(Vec::new()),
             }),
             arms: Arc::new(AtomicUsize::new(0)),
             armed_devices: Arc::new(Mutex::new(Vec::new())),
@@ -97,11 +98,17 @@ pub struct FakeSession {
     pub source: String,
     pub controls: Mutex<Vec<Value>>,
     pub alive: AtomicBool,
+    pub released: Mutex<Vec<String>>,
 }
 
 impl FakeSession {
     pub fn controls(&self) -> Vec<Value> {
         self.controls.lock().unwrap().clone()
+    }
+
+    /// The stream names released back to the session, in order.
+    pub fn released(&self) -> Vec<String> {
+        self.released.lock().unwrap().clone()
     }
 }
 
@@ -146,6 +153,10 @@ impl LaneSession for FakeSession {
 
     fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    fn release(&self, name: &str) {
+        self.released.lock().unwrap().push(name.to_owned());
     }
 
     fn shutdown(&self) {

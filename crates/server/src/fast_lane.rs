@@ -11,6 +11,12 @@
 //! The SDP describes video only: the audio payload type's codec is
 //! unverified, and listen-audio keeps riding the cloud path until the live
 //! round pins it down.
+//!
+//! The camera sends one stream, so an armed camera's streams all read the
+//! same full-size media: on the fast lane the low tile's label keeps its
+//! name but not a downscale (the shared template carries no scale step -
+//! the cloud path's smaller rendition is ffmpeg work the mint URL asks
+//! for, which the P2P source has no equivalent of).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -83,6 +89,8 @@ impl Lane for EngineLane {
 enum LaneCommand {
     /// Start fanning the session's media out to this loopback port.
     Subscribe { port: u16 },
+    /// Stop fanning to this loopback port.
+    Unsubscribe { port: u16 },
     /// One control envelope for the camera.
     Control(Value),
     /// End the session (the pump disarms on its way out).
@@ -93,7 +101,8 @@ enum LaneCommand {
 /// and a control path back to the camera.
 struct PumpLane {
     commands: mpsc::UnboundedSender<LaneCommand>,
-    sources: Mutex<HashMap<String, String>>,
+    /// Per stream: its sink's loopback port and the go2rtc source string.
+    sources: Mutex<HashMap<String, (u16, String)>>,
     alive: Arc<AtomicBool>,
     /// Where the per-stream SDP files are written for go2rtc's ffmpeg.
     data_dir: PathBuf,
@@ -125,7 +134,7 @@ impl LaneSession for PumpLane {
             .sources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(source) = sources.get(name) {
+        if let Some((_, source)) = sources.get(name) {
             return Ok(source.clone());
         }
         let port = free_loopback_port()?;
@@ -134,8 +143,21 @@ impl LaneSession for PumpLane {
             .send(LaneCommand::Subscribe { port })
             .map_err(|_| "the fast-lane session has ended".to_owned())?;
         let source = sdp_source(&sdp);
-        sources.insert(name.to_owned(), source.clone());
+        sources.insert(name.to_owned(), (port, source.clone()));
         Ok(source)
+    }
+
+    fn release(&self, name: &str) {
+        let entry = self
+            .sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+        let Some((port, _)) = entry else {
+            return;
+        };
+        let _ = self.commands.send(LaneCommand::Unsubscribe { port });
+        remove_sdp(&self.data_dir, name);
     }
 
     fn control(&self, envelope: Value) -> Result<(), String> {
@@ -177,6 +199,7 @@ async fn pump(
             command = commands.recv() => match command {
                 None | Some(LaneCommand::Shutdown) => break,
                 Some(LaneCommand::Subscribe { port }) => add_sink(&mut sinks, port),
+                Some(LaneCommand::Unsubscribe { port }) => drop_sink(&mut sinks, port),
                 Some(LaneCommand::Control(envelope)) => {
                     if let Err(err) = armed.send_control(&envelope).await {
                         tracing::warn!(%err, "the fast-lane control send failed");
@@ -221,6 +244,16 @@ fn add_sink(sinks: &mut Vec<SocketAddr>, port: u16) {
     if !sinks.contains(&sink) {
         sinks.push(sink);
     }
+}
+
+/// Drop a stream's sink from the fan-out.
+fn drop_sink(sinks: &mut Vec<SocketAddr>, port: u16) {
+    sinks.retain(|sink| sink.port() != port);
+}
+
+/// Remove a stream's SDP file; a missing one is already gone.
+fn remove_sdp(data_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(data_dir.join(format!("p2p-{name}.sdp")));
 }
 
 /// The go2rtc source for a stream's SDP file: the same template the cloud
@@ -311,6 +344,28 @@ mod tests {
             "a repeated subscribe does not double the fan-out"
         );
         assert_eq!(sinks[0].port(), 41001, "order is preserved");
+    }
+
+    #[test]
+    fn the_fan_out_drops_by_port() {
+        let mut sinks = Vec::new();
+        add_sink(&mut sinks, 41001);
+        add_sink(&mut sinks, 41002);
+        drop_sink(&mut sinks, 41001);
+        assert_eq!(sinks.len(), 1, "the dropped stream's sink leaves");
+        assert_eq!(sinks[0].port(), 41002, "the other stream's sink stays");
+    }
+
+    #[test]
+    fn releasing_a_stream_removes_its_sdp() {
+        let dir = std::env::temp_dir().join(format!("nazar-sdp-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = write_sdp(&dir, "cam-high", 41003).expect("the sdp writes");
+        assert!(path.exists(), "the file is there to begin with");
+        remove_sdp(&dir, "cam-high");
+        assert!(!path.exists(), "release takes the sdp with it");
+        // A second release for an already-gone file is a no-op.
+        remove_sdp(&dir, "cam-high");
     }
 
     #[test]

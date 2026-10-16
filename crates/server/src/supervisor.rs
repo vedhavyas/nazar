@@ -147,6 +147,9 @@ pub trait LaneSession: Send + Sync + 'static {
     fn control(&self, envelope: Value) -> Result<(), String>;
     /// Whether the session is still up.
     fn alive(&self) -> bool;
+    /// Let `name`'s reader go: its sink leaves the pump's fan-out and its
+    /// SDP file goes with it.
+    fn release(&self, name: &str);
     /// End the session (`endP2pCall`); called when the camera's last stream
     /// is torn down.
     fn shutdown(&self);
@@ -1391,6 +1394,11 @@ impl Supervisor {
         let Some((device_id, _)) = name.rsplit_once('-') else {
             return;
         };
+        // The stream's reader leaves the session's fan-out whichever way
+        // the teardown lands.
+        if let Some(session) = self.armed.read().await.get(device_id).cloned() {
+            session.release(name);
+        }
         let prefix = format!("{device_id}-");
         let remaining = self
             .state
@@ -1624,9 +1632,10 @@ mod tests {
         );
     }
 
-    /// A session that only records when its shutdown ran.
+    /// A session that only records what it was told.
     struct RecordingSession {
         ended: Arc<AtomicBool>,
+        released: Arc<Mutex<Vec<String>>>,
     }
 
     impl LaneSession for RecordingSession {
@@ -1642,21 +1651,38 @@ mod tests {
             true
         }
 
+        fn release(&self, name: &str) {
+            self.released.lock().unwrap().push(name.to_owned());
+        }
+
         fn shutdown(&self) {
             self.ended.store(true, Ordering::SeqCst);
         }
     }
 
+    fn recorded_session() -> (
+        Arc<RecordingSession>,
+        Arc<AtomicBool>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let ended = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let session = Arc::new(RecordingSession {
+            ended: Arc::clone(&ended),
+            released: Arc::clone(&released),
+        });
+        (session, ended, released)
+    }
+
     #[tokio::test]
     async fn the_last_streams_teardown_ends_the_cameras_session() {
         let supervisor = quiet_supervisor();
-        let ended = Arc::new(AtomicBool::new(false));
-        supervisor.armed.write().await.insert(
-            "cam".to_owned(),
-            Arc::new(RecordingSession {
-                ended: Arc::clone(&ended),
-            }),
-        );
+        let (session, ended, released) = recorded_session();
+        supervisor
+            .armed
+            .write()
+            .await
+            .insert("cam".to_owned(), session);
         let name = stream_name("cam", Quality::Low);
         supervisor.state.write().await.insert(
             name.clone(),
@@ -1674,15 +1700,20 @@ mod tests {
             ended.load(Ordering::SeqCst),
             "the camera's last stream going ends its fast-lane session"
         );
-
-        // With another stream left, the session stays.
-        let ended = Arc::new(AtomicBool::new(false));
-        supervisor.armed.write().await.insert(
-            "cam".to_owned(),
-            Arc::new(RecordingSession {
-                ended: Arc::clone(&ended),
-            }),
+        assert_eq!(
+            released.lock().unwrap().as_slice(),
+            [name.as_str()],
+            "and the stream's reader was released from the session"
         );
+
+        // With another stream left, the session stays - but its reader
+        // still leaves.
+        let (session, ended, released) = recorded_session();
+        supervisor
+            .armed
+            .write()
+            .await
+            .insert("cam".to_owned(), session);
         supervisor.state.write().await.insert(
             stream_name("cam", Quality::High),
             Tracked {
@@ -1697,6 +1728,11 @@ mod tests {
         assert!(
             !ended.load(Ordering::SeqCst),
             "a camera with another stream keeps its session"
+        );
+        assert_eq!(
+            released.lock().unwrap().as_slice(),
+            [name.as_str()],
+            "the torn stream's reader is released even when the session stays"
         );
     }
 
