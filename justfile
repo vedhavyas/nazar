@@ -1,5 +1,12 @@
 # Run the full check suite: formatting, lints, tests.
-check: fmt-check lint test
+check: fmt-check lint test test-scripts
+
+# The release scripts' own tests: `update_manifest.py` writes the one file
+# every installed desktop reads for updates, and the release job runs it
+# only at tag time - so its shape is pinned here, where a change meets a
+# test before a tag does.
+test-scripts:
+    python3 scripts/test_update_manifest.py
 
 # Fail on unformatted Rust.
 fmt-check:
