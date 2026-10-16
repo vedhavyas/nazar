@@ -143,7 +143,9 @@ jobs:
           # reason in the log rather than vanish behind a successful `tr`.
           "$apksigner" verify --print-certs "$built" > certs.txt
           cat certs.txt
-          signed=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' certs.txt | head -1 | tr -d ':' | tr 'A-Z' 'a-z')
+          # The signer label depends on the apksigner version ("Signer #1"
+          # here, "V2 Signer" on the runner); the digest line is what counts.
+          signed=$(sed -n 's/^.*certificate SHA-256 digest: //p' certs.txt | head -1 | tr -d ':' | tr 'A-Z' 'a-z')
           want=$(tr -d '[:space:]' < web/src-tauri/gen/android/release-keystore.sha256)
           [ "$signed" = "$want" ] || {
             echo "[ERROR] the APK signer '$signed' is not the recorded release key $want"; exit 1; }
