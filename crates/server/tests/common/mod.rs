@@ -32,6 +32,9 @@ use tokio::net::TcpListener;
 pub struct FakeApi {
     pub base: reqwest::Url,
     puts: Arc<Mutex<Vec<(String, String)>>>,
+    /// The puts go2rtc actually took: what the streams view lists, as a
+    /// refused put leaves no entry behind in the real one.
+    taken: Arc<Mutex<Vec<(String, String)>>>,
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
     streams_visible: Arc<AtomicBool>,
@@ -66,6 +69,7 @@ pub struct FakeApi {
 impl FakeApi {
     pub async fn start() -> Self {
         let puts = Arc::new(Mutex::new(Vec::new()));
+        let taken = Arc::new(Mutex::new(Vec::new()));
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
         let streams_visible = Arc::new(AtomicBool::new(true));
@@ -92,6 +96,7 @@ impl FakeApi {
                 connect_after: &connect_after,
                 delete_delay: &delete_delay,
                 ops: &ops,
+                taken: &taken,
             },
             &viewers,
         ));
@@ -105,6 +110,7 @@ impl FakeApi {
         Self {
             base: format!("http://{addr}").parse().expect("a url"),
             puts,
+            taken,
             deletes,
             put_status,
             streams_visible,
@@ -228,6 +234,7 @@ struct Knobs<'a> {
     connect_after: &'a Arc<Mutex<HashMap<String, Duration>>>,
     delete_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
+    taken: &'a Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// The streams admin surface, as go2rtc 1.9.14 answers it.
@@ -276,6 +283,7 @@ fn streams_methods(
     let urls = Arc::clone(knobs.url_state);
     let dialed = Arc::clone(knobs.dialed);
     let served = Arc::clone(viewers);
+    let taken = Arc::clone(knobs.taken);
     let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
         let recorded = Arc::clone(&recorded);
         let status = Arc::clone(&status);
@@ -283,6 +291,7 @@ fn streams_methods(
         let urls = Arc::clone(&urls);
         let dialed = Arc::clone(&dialed);
         let served = Arc::clone(&served);
+        let taken = Arc::clone(&taken);
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
             recorded
@@ -311,6 +320,12 @@ fn streams_methods(
             }
             ops.lock().unwrap().push(format!("put:{name}"));
             let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+            if code.is_success() {
+                taken
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
+            }
             // A rejected PUT quotes the source back, as go2rtc's own
             // refusals do - token and all.
             let body = if code.is_success() {
@@ -346,7 +361,7 @@ fn streams_methods(
             }
         });
     let list_streams = list_streams_handler(StreamsAnswer {
-        recorded: Arc::clone(puts),
+        recorded: Arc::clone(knobs.taken),
         visible: Arc::clone(knobs.streams_visible),
         viewers: Arc::clone(viewers),
         error: Arc::clone(knobs.streams_error),

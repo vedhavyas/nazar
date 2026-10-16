@@ -420,6 +420,35 @@ async fn an_idle_stream_does_not_mint_once_more_before_dying() {
     );
 }
 
+/// A healthy tile chain is not re-asserted on every liveness slice: every
+/// PUT rewrites go2rtc's whole config on disk, and a chain nobody broke
+/// needs none of that.
+#[tokio::test]
+async fn a_healthy_tile_chain_is_not_re_written_every_slice() {
+    let h = harness(Duration::from_secs(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+    let chain = |h: &Harness| {
+        let want = format!("put:{DEVICE_ID}-low");
+        h.go2rtc.ops().iter().filter(|op| **op == want).count()
+    };
+    let chained = common::eventually(|| async { chain(&h) >= 1 }).await;
+    assert!(chained, "the tile's chain took: {:?}", h.go2rtc.ops());
+
+    let before = chain(&h);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        chain(&h),
+        before,
+        "a healthy chain is not re-written every slice: {:?}",
+        h.go2rtc.ops()
+    );
+}
+
 /// Everything the stream owned goes with it: a stream re-registered after
 /// its teardown gets its own full idle window again, not a shorter one
 /// inherited from the retired loop.
