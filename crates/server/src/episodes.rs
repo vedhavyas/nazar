@@ -80,7 +80,7 @@ impl EpisodeStore {
     ) -> Option<Episode> {
         let mut ledger = self.lock();
         let now = now_ms();
-        if at_ms < now - ms(self.retention) {
+        if at_ms < retention_cutoff(self.retention, now) {
             // Older than the memory itself: remembering it would only
             // write an entry the next trim drops.
             return None;
@@ -145,12 +145,68 @@ pub(crate) fn preserve(path: &std::path::Path) {
     }
 }
 
-/// Drop everything that began before the retention window.
+/// The instant before which the memory keeps nothing: the start of the
+/// household's day the retention window begins in, so retention drops
+/// WHOLE days - the oldest day a picker can offer never empties through
+/// the day as the clock advances.
+fn retention_cutoff(retention: Duration, now_ms: i64) -> i64 {
+    crate::recordings::ist_day_start(now_ms - ms(retention))
+}
+
+/// Drop everything that began before the retention window's own day.
 fn trim(ledger: &mut Ledger, retention: Duration, now_ms: i64) {
-    let cutoff = now_ms - ms(retention);
+    let cutoff = retention_cutoff(retention, now_ms);
     ledger.episodes.retain(|episode| episode.start_ms >= cutoff);
 }
 
 fn ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    /// 16 October 2026, 12:00 IST - midday, so a mid-day cutoff and a
+    /// whole-day one land in different places.
+    const NOON: i64 = 1_792_132_200_000;
+    const HOUR: i64 = 3_600_000;
+
+    fn episode(start_ms: i64) -> Episode {
+        Episode {
+            id: format!("{start_ms}"),
+            device_id: "hall".to_owned(),
+            start_ms,
+            snapshot_url: None,
+        }
+    }
+
+    #[test]
+    fn retention_drops_whole_days_only() {
+        let cutoff = retention_cutoff(Duration::from_hours(48), NOON);
+        assert_eq!(
+            cutoff,
+            crate::recordings::ist_day_start(NOON - 48 * HOUR),
+            "the cutoff is the window's own day's first instant"
+        );
+        assert!(
+            NOON - 48 * HOUR > cutoff,
+            "midday sits inside the window's own day - the boundary the whole-day rule moves to"
+        );
+
+        let mut ledger = Ledger::default();
+        ledger.episodes.push_back(episode(cutoff));
+        ledger.episodes.push_back(episode(cutoff + 30 * 60_000));
+        ledger.episodes.push_back(episode(cutoff - 60_000));
+        trim(&mut ledger, Duration::from_hours(48), NOON);
+
+        let kept: Vec<i64> = ledger.episodes.iter().map(|entry| entry.start_ms).collect();
+        assert_eq!(kept.len(), 2, "the window's own day is kept whole: {kept:?}");
+        assert!(
+            ledger.episodes.iter().all(|entry| entry.start_ms >= cutoff),
+            "and nothing before it survives"
+        );
+    }
 }
