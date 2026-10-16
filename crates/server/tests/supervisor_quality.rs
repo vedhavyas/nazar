@@ -406,6 +406,36 @@ async fn an_idle_stream_does_not_mint_once_more_before_dying() {
     );
 }
 
+/// The teardown holds the state lock across its deletes on purpose (a
+/// request landing then must spawn fresh, not be told Live about a stream
+/// being deleted under it) - and every await under it is bounded, so a
+/// go2rtc that accepts and then never answers wedges a status read for one
+/// timeout, never for the process's lifetime.
+#[tokio::test]
+async fn a_wedged_go2rtc_does_not_wedge_the_lock() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    // The API takes the DELETE and answers far past the client's own bound.
+    h.go2rtc.set_delete_delay(Duration::from_secs(30));
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream wakes");
+    // The idle window passes and the loop walks into its teardown.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let read = tokio::time::timeout(
+        Duration::from_secs(9),
+        h.supervisor.status_for(DEVICE_ID, Quality::High),
+    )
+    .await;
+    assert!(
+        read.is_ok(),
+        "a status read answers while a wedged teardown is in flight"
+    );
+}
+
 #[tokio::test]
 async fn a_request_landing_during_teardown_gets_a_fresh_stream() {
     let h = harness(Duration::from_millis(60)).await;

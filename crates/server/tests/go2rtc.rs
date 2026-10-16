@@ -107,6 +107,39 @@ async fn streams_reports_a_producer_as_live() {
     );
 }
 
+/// A go2rtc that accepts the connection and then never answers must not
+/// hold a caller: every call is bounded by the client's own timeout, so a
+/// wedged API is an error inside a known window, not a hang until the
+/// process dies - the supervisor's state lock rides on these calls.
+#[tokio::test]
+async fn a_go2rtc_that_never_answers_is_bounded() {
+    use tokio::io::AsyncReadExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut buf = [0_u8; 4096];
+        // Consume the request, then hold the socket open in silence.
+        let _ = socket.read(&mut buf).await;
+        std::future::pending::<()>().await;
+    });
+
+    let go2rtc = Go2rtc::connect(format!("http://{addr}").parse().expect("a url"));
+    let started = std::time::Instant::now();
+    let answer = tokio::time::timeout(Duration::from_secs(8), go2rtc.streams())
+        .await
+        .expect("the call is bounded by the client's own timeout, not by this test");
+    assert!(answer.is_err(), "a wedged go2rtc is an error, not a hang");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "and it returns inside the bound: {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn start_writes_the_config_and_runs_the_binary_with_it() {
     let data_dir = temp_dir();

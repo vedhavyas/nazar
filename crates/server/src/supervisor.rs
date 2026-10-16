@@ -454,7 +454,11 @@ impl Supervisor {
     /// is held until go2rtc has forgotten the stream: a request that lands
     /// while the deletes are in flight waits for the claim, finds no
     /// entry, and spawns a fresh stream, rather than being told Live about
-    /// one that is being deleted under it.
+    /// one that is being deleted under it. Every await under that lock is
+    /// bounded by the go2rtc client's own timeouts (and the two deletes run
+    /// together rather than one after the other), so an API that accepts
+    /// and then never answers wedges a status read for one timeout, never
+    /// for the process's lifetime.
     async fn teardown_if_idle(&self, name: &str, seen_at: Instant) -> bool {
         let mut state = self.state.write().await;
         match state.get(name) {
@@ -466,16 +470,27 @@ impl Supervisor {
                 return false;
             }
         }
-        if let Some(low) = low_name_of(name) {
-            // Only the tile that is still tracked: one its own reconcile
-            // already retired is gone from go2rtc too.
-            let known = state.remove(&low).is_some();
-            if known && let Err(err) = self.go2rtc.delete_stream(&low).await {
-                tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
+        // Only the tile that is still tracked: one its own reconcile
+        // already retired is gone from go2rtc too.
+        let tile = low_name_of(name).filter(|low| state.remove(low).is_some());
+        match tile {
+            Some(low) => {
+                let (tile_deleted, dropped) = tokio::join!(
+                    self.go2rtc.delete_stream(&low),
+                    self.go2rtc.delete_stream(name),
+                );
+                if let Err(err) = tile_deleted {
+                    tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
+                }
+                if let Err(err) = dropped {
+                    tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+                }
             }
-        }
-        if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+            None => {
+                if let Err(err) = self.go2rtc.delete_stream(name).await {
+                    tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+                }
+            }
         }
         tracing::info!(stream = name, "idle stream dropped");
         true

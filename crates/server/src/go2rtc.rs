@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::Url;
 use serde::Deserialize;
@@ -17,6 +18,26 @@ use crate::config::Config;
 
 /// Where the generated config puts go2rtc's API.
 pub const API_BASE: &str = "http://127.0.0.1:1984";
+
+/// How long a go2rtc call may take before it gives up. The API is loopback
+/// and answers in milliseconds; the bound exists so an API that accepts and
+/// then never answers cannot hold a caller - and, through it, whatever lock
+/// the caller holds - for the process's lifetime.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The client every go2rtc call goes through. Both limits are load-bearing:
+/// `a_go2rtc_that_never_answers_is_bounded` pins what removing them costs.
+fn api_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "the go2rtc client fell back to defaults");
+            reqwest::Client::new()
+        })
+}
 
 /// The generated config's ffmpeg template name.
 const TEMPLATE: &str = "nazar";
@@ -94,7 +115,7 @@ impl Go2rtc {
         );
         Ok(Self {
             api: parse_url(API_BASE)?,
-            http: reqwest::Client::new(),
+            http: api_client(),
             child: Some(child),
             config_path,
         })
@@ -104,7 +125,7 @@ impl Go2rtc {
     pub fn connect(api_base: Url) -> Self {
         Self {
             api: api_base,
-            http: reqwest::Client::new(),
+            http: api_client(),
             child: None,
             config_path: PathBuf::new(),
         }
