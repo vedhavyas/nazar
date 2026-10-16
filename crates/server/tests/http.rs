@@ -595,7 +595,7 @@ async fn verify_with_two_profiles_asks_for_a_pick() {
 }
 
 #[tokio::test]
-async fn verify_offers_only_accounts_that_can_mint() {
+async fn verify_signs_in_the_lone_mailable_account() {
     let h = harness().await;
     let profiles = json!([
         {"accessToken": "token-1", "uuid": "mailable-uuid", "name": "A", "email": "a@example.com"},
@@ -603,33 +603,61 @@ async fn verify_offers_only_accounts_that_can_mint() {
     ])
     .to_string();
     mount_login(&h, &profiles).await;
+    mount_discovery(&h.qubo).await;
+    mount_mint(&h.qubo).await;
 
     let response = ask_and_verify(&h).await;
 
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::OK,
-        "a pick is asked"
+        reqwest::StatusCode::NO_CONTENT,
+        "one mailable account needs no pick"
+    );
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("synthetic.minted.access"),
+        "the minted session lands: {stored}"
+    );
+    let minted = h
+        .qubo
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .find(|request| request.url.path() == EMAILPROFILE_PATH)
+        .expect("the mint reached the gateway");
+    let subscriber = minted
+        .headers
+        .get("subscriber-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("the Subscriber-Key header");
+    assert_eq!(
+        subscriber, "token-1",
+        "the mailable account's token is what mints, not the silent one's"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn a_lone_none_mailable_profile_refuses_cleanly() {
+    let h = harness().await;
+    let profiles = json!([{"accessToken": "token-1", "uuid": "silent-1", "name": "A"}]).to_string();
+    mount_login(&h, &profiles).await;
+
+    let response = ask_and_verify(&h).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a lone account that cannot mint is refused at verify"
     );
     let body: Value = response.json().await.expect("json");
-    let offered = body["profiles"].as_array().expect("a profile list");
     assert_eq!(
-        offered.len(),
-        1,
-        "the emailless account is not offered: {body}"
+        body["error"],
+        json!("none of this number's accounts carries an email to sign in with"),
+        "the refusal is the verify path's own, not the mint helper's wording"
     );
-    assert_eq!(
-        offered[0]["uuid"], "mailable-uuid",
-        "only the mailable account is a choice"
-    );
-    let mut keys: Vec<&str> = offered[0]
-        .as_object()
-        .expect("an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(keys, ["email", "name", "uuid"], "exactly the picker's keys");
+    session_untouched(&h);
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
@@ -845,18 +873,27 @@ async fn two_concurrent_picks_mint_once() {
         .json(&json!({ "uuid": two_profile_field(1, "uuid") }))
         .send();
     let (one, two) = tokio::join!(first, second);
-    let mut statuses = vec![
-        one.expect("one pick answers").status(),
-        two.expect("the other pick answers").status(),
+    let mut answers = vec![
+        one.expect("one pick answers"),
+        two.expect("the other pick answers"),
     ];
-    statuses.sort();
+    answers.sort_by_key(reqwest::Response::status);
+    let refused = answers.pop().expect("the refused pick");
     assert_eq!(
-        statuses,
-        [
-            reqwest::StatusCode::NO_CONTENT,
-            reqwest::StatusCode::UNAUTHORIZED
-        ],
+        refused.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
         "one pick mints; the racing one is refused"
+    );
+    let body: Value = refused.json().await.expect("json");
+    assert_eq!(
+        body["error"],
+        json!("auth error: a pick for this login is already in flight; wait or request a new code"),
+        "the refused pick says a mint is already running"
+    );
+    assert_eq!(
+        answers[0].status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the other pick mints"
     );
     let mints = h
         .qubo

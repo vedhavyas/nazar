@@ -210,8 +210,12 @@ fn login_failure(err: QuboError) -> ApiError {
         QuboError::Api { code, .. }
         | QuboError::Auth {
             code: Some(code), ..
-        } => code.as_str(),
-        _ => "none",
+        } => code.clone(),
+        QuboError::Http {
+            status: Some(status),
+            ..
+        } => status.to_string(),
+        _ => "none".to_owned(),
     };
     tracing::warn!(variant, upstream, "login failed");
     err.into()
@@ -344,21 +348,28 @@ async fn login_verify(
     let profiles = verify_otp(&state.qubo, &body.phone, &body.code)
         .await
         .map_err(login_failure)?;
-    if let [only] = profiles.as_slice() {
-        finish_login(&state, only).await?;
-        return Ok(StatusCode::NO_CONTENT.into_response());
-    }
     // A profile without an email cannot mint - the mint's body's username
-    // is the email - so it is never offered as a choice.
+    // is the email - so it is never offered, and a lone mailable account
+    // still signs straight in.
     let offered: Vec<AccountProfile> = profiles
         .into_iter()
-        .filter(|profile| profile.email.is_some())
+        .filter(|profile| {
+            profile
+                .email
+                .as_deref()
+                .is_some_and(|email| !email.is_empty())
+        })
         .collect();
     if offered.is_empty() {
+        tracing::warn!("no account on this number carries an email to sign in with");
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "none of this number's accounts carries an email to sign in with",
         ));
+    }
+    if let [only] = offered.as_slice() {
+        finish_login(&state, only).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let choices: Vec<Value> = offered
         .iter()
@@ -384,15 +395,11 @@ async fn login_select(
     State(state): State<AppState>,
     Json(body): Json<SelectRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let profile = state.qubo.claim_pending_profile(&body.uuid)?;
-    match finish_login(&state, &profile).await {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(err) => {
-            // Nothing was persisted; the pick is open again for a retry.
-            state.qubo.release_pending_profiles();
-            Err(err)
-        }
-    }
+    let picked = state.qubo.claim_pending_profile(&body.uuid)?;
+    // The claim rides the guard: a failed mint, or a request dropped
+    // mid-flight, reopens the pick on the way out.
+    finish_login(&state, picked.profile()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The chosen profile's mint, and the session it becomes.
@@ -409,7 +416,10 @@ async fn persist_login(state: &AppState, session: Session) -> Result<(), ApiErro
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
         .await?
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        .map_err(|err| {
+            tracing::warn!(%err, "the session file could not be saved");
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        })?;
     // Also drops an in-flight picker in another tab: its next pick is
     // refused with the true "no login is waiting" reason.
     state.qubo.clear_pending_profiles();
