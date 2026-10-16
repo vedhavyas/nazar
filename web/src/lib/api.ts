@@ -1,6 +1,6 @@
-//! The server API: one place for fetch and the error envelope. There is no
-//! cookie to carry: the session is a file on the server, and the browser
-//! holds nothing.
+//! The server API: one place for fetch, the error envelope, and the
+//! server's own address. There is no cookie to carry: the session is a file
+//! on the server, and the browser holds nothing.
 
 /** What a failed call throws; `message` is the server's own words. */
 export class ApiError extends Error {
@@ -11,6 +11,62 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+/** True when the bundle runs inside a Tauri shell; false in a browser and
+ * wherever there is no window at all. */
+export function inShell(): boolean {
+  if (typeof window === 'undefined') return false;
+  const shell = window as { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown };
+  return '__TAURI_INTERNALS__' in shell || '__TAURI__' in shell;
+}
+
+/** The server's address on the mesh, where a shell starts from. */
+export const DEFAULT_SERVER = 'http://nazar.hub';
+
+const STORED = 'nazar.server';
+
+/** Trim, drop trailing slashes, and assume the mesh's scheme when none was
+ * typed - a bare `nazar.hub` would otherwise read as one. */
+export function normalizeAddress(address: string): string {
+  const trimmed = address.trim().replace(/\/+$/, '');
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+/** Where requests point. Empty in a browser: the SPA is served by the server
+ * itself, so paths stay relative. */
+function resolveBase(): string {
+  if (!inShell()) return '';
+  const stored = localStorage.getItem(STORED);
+  return stored ? normalizeAddress(stored) : DEFAULT_SERVER;
+}
+
+let base = resolveBase();
+
+/** The current base; `''` means same-origin. */
+export function serverBase(): string {
+  return base;
+}
+
+/** Store an address and point everything at it from now on. */
+export function setServerBase(address: string): void {
+  base = normalizeAddress(address);
+  localStorage.setItem(STORED, base);
+}
+
+/** The websocket origin the event sockets dial. */
+export function socketBase(): string {
+  return (base || location.origin).replace(/^http/, 'ws');
+}
+
+/** Whether a server answers at `address` - the setup screen's check, run
+ * against a candidate before it is saved. */
+export async function healthAt(address: string): Promise<{ ok: boolean; version: string }> {
+  const response = await fetch(`${normalizeAddress(address)}/api/health`);
+  if (!response.ok) {
+    throw new ApiError(response.status, await errorMessage(response));
+  }
+  return (await response.json()) as { ok: boolean; version: string };
 }
 
 export interface Camera {
@@ -72,7 +128,7 @@ export interface PrivacyResult {
 }
 
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(`${base}${path}`, {
     ...init,
     headers: init.body ? { 'content-type': 'application/json' } : undefined,
   });

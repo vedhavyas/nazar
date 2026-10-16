@@ -2,7 +2,7 @@
 //! follows. Nothing here orders cameras by its own idea of motion - the
 //! hysteresis lives on the server, so every browser agrees.
 
-import { api, type Camera } from './api';
+import { api, socketBase, type Camera } from './api';
 
 /** Where the hero decision and its events come from. */
 export interface HeroSource {
@@ -87,7 +87,7 @@ export function serverSource(): HeroSource {
       let again: ReturnType<typeof setTimeout> | null = null;
       const open = () => {
         if (stopped) return;
-        socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events`);
+        socket = new WebSocket(`${socketBase()}/api/events`);
         socket.onmessage = () => onEvent();
         // A dropped socket would silently freeze the hero: come back.
         socket.onclose = () => {
