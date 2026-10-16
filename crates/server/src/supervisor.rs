@@ -1,9 +1,9 @@
 //! The stream supervisor: one mint-and-swap loop per live camera.
 //!
-//! Qubo sessions last about five minutes and cannot be refreshed (the OTP
-//! route issues no refresh token), so a live stream is re-minted on a
-//! cadence and the session is re-read from the store on every mint - a
-//! fresh login heals the streams without restarting the server. The cloud
+//! Stream sessions last about five minutes, so a live stream is re-minted
+//! on a cadence and the account session is re-read from the store on every
+//! mint - a fresh login, or a spent refresh token (spec §3.2), heals the
+//! streams without restarting the server. The cloud
 //! keeps one stream per camera (mints are last-mint-wins), so only the
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.

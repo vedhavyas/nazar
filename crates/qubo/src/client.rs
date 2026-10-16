@@ -68,7 +68,7 @@ pub struct QuboClient {
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
     /// The profiles a login is waiting on a choice between: a number that
     /// maps to several accounts.
-    pending_profiles: Arc<Mutex<Option<Vec<AccountProfile>>>>,
+    pending_profiles: Arc<Mutex<Option<PendingProfiles>>>,
 }
 
 /// The gateway's login session and the number it was issued for; verify
@@ -84,6 +84,14 @@ pub(crate) struct PendingLogin {
 enum Caller<'a> {
     Session(&'a Session),
     Source(&'a str),
+}
+
+/// The profiles a login is waiting on a choice between, and whether a
+/// pick has already claimed the slot to mint it.
+#[derive(Debug, Clone)]
+struct PendingProfiles {
+    profiles: Vec<AccountProfile>,
+    claimed: bool,
 }
 
 impl QuboClient {
@@ -128,18 +136,27 @@ impl QuboClient {
 
     /// Keep the profiles a login is waiting on a choice between.
     pub fn set_pending_profiles(&self, profiles: Vec<AccountProfile>) {
-        *self.lock_pending_profiles() = Some(profiles);
+        *self.lock_pending_profiles() = Some(PendingProfiles {
+            profiles,
+            claimed: false,
+        });
     }
 
-    /// The pending profile the caller picked, by uuid; a refusal means no
-    /// login is waiting or the pick is not one of its accounts.
-    pub fn pending_profile(&self, uuid: &str) -> Result<AccountProfile, QuboError> {
-        let pending = self.lock_pending_profiles();
-        let profiles = pending.as_ref().ok_or(QuboError::Auth {
-            code: None,
-            message: "no login is waiting for a profile choice".to_owned(),
-        })?;
-        select_profile(profiles, uuid)
+    /// Claim the pick for `uuid`: the first select takes the slot, so a
+    /// racing second one is refused. `release_pending_profiles` hands it
+    /// back when nothing was minted.
+    pub fn claim_pending_profile(&self, uuid: &str) -> Result<AccountProfile, QuboError> {
+        let mut pending = self.lock_pending_profiles();
+        let waiting = pending
+            .as_mut()
+            .filter(|state| !state.claimed)
+            .ok_or(QuboError::Auth {
+                code: None,
+                message: "no login is waiting for a profile choice".to_owned(),
+            })?;
+        let profile = select_profile(&waiting.profiles, uuid)?;
+        waiting.claimed = true;
+        Ok(profile)
     }
 
     /// The choice was made or abandoned; nothing is pending any more.
@@ -147,7 +164,14 @@ impl QuboClient {
         *self.lock_pending_profiles() = None;
     }
 
-    fn lock_pending_profiles(&self) -> std::sync::MutexGuard<'_, Option<Vec<AccountProfile>>> {
+    /// Nothing was persisted: the choice is open again for another pick.
+    pub fn release_pending_profiles(&self) {
+        if let Some(state) = self.lock_pending_profiles().as_mut() {
+            state.claimed = false;
+        }
+    }
+
+    fn lock_pending_profiles(&self) -> std::sync::MutexGuard<'_, Option<PendingProfiles>> {
         self.pending_profiles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -576,13 +576,84 @@ async fn verify_with_two_profiles_asks_for_a_pick() {
         two_profile_field(1, "uuid"),
         "both uuids are offered"
     );
-    assert!(
-        offered[1]["email"].is_string(),
-        "the emails tell the accounts apart: {body}"
+    for entry in offered {
+        let mut keys: Vec<&str> = entry
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["email", "name", "uuid"],
+            "exactly the picker's keys - name stays, no token rides: {entry}"
+        );
+    }
+    session_untouched(&h);
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn verify_offers_only_accounts_that_can_mint() {
+    let h = harness().await;
+    let profiles = json!([
+        {"accessToken": "token-1", "uuid": "mailable-uuid", "name": "A", "email": "a@example.com"},
+        {"accessToken": "token-2", "uuid": "silent-uuid", "name": "B"},
+    ])
+    .to_string();
+    mount_login(&h, &profiles).await;
+
+    let response = ask_and_verify(&h).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "a pick is asked"
     );
+    let body: Value = response.json().await.expect("json");
+    let offered = body["profiles"].as_array().expect("a profile list");
+    assert_eq!(
+        offered.len(),
+        1,
+        "the emailless account is not offered: {body}"
+    );
+    assert_eq!(
+        offered[0]["uuid"], "mailable-uuid",
+        "only the mailable account is a choice"
+    );
+    let mut keys: Vec<&str> = offered[0]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["email", "name", "uuid"], "exactly the picker's keys");
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn verify_refuses_when_no_account_can_mint() {
+    let h = harness().await;
+    let profiles = json!([
+        {"accessToken": "token-1", "uuid": "silent-1", "name": "A"},
+        {"accessToken": "token-2", "uuid": "silent-2", "name": "B"},
+    ])
+    .to_string();
+    mount_login(&h, &profiles).await;
+
+    let response = ask_and_verify(&h).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "no account that can sign in is an honest refusal, not a dead picker"
+    );
+    let body: Value = response.json().await.expect("json");
     assert!(
-        offered[0].get("accessToken").is_none(),
-        "profile tokens never reach the browser: {body}"
+        body["error"].as_str().expect("a reason").contains("email"),
+        "the reason names what is missing: {body}"
     );
     session_untouched(&h);
     let _ = std::fs::remove_dir_all(&h.data_dir);
@@ -615,6 +686,42 @@ async fn verify_with_one_profile_signs_in_without_a_pick() {
         stored.contains("synthetic.minted.refresh"),
         "with the refresh token that makes the session durable: {stored}"
     );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn a_mint_without_a_refresh_token_leaves_the_session_alone() {
+    let h = harness().await;
+    mount_login(
+        &h,
+        include_str!("../../qubo/tests/fixtures/otp_verify.json"),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(EMAILPROFILE_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"accessToken":"minted","uuid":"user-uuid-1"}"#),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    let response = ask_and_verify(&h).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a mint without the durable half is an upstream failure"
+    );
+    let body: Value = response.json().await.expect("json");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("a reason")
+            .contains("refreshToken"),
+        "the reason names the missing field: {body}"
+    );
+    session_untouched(&h);
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
@@ -675,6 +782,187 @@ async fn selecting_a_profile_signs_in_with_the_chosen_account() {
         subscriber,
         two_profile_field(1, "accessToken"),
         "the chosen account's token is what mints, not the first account's"
+    );
+    assert!(
+        stored.contains(&second),
+        "the chosen identity lands in the session: {stored}"
+    );
+
+    // The pick is spent: nothing is waiting for a second answer.
+    let raced = client()
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": two_profile_field(0, "uuid") }))
+        .send()
+        .await
+        .expect("the second pick");
+    assert_eq!(
+        raced.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a completed pick consumes the pending set"
+    );
+    let body: Value = raced.json().await.expect("json");
+    assert_eq!(
+        body["error"],
+        json!("auth error: no login is waiting for a profile choice"),
+        "the second pick is refused as nothing waiting"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn two_concurrent_picks_mint_once() {
+    let h = harness().await;
+    mount_login(
+        &h,
+        include_str!("../../qubo/tests/fixtures/otp_verify_two.json"),
+    )
+    .await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(EMAILPROFILE_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!(
+                    "../../qubo/tests/fixtures/emailprofile_login.json"
+                ))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&h.qubo)
+        .await;
+    assert_eq!(
+        ask_and_verify(&h).await.status(),
+        reqwest::StatusCode::OK,
+        "a pick is asked"
+    );
+
+    let browser = client();
+    let first = browser
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": two_profile_field(0, "uuid") }))
+        .send();
+    let second = browser
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": two_profile_field(1, "uuid") }))
+        .send();
+    let (one, two) = tokio::join!(first, second);
+    let mut statuses = vec![
+        one.expect("one pick answers").status(),
+        two.expect("the other pick answers").status(),
+    ];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            reqwest::StatusCode::NO_CONTENT,
+            reqwest::StatusCode::UNAUTHORIZED
+        ],
+        "one pick mints; the racing one is refused"
+    );
+    let mints = h
+        .qubo
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|request| request.url.path() == EMAILPROFILE_PATH)
+        .count();
+    assert_eq!(mints, 1, "exactly one mint is spent");
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("synthetic.minted.access"),
+        "the winner's session lands: {stored}"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn a_failed_mint_puts_the_pick_back() {
+    let h = harness().await;
+    mount_login(
+        &h,
+        include_str!("../../qubo/tests/fixtures/otp_verify_two.json"),
+    )
+    .await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(EMAILPROFILE_PATH))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream hiccup"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mount_mint(&h.qubo).await;
+    assert_eq!(
+        ask_and_verify(&h).await.status(),
+        reqwest::StatusCode::OK,
+        "a pick is asked"
+    );
+    let second = two_profile_field(1, "uuid");
+    let browser = client();
+
+    let first = browser
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": second }))
+        .send()
+        .await
+        .expect("select");
+    assert_eq!(
+        first.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a failed mint is not a login"
+    );
+
+    let retry = browser
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": second }))
+        .send()
+        .await
+        .expect("retry select");
+    assert_eq!(
+        retry.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the failed pick is open again"
+    );
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("synthetic.minted.access"),
+        "the retry's session lands: {stored}"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn requesting_a_new_code_drops_the_picker() {
+    let h = harness().await;
+    mount_login(
+        &h,
+        include_str!("../../qubo/tests/fixtures/otp_verify_two.json"),
+    )
+    .await;
+    assert_eq!(
+        ask_and_verify(&h).await.status(),
+        reqwest::StatusCode::OK,
+        "a pick is asked"
+    );
+
+    let again = client()
+        .post(format!("{}/api/login/otp", h.base))
+        .json(&json!({ "phone": "9876543210" }))
+        .send()
+        .await
+        .expect("a new code");
+    assert_eq!(again.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let stale = client()
+        .post(format!("{}/api/login/select", h.base))
+        .json(&json!({ "uuid": two_profile_field(0, "uuid") }))
+        .send()
+        .await
+        .expect("the stale pick");
+    assert_eq!(
+        stale.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a new code ends the old picker"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

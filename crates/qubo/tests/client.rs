@@ -9,6 +9,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use qubo::auth::AccountProfile;
 use qubo::client::QuboClient;
 use qubo::error::QuboError;
 use qubo::session::Session;
@@ -122,4 +123,45 @@ async fn malformed_json_maps_to_parse_without_panicking() {
         matches!(err, QuboError::Parse(_)),
         "expected Parse, got {err:?}"
     );
+}
+
+fn profile(uuid: &str) -> AccountProfile {
+    AccountProfile {
+        access_token: format!("token-{uuid}"),
+        uuid: uuid.to_owned(),
+        name: None,
+        email: Some(format!("{uuid}@example.com")),
+        refresh_token: None,
+    }
+}
+
+#[test]
+fn a_pick_is_claimed_once_and_released_alone() {
+    let base = "http://127.0.0.1:9/"
+        .parse()
+        .expect("a URL to carry, never to call");
+    let client = QuboClient::new(base, SP.into());
+    client.set_pending_profiles(vec![profile("u-1"), profile("u-2")]);
+
+    let picked = client
+        .claim_pending_profile("u-1")
+        .expect("the first pick claims");
+    assert_eq!(picked.uuid, "u-1", "the pick resolves by uuid");
+
+    let racing = client
+        .claim_pending_profile("u-2")
+        .expect_err("a claimed slot refuses the racing pick");
+    match racing {
+        QuboError::Auth { message, .. } => assert!(
+            message.contains("no login is waiting"),
+            "the refusal reads as nothing waiting: {message}"
+        ),
+        other => panic!("expected Auth, got {other:?}"),
+    }
+
+    client.release_pending_profiles();
+    let retry = client
+        .claim_pending_profile("u-2")
+        .expect("a released slot opens again");
+    assert_eq!(retry.uuid, "u-2", "the retry takes the other account");
 }

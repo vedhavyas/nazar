@@ -195,6 +195,28 @@ impl From<QuboError> for ApiError {
     }
 }
 
+/// A login failure worth the operator's eye: the deployed filter is info
+/// and nothing else records these. The variant and the upstream code,
+/// never the number or the code the person typed.
+fn login_failure(err: QuboError) -> ApiError {
+    let variant = match &err {
+        QuboError::Http { .. } => "http",
+        QuboError::Api { .. } => "api",
+        QuboError::Auth { .. } => "auth",
+        QuboError::Parse(_) => "parse",
+        QuboError::Io(_) => "io",
+    };
+    let upstream = match &err {
+        QuboError::Api { code, .. }
+        | QuboError::Auth {
+            code: Some(code), ..
+        } => code.as_str(),
+        _ => "none",
+    };
+    tracing::warn!(variant, upstream, "login failed");
+    err.into()
+}
+
 impl From<SupervisorError> for ApiError {
     fn from(err: SupervisorError) -> Self {
         match err {
@@ -301,7 +323,9 @@ async fn login_otp(
     State(state): State<AppState>,
     Json(body): Json<OtpRequest>,
 ) -> Result<StatusCode, ApiError> {
-    request_otp(&state.qubo, &body.phone).await?;
+    request_otp(&state.qubo, &body.phone)
+        .await
+        .map_err(login_failure)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -317,12 +341,26 @@ async fn login_verify(
     State(state): State<AppState>,
     Json(body): Json<VerifyRequest>,
 ) -> Result<Response, ApiError> {
-    let profiles = verify_otp(&state.qubo, &body.phone, &body.code).await?;
+    let profiles = verify_otp(&state.qubo, &body.phone, &body.code)
+        .await
+        .map_err(login_failure)?;
     if let [only] = profiles.as_slice() {
         finish_login(&state, only).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    let choices: Vec<Value> = profiles
+    // A profile without an email cannot mint - the mint's body's username
+    // is the email - so it is never offered as a choice.
+    let offered: Vec<AccountProfile> = profiles
+        .into_iter()
+        .filter(|profile| profile.email.is_some())
+        .collect();
+    if offered.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "none of this number's accounts carries an email to sign in with",
+        ));
+    }
+    let choices: Vec<Value> = offered
         .iter()
         .map(|profile| {
             json!({
@@ -332,7 +370,7 @@ async fn login_verify(
             })
         })
         .collect();
-    state.qubo.set_pending_profiles(profiles);
+    state.qubo.set_pending_profiles(offered);
     Ok(Json(json!({ "profiles": choices })).into_response())
 }
 
@@ -346,14 +384,22 @@ async fn login_select(
     State(state): State<AppState>,
     Json(body): Json<SelectRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let profile = state.qubo.pending_profile(&body.uuid)?;
-    finish_login(&state, &profile).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let profile = state.qubo.claim_pending_profile(&body.uuid)?;
+    match finish_login(&state, &profile).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(err) => {
+            // Nothing was persisted; the pick is open again for a retry.
+            state.qubo.release_pending_profiles();
+            Err(err)
+        }
+    }
 }
 
 /// The chosen profile's mint, and the session it becomes.
 async fn finish_login(state: &AppState, profile: &AccountProfile) -> Result<(), ApiError> {
-    let session = phone_login(&state.qubo, profile).await?;
+    let session = phone_login(&state.qubo, profile)
+        .await
+        .map_err(login_failure)?;
     persist_login(state, session).await
 }
 
@@ -364,6 +410,8 @@ async fn persist_login(state: &AppState, session: Session) -> Result<(), ApiErro
     blocking(move || sessions.save(&session))
         .await?
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    // Also drops an in-flight picker in another tab: its next pick is
+    // refused with the true "no login is waiting" reason.
     state.qubo.clear_pending_profiles();
     if let Err(err) = state.supervisor.refresh_devices().await {
         tracing::warn!(%err, "device discovery after login failed");
@@ -383,7 +431,9 @@ async fn login_google(
     State(state): State<AppState>,
     Json(body): Json<GoogleLoginRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let session = verify_google(&state.qubo, &body.id_token).await?;
+    let session = verify_google(&state.qubo, &body.id_token)
+        .await
+        .map_err(login_failure)?;
     persist_login(&state, session).await?;
     Ok(StatusCode::NO_CONTENT)
 }
