@@ -350,6 +350,11 @@ pub fn start(
                     let Some(notification) = store.push(&event, Instant::now()) else {
                         continue;
                     };
+                    // The telling goes out before the still is resolved: a
+                    // grab is a go2rtc round-trip per event, and a burst
+                    // waiting on those overflows the consumer. The still
+                    // attaches when it lands; the list serves it.
+                    store.announce(&notification);
                     let url = match &event {
                         // The feed's own still, when it was fetchable.
                         UnitEvent::Motion {
@@ -360,20 +365,22 @@ pub fn start(
                         }
                         _ => None,
                     };
-                    if let Some(url) = url {
-                        store.attach(&notification.id, url);
-                    }
-                    let final_shape = store.get(&notification.id).unwrap_or(notification);
+                    let attached = match url {
+                        Some(url) => {
+                            store.attach(&notification.id, url);
+                            store.get(&notification.id).unwrap_or(notification)
+                        }
+                        None => notification,
+                    };
                     // The timeline keeps its own, longer memory of motion -
                     // the bell's ring is a screen's worth, not a day's.
-                    if matches!(final_shape.kind, Kind::Motion) {
+                    if matches!(attached.kind, Kind::Motion) {
                         episodes.record(
-                            &final_shape.device_id,
-                            final_shape.at,
-                            final_shape.snapshot_url.clone(),
+                            &attached.device_id,
+                            attached.at,
+                            attached.snapshot_url.clone(),
                         );
                     }
-                    store.announce(&final_shape);
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::warn!(missed, "the notification service fell behind a burst");

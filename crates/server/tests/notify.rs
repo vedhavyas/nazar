@@ -522,6 +522,67 @@ async fn a_motion_is_also_an_episode_for_the_timeline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The telling must not wait on go2rtc: the frame goes out as the motion
+/// is recorded, and the still attaches when it lands. A burst that has to
+/// wait on a grab per event overflows the consumer instead.
+#[tokio::test]
+async fn the_bell_rings_before_the_still_is_resolved() {
+    let dir = temp_dir("notify-prompt");
+    let store = store_in(&dir);
+    let h = harness(Arc::clone(&store)).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/stream-manager/api/v1/sp/{SP}/stream/unit/{UNIT}/device/{CAMERA}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({
+                "streamURL": "rtsps://wowza2.platform.quboworld.com:443/x/cam?token=t",
+                "sessionId": "s1",
+            })
+            .to_string(),
+        ))
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+    let started = browser
+        .post(format!("{}/api/cameras/{CAMERA}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+    assert_eq!(started.status(), reqwest::StatusCode::OK);
+    let live = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(name, _)| name == &format!("{CAMERA}-high"))
+    })
+    .await;
+    assert!(live, "a pipeline is running, so the grab is a real one");
+
+    let mut told = store.subscribe();
+    h.events.publish(motion(CAMERA));
+    let frame = tokio::time::timeout(Duration::from_secs(2), told.recv())
+        .await
+        .expect("the telling is prompt")
+        .expect("a notification");
+    assert_eq!(
+        frame.snapshot_url, None,
+        "the frame went out before the still was resolved"
+    );
+
+    let attached = common::eventually(|| async {
+        h.store
+            .list()
+            .first()
+            .is_some_and(|entry| entry.snapshot_url.is_some())
+    })
+    .await;
+    assert!(attached, "and the still attaches when it lands");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_fetchable_image_on_the_event_wins() {
     let dir = temp_dir("notify-event-image");
