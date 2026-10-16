@@ -85,6 +85,13 @@ export interface Cameras {
 /** The two stream classes the gateway mints. */
 export type Quality = 'high' | 'low';
 
+/** One account to choose between when a number maps to several. */
+export interface ProfileChoice {
+  uuid: string;
+  name: string | null;
+  email: string | null;
+}
+
 /** The server's hero decision: the camera that last saw the house move. */
 export interface MotionHero {
   hero: string | null;
@@ -160,7 +167,13 @@ function post(path: string, body: unknown): Promise<void> {
 export const api = {
   health: () => call<{ ok: boolean; version: string }>('/api/health'),
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
-  verifyOtp: (phone: string, code: string) => post('/api/login/verify', { phone, code }),
+  // 204 signs straight in; a 200 answers the accounts to pick between.
+  verifyOtp: (phone: string, code: string) =>
+    call<{ profiles: ProfileChoice[] } | undefined>('/api/login/verify', {
+      method: 'POST',
+      body: JSON.stringify({ phone, code }),
+    }),
+  selectProfile: (uuid: string) => post('/api/login/select', { uuid }),
   cameras: () => call<Cameras>('/api/cameras'),
   // `retry=true`, spelled out: the server's query parser takes the words,
   // not `1`, and a wrong spelling is a 400 at the wire.
