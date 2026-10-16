@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts as _, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -206,6 +207,53 @@ impl From<SupervisorError> for ApiError {
     }
 }
 
+/// The two origins the shells fetch from: the Android and Windows webviews
+/// serve the SPA from `http://tauri.localhost`, the macOS and Linux ones
+/// from `tauri://localhost`. In a browser the SPA is served by this server
+/// itself and none of this applies; a shell's webview is cross-origin by
+/// construction, and the browser blocks every read without the grants
+/// below.
+const SHELL_ORIGINS: [&str; 2] = ["http://tauri.localhost", "tauri://localhost"];
+
+/// Answer the shells' cross-origin fetches. Only the shells' own origins may
+/// read the API: the server holds the Qubo session, and any other page on
+/// the mesh must not be able to read the family's house through it.
+async fn shell_cors(request: Request, next: Next) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let Some(origin) = origin.filter(|origin| SHELL_ORIGINS.contains(&origin.as_str())) else {
+        return next.run(request).await;
+    };
+
+    let mut response = if request.method() == Method::OPTIONS {
+        // A preflight is answered here, never routed: no handler takes
+        // OPTIONS, and the browser only needs the grants below.
+        let mut reply = Response::new(Body::empty());
+        *reply.status_mut() = StatusCode::NO_CONTENT;
+        reply.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE"),
+        );
+        reply.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("content-type"),
+        );
+        reply
+    } else {
+        next.run(request).await
+    };
+
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&origin) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("origin"));
+    response
+}
+
 /// The app's routes.
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -235,6 +283,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/events", get(events_socket))
         .route("/go2rtc/{*rest}", any(proxy))
         .fallback(spa)
+        .layer(axum::middleware::from_fn(shell_cors))
         .with_state(state)
 }
 

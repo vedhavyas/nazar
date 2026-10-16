@@ -910,3 +910,88 @@ async fn the_spa_serves_index_and_revalidates_with_etags() {
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
+
+#[tokio::test]
+async fn the_shells_origin_may_read_the_api() {
+    let h = harness().await;
+
+    // The Android/Windows webview serves the SPA from http://tauri.localhost,
+    // the macOS/Linux one from tauri://localhost; both are cross-origin to
+    // this server, and the browser blocks every read without the header.
+    for origin in ["http://tauri.localhost", "tauri://localhost"] {
+        let response = client()
+            .get(format!("{}/api/health", h.base))
+            .header("origin", origin)
+            .send()
+            .await
+            .expect("the call");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            origin,
+            "the shell's own webview may read the API"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn the_shells_preflight_is_answered() {
+    let h = harness().await;
+
+    let response = client()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/api/login/verify", h.base),
+        )
+        .header("origin", "http://tauri.localhost")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .expect("the preflight");
+
+    assert!(
+        response.status().is_success(),
+        "a preflight is answered, not routed: {}",
+        response.status()
+    );
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "http://tauri.localhost"
+    );
+    let methods = response.headers()["access-control-allow-methods"]
+        .to_str()
+        .expect("ascii");
+    assert!(methods.contains("POST"), "the method is allowed: {methods}");
+    let headers = response.headers()["access-control-allow-headers"]
+        .to_str()
+        .expect("ascii")
+        .to_ascii_lowercase();
+    assert!(
+        headers.contains("content-type"),
+        "the JSON body's header is allowed: {headers}"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn another_origin_stays_unreadable() {
+    let h = harness().await;
+
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .header("origin", "https://elsewhere.example")
+        .send()
+        .await
+        .expect("the call");
+
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "a page that is not one of the shells must not be able to read the API"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
