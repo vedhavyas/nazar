@@ -114,6 +114,7 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_millis(50),
             connect_window: Duration::from_millis(300),
+            liveness_poll: Duration::from_millis(50),
         },
     );
     let events = EventBus::new();

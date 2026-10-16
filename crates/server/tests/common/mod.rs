@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::Body;
 use axum::extract::ws::Message;
 use axum::extract::{Query, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -42,14 +41,20 @@ pub struct FakeApi {
     /// a source and reads no `remote_addr`, as a go2rtc whose ffmpeg cannot
     /// reach the camera. Empty means every held producer is connected.
     unconnected: Arc<Mutex<HashSet<String>>>,
-    /// The live consumers of `/api/stream.mpegts`, by stream: count and
-    /// when the first one attached. A producer is up only while a consumer
-    /// is, which is the whole point of the endpoint.
-    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    /// The attached viewers, by stream: count and when the first one
+    /// attached. A producer is up only while a consumer is, so this is
+    /// both the consumers count and the connect clock.
+    viewers: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    /// The minted-URL bookkeeping: (the put generation, the generation a
+    /// consumer has dialled). The wire's URL is one-shot, and the fake
+    /// models it: an attach in an already-dialled generation never
+    /// connects until a fresh put.
+    url_state: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// The streams whose current attach burst dialled the fresh URL.
+    dialed: Arc<Mutex<HashSet<String>>>,
     /// Per-stream delay between a consumer attaching and the producer
     /// connecting, for tests that need a slow source.
     connect_after: Arc<Mutex<HashMap<String, Duration>>>,
-    viewers: Arc<Mutex<HashMap<String, usize>>>,
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
@@ -67,12 +72,13 @@ impl FakeApi {
         let streams_error = Arc::new(AtomicBool::new(false));
         let producers = Arc::new(AtomicBool::new(true));
         let unconnected = Arc::new(Mutex::new(HashSet::new()));
-        let holds = Arc::new(Mutex::new(HashMap::new()));
         let connect_after = Arc::new(Mutex::new(HashMap::new()));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
+        let url_state = Arc::new(Mutex::new(HashMap::new()));
+        let dialed = Arc::new(Mutex::new(HashSet::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
         let ops = Arc::new(Mutex::new(Vec::new()));
-        let app = hls_routes(&holds).merge(streams_routes(
+        let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
             &Knobs {
@@ -81,7 +87,8 @@ impl FakeApi {
                 streams_error: &streams_error,
                 producers: &producers,
                 unconnected: &unconnected,
-                holds: &holds,
+                url_state: &url_state,
+                dialed: &dialed,
                 connect_after: &connect_after,
                 delete_delay: &delete_delay,
                 ops: &ops,
@@ -104,9 +111,10 @@ impl FakeApi {
             streams_error,
             producers,
             unconnected,
-            holds,
-            connect_after,
             viewers,
+            url_state,
+            dialed,
+            connect_after,
             delete_delay,
             ops,
         }
@@ -155,9 +163,28 @@ impl FakeApi {
     }
 
     /// Report `count` viewers on the stream, as go2rtc does while a browser
-    /// holds it open.
+    /// holds it open. The first attach is the clock the producer's connect
+    /// delay runs from; zero viewers clears it, as a departed consumer's
+    /// producer would stop. An attach after the URL's one dial, with no
+    /// fresh mint since, is what the wire answers with silence.
     pub fn set_viewers(&self, name: &str, count: usize) {
-        self.viewers.lock().unwrap().insert(name.to_owned(), count);
+        let mut viewers = self.viewers.lock().unwrap();
+        if count == 0 {
+            viewers.remove(name);
+            self.dialed.lock().unwrap().remove(name);
+            return;
+        }
+        if let Some((seen, _)) = viewers.get_mut(name) {
+            *seen = count;
+            return;
+        }
+        let mut urls = self.url_state.lock().unwrap();
+        let state = urls.entry(name.to_owned()).or_insert((0, 0));
+        if state.1 < state.0 {
+            state.1 = state.0;
+            self.dialed.lock().unwrap().insert(name.to_owned());
+        }
+        viewers.insert(name.to_owned(), (count, Instant::now()));
     }
 
     /// Answer stream PUTs with `status` from now on.
@@ -196,7 +223,8 @@ struct Knobs<'a> {
     streams_error: &'a Arc<AtomicBool>,
     producers: &'a Arc<AtomicBool>,
     unconnected: &'a Arc<Mutex<HashSet<String>>>,
-    holds: &'a Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    url_state: &'a Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    dialed: &'a Arc<Mutex<HashSet<String>>>,
     connect_after: &'a Arc<Mutex<HashMap<String, Duration>>>,
     delete_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
@@ -207,7 +235,7 @@ fn streams_routes(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
     knobs: &Knobs<'_>,
-    viewers: &Arc<Mutex<HashMap<String, usize>>>,
+    viewers: &Arc<Mutex<HashMap<String, (usize, Instant)>>>,
 ) -> Router {
     Router::new()
         .route(
@@ -240,21 +268,47 @@ fn streams_methods(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
     knobs: &Knobs<'_>,
-    viewers: &Arc<Mutex<HashMap<String, usize>>>,
+    viewers: &Arc<Mutex<HashMap<String, (usize, Instant)>>>,
 ) -> axum::routing::MethodRouter {
     let recorded = Arc::clone(puts);
     let status = Arc::clone(knobs.put_status);
     let ops = Arc::clone(knobs.ops);
+    let urls = Arc::clone(knobs.url_state);
+    let dialed = Arc::clone(knobs.dialed);
+    let served = Arc::clone(viewers);
     let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
         let recorded = Arc::clone(&recorded);
         let status = Arc::clone(&status);
         let ops = Arc::clone(&ops);
+        let urls = Arc::clone(&urls);
+        let dialed = Arc::clone(&dialed);
+        let served = Arc::clone(&served);
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
             recorded
                 .lock()
                 .unwrap()
                 .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
+            // A fresh source is a fresh URL. Attached viewers ride the
+            // swap, as go2rtc swaps the source under the stream's name:
+            // their producer restarts and dials the new URL, spending its
+            // one dial for this generation. With nobody attached the URL
+            // stays unspent, and the next new attach is the one that
+            // dials it.
+            let riding = served.lock().unwrap().contains_key(&name);
+            {
+                let mut urls = urls.lock().unwrap();
+                let state = urls.entry(name.clone()).or_insert((0, 0));
+                state.0 += 1;
+                if riding {
+                    state.1 = state.0;
+                }
+            }
+            if riding {
+                dialed.lock().unwrap().insert(name.clone());
+            } else {
+                dialed.lock().unwrap().remove(&name);
+            }
             ops.lock().unwrap().push(format!("put:{name}"));
             let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
             // A rejected PUT quotes the source back, as go2rtc's own
@@ -298,7 +352,7 @@ fn streams_methods(
         error: Arc::clone(knobs.streams_error),
         running: Arc::clone(knobs.producers),
         unconnected: Arc::clone(knobs.unconnected),
-        holds: Arc::clone(knobs.holds),
+        dialed: Arc::clone(knobs.dialed),
         connect_after: Arc::clone(knobs.connect_after),
     });
     put_stream.delete(drop_stream).get(list_streams)
@@ -310,11 +364,11 @@ fn streams_methods(
 struct StreamsAnswer {
     recorded: Arc<Mutex<Vec<(String, String)>>>,
     visible: Arc<AtomicBool>,
-    viewers: Arc<Mutex<HashMap<String, usize>>>,
+    viewers: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
     error: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     unconnected: Arc<Mutex<HashSet<String>>>,
-    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+    dialed: Arc<Mutex<HashSet<String>>>,
     connect_after: Arc<Mutex<HashMap<String, Duration>>>,
 }
 
@@ -328,7 +382,7 @@ fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
             error,
             running,
             unconnected,
-            holds,
+            dialed,
             connect_after,
         } = state.clone();
         async move {
@@ -344,30 +398,27 @@ fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
                 return "{}".to_owned();
             }
             let viewers = viewers.lock().unwrap().clone();
-            let holds = holds.lock().unwrap().clone();
             let connect_after = connect_after.lock().unwrap().clone();
             // go2rtc materializes a producer as soon as the source is set.
             let mut streams = serde_json::Map::new();
             for (name, source) in recorded {
-                let watching = viewers.get(&name).copied().unwrap_or(0);
-                let (holding, since) = holds
+                let (watching, since) = viewers
                     .get(&name)
                     .map_or((0, None), |(count, at)| (*count, Some(*at)));
-                // The mpegts connections are consumers, as go2rtc counts
-                // them: present for exactly as long as they are held.
-                let total = watching + holding;
                 // Measured shape: no consumers is `null`.
-                let consumers = (total > 0).then(|| {
-                    (0..total)
+                let consumers = (watching > 0).then(|| {
+                    (0..watching)
                         .map(|_| serde_json::json!({ "id": "viewer" }))
                         .collect::<Vec<_>>()
                 });
                 let running_now = running.load(Ordering::SeqCst);
-                // Connects once a consumer is holding it AND the source
-                // answers; the deny-list is the camera turning the ffmpeg
-                // away, and `connect_after` is a slow push.
+                // Connects once a consumer is attached AND the source
+                // answers AND the URL still has its one dial; the deny-list
+                // is the camera turning the ffmpeg away, and
+                // `connect_after` is a slow push.
                 let delay = connect_after.get(&name).copied().unwrap_or_default();
-                let connected = since.is_some_and(|at| at.elapsed() >= delay)
+                let connected = dialed.lock().unwrap().contains(&name)
+                    && since.is_some_and(|at| at.elapsed() >= delay)
                     && !unconnected.lock().unwrap().contains(&name);
                 streams.insert(
                     name,
@@ -391,40 +442,8 @@ fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
     })
 }
 
-/// A live consumer on the fake's mpegts stream: counted while it lives,
-/// released when the connection drops - the moment go2rtc stops a producer
-/// whose last consumer has left.
-struct HoldGuard {
-    name: String,
-    holds: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
-}
-
-impl HoldGuard {
-    fn attach(&self) {
-        let mut holds = self.holds.lock().unwrap();
-        holds
-            .entry(self.name.clone())
-            .and_modify(|(count, _)| *count += 1)
-            .or_insert((1, Instant::now()));
-    }
-}
-
-impl Drop for HoldGuard {
-    fn drop(&mut self) {
-        let mut holds = self.holds.lock().unwrap();
-        if let Some((count, _)) = holds.get_mut(&self.name) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                holds.remove(&self.name);
-            }
-        }
-    }
-}
-
-/// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them, plus the
-/// mpegts endpoint a standing consumer rides.
-fn hls_routes(holds: &Arc<Mutex<HashMap<String, (usize, Instant)>>>) -> Router {
-    let holds = Arc::clone(holds);
+/// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them.
+fn hls_routes() -> Router {
     Router::new()
         .route(
             "/api/stream.m3u8",
@@ -436,28 +455,6 @@ fn hls_routes(holds: &Arc<Mutex<HashMap<String, (usize, Instant)>>>) -> Router {
                         "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
                     ),
                     None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
-                }
-            }),
-        )
-        .route(
-            "/api/stream.mpegts",
-            get(move |Query(params): Query<HashMap<String, String>>| {
-                let holds = Arc::clone(&holds);
-                async move {
-                    let Some(src) = params.get("src").cloned() else {
-                        return (StatusCode::NOT_FOUND, Body::empty());
-                    };
-                    let guard = HoldGuard { name: src, holds };
-                    guard.attach();
-                    // An endless body, holding the guard: the stream lives
-                    // until the client's connection drops.
-                    let endless = futures_util::stream::poll_fn(move |_| {
-                        let _ = &guard;
-                        std::task::Poll::<
-                            Option<Result<Vec<u8>, std::convert::Infallible>>,
-                        >::Pending
-                    });
-                    (StatusCode::OK, Body::from_stream(endless))
                 }
             }),
         )

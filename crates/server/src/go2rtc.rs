@@ -244,30 +244,6 @@ impl Go2rtc {
             .collect())
     }
 
-    /// Hold a consumer on the stream for as long as the caller keeps the
-    /// response: a running read is the only thing that keeps go2rtc's
-    /// producer up. Measured on go2rtc 1.9.14: an HLS request's consumer
-    /// is removed by the 5s keepalive and its producer then stops, so a
-    /// check that merely starts a producer leaves it dead moments later -
-    /// and the minted URL, being one-shot, is spent by the attempt.
-    pub async fn hold(&self, name: &str) -> Result<reqwest::Response, Go2rtcError> {
-        let response = self
-            .http
-            .get(self.api_for("/api/stream.mpegts")?)
-            .query(&[("src", name)])
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(Go2rtcError::Rejected {
-                status: status.as_u16(),
-                body: snippet(&text),
-            });
-        }
-        Ok(response)
-    }
-
     /// Kill the spawned process, if this instance owns one.
     pub async fn stop(&mut self) -> Result<(), Go2rtcError> {
         let Some(child) = &mut self.child else {
