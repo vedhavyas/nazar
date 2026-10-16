@@ -55,6 +55,11 @@ pub struct Pacing {
     /// is loopback - and it is what notices a dead picture before the next
     /// mint's cadence would.
     pub liveness_poll: Duration,
+    /// How long a viewer's ask keeps counting as a viewer. Must outlast
+    /// the slowest client cadence that re-asks - the HLS fallback's
+    /// playlist refresh, an away-mode tile's still interval (~10s) - and
+    /// it is what ends a stall whose viewer has gone.
+    pub touch_ttl: Duration,
 }
 
 impl Default for Pacing {
@@ -68,6 +73,7 @@ impl Default for Pacing {
             connect_grace: Duration::from_secs(8),
             connect_window: Duration::from_secs(90),
             liveness_poll: Duration::from_secs(2),
+            touch_ttl: Duration::from_secs(30),
         }
     }
 }
@@ -137,6 +143,11 @@ pub struct Supervisor {
     /// When discovery last ran, so a refused session is re-tried on a
     /// cadence rather than on every gated request.
     last_discovery: Arc<Mutex<Option<Instant>>>,
+    /// When a viewer last asked for a stream, from the server's own
+    /// vantage points (the proxy's signalling socket and HLS master): the
+    /// only sighting that survives a failed attach, which go2rtc's API
+    /// does not trace at all.
+    touches: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl Supervisor {
@@ -150,7 +161,22 @@ impl Supervisor {
             devices: Arc::new(RwLock::new(Vec::new())),
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
+            touches: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// A viewer's ask, as narar itself sees it. The ask is normalized to
+    /// the cloud stream: a tile's ask for the low rendition counts for the
+    /// high stream that carries it, and a playback stream's ask counts for
+    /// nothing here - its own lifecycle judges it.
+    pub fn note_viewer_touch(&self, src: &str) {
+        let Some(name) = touched_high(src) else {
+            return;
+        };
+        self.touches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name, Instant::now());
     }
 
     /// Whether a refused session's re-discovery is worth trying yet.
@@ -652,15 +678,34 @@ impl Supervisor {
         Ok(())
     }
 
-    /// When the stream's producer is not up while viewers are attached -
-    /// the moment that state began, as `now`. `None` when there is nothing
-    /// to judge: no consumers (the URL is still unspent, a fresh one is
-    /// what any viewer dials), or go2rtc unreadable (the next check will
-    /// say).
+    /// When the stream's producer is not up while somebody is on it - the
+    /// moment that state began, as the server saw it. A viewer shows up as
+    /// a consumer once a session opens, or as the ask itself - the
+    /// proxy's sighting of a socket or a playlist request - which is the
+    /// only trace a failed attach leaves anywhere (measured live
+    /// 2026-10-16). `None` when there is nothing to judge: nobody
+    /// attached and no recent ask (the URL is still unspent, a fresh one
+    /// is what the next viewer dials), or go2rtc unreadable (the next
+    /// check will say).
     async fn watched_but_unconnected(&self, name: &str) -> Option<Instant> {
         let streams = self.go2rtc.streams().await.ok()?;
         let stream = streams.iter().find(|stream| stream.name == name)?;
-        (stream.consumers > 0 && !stream.connected).then(Instant::now)
+        if stream.connected {
+            return None;
+        }
+        // The ask is the clock: the grace runs from the viewer's own
+        // attempt, not from when a poll noticed it.
+        let asked = self
+            .touches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .copied()
+            .filter(|at| at.elapsed() <= self.pacing.touch_ttl);
+        if let Some(at) = asked {
+            return Some(at);
+        }
+        (stream.consumers > 0).then(Instant::now)
     }
 
     /// The liveness watch, once per loop slice: a viewer on a picture whose
@@ -918,6 +963,19 @@ impl Supervisor {
 fn low_name_of(high: &str) -> Option<String> {
     high.strip_suffix("-high")
         .map(|device| format!("{device}-low"))
+}
+
+/// The cloud stream a viewer's ask belongs to: a live stream's own name,
+/// the high stream behind a tile's low rendition, and nothing for a
+/// playback stream or anything unrecognized.
+fn touched_high(src: &str) -> Option<String> {
+    if src.starts_with(VOD_PREFIX) {
+        return None;
+    }
+    match src.rsplit_once('-') {
+        Some((camera, "high" | "low")) => Some(format!("{camera}-high")),
+        _ => None,
+    }
 }
 
 fn new_tracked() -> Tracked {

@@ -17,7 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{Quality, QuboClient, Session, SessionStore};
 use server::go2rtc::Go2rtc;
-use server::supervisor::{Pacing, StreamState, Supervisor, stream_name};
+use server::supervisor::{Pacing, StreamState, Supervisor, stream_name, vod_name};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
@@ -47,6 +47,7 @@ fn pacing(remint: Duration) -> Pacing {
         connect_grace: Duration::from_millis(50),
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
+        touch_ttl: Duration::from_millis(300),
     }
 }
 
@@ -318,6 +319,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         connect_grace: Duration::from_millis(50),
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
+        touch_ttl: Duration::from_millis(300),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -953,6 +955,133 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         degraded,
         "the window lands on its own deadline despite the refused mints: {:?}",
         h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A viewer's ask is what the server sees of a viewer directly: an attach
+/// whose producer never starts registers no consumer at go2rtc (measured
+/// live 2026-10-16), so the ask itself is the clock. A dead stream a
+/// viewer is knocking on is re-minted with no consumer ever attached.
+#[tokio::test]
+async fn a_viewers_ask_heals_a_dead_stream_without_a_consumer() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor.note_viewer_touch(&name);
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(
+        reminted,
+        "the ask sent a fresh URL out: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A tile asks for the low rendition, and the tile's ask counts for the
+/// cloud stream that carries it.
+#[tokio::test]
+async fn a_tiles_ask_counts_for_its_cloud_stream() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor
+        .note_viewer_touch(&stream_name(DEVICE_ID, Quality::Low));
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(
+        reminted,
+        "the tile's ask sent a fresh URL out: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A playback stream's ask, and an ask that names nothing, leave the live
+/// loop alone.
+#[tokio::test]
+async fn a_playback_ask_does_not_touch_the_live_stream() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor.note_viewer_touch(&vod_name(DEVICE_ID));
+    h.supervisor.note_viewer_touch("nonsense");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        1,
+        "nothing re-minted: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A stall whose viewer has gone ends with the ask window: no fresh URLs
+/// are minted for an empty house.
+#[tokio::test]
+async fn an_expired_ask_stops_the_re_minting() {
+    let h = harness(Pacing {
+        touch_ttl: Duration::from_millis(150),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor.note_viewer_touch(&name);
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(reminted, "the ask heals first: {:?}", h.go2rtc.puts());
+
+    // The viewer never comes back; the ask expires and the loop stands down.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let settled = h.go2rtc.puts().len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        settled,
+        "the expired ask mints nothing more: {:?}",
+        h.go2rtc.puts()
+    );
+    assert!(
+        is_live(&h.supervisor).await,
+        "and the stream returns to live"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

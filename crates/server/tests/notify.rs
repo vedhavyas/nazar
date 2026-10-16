@@ -383,6 +383,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             connect_grace: Duration::from_millis(50),
             connect_window: Duration::from_millis(300),
             liveness_poll: Duration::from_millis(50),
+            touch_ttl: Duration::from_millis(300),
         },
     );
     let episodes = common::episodes_in(&data_dir);

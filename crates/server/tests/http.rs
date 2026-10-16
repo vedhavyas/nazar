@@ -41,9 +41,25 @@ struct Harness {
     base: String,
     qubo: MockServer,
     data_dir: PathBuf,
+    go2rtc: common::FakeApi,
 }
 
 async fn harness() -> Harness {
+    harness_with(Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_secs(30),
+        retry_max: Duration::from_secs(30),
+        discovery_retry: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(120),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
+        liveness_poll: Duration::from_millis(50),
+        touch_ttl: Duration::from_millis(300),
+    })
+    .await
+}
+
+async fn harness_with(pacing: Pacing) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = std::env::temp_dir().join(format!(
@@ -67,16 +83,7 @@ async fn harness() -> Harness {
         client.clone(),
         sessions.clone(),
         Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
-        Pacing {
-            remint: Duration::from_secs(30),
-            retry_base: Duration::from_secs(30),
-            retry_max: Duration::from_secs(30),
-            discovery_retry: Duration::from_secs(30),
-            stream_idle: Duration::from_secs(120),
-            connect_grace: Duration::from_millis(50),
-            connect_window: Duration::from_millis(300),
-            liveness_poll: Duration::from_millis(50),
-        },
+        pacing,
     );
     let state = AppState::new(
         "test",
@@ -108,6 +115,7 @@ async fn harness() -> Harness {
         base,
         qubo,
         data_dir,
+        go2rtc,
     }
 }
 
@@ -597,6 +605,79 @@ async fn a_gateway_auth_failure_reads_as_unauthorized() {
         refused.json::<Value>().await.expect("json")["error"],
         json!("auth error: User Token expired, Access denied"),
         "the gateway's words ride the envelope"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+/// The viewer's ask through the proxy - the signalling socket or the HLS
+/// fallback's master - is the server's own sighting of a viewer: a dead
+/// stream is re-minted off the ask even though a failed attach registers
+/// no consumer anywhere (measured live 2026-10-16).
+#[tokio::test]
+async fn a_proxied_viewer_ask_heals_a_dead_stream() {
+    let h = harness_with(Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_millis(20),
+        retry_max: Duration::from_millis(200),
+        discovery_retry: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(120),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
+        liveness_poll: Duration::from_millis(50),
+        touch_ttl: Duration::from_millis(300),
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({
+                "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}_CAMERA_VOD0?token=live"),
+                "sessionId": "session-1",
+            })
+            .to_string(),
+        ))
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+
+    // Fill the device list, open the stream, let the first mint land.
+    assert_eq!(
+        browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let watch = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+    assert_eq!(watch.status(), reqwest::StatusCode::OK);
+    let minted = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
+    assert!(minted, "the stream's first mint reached go2rtc");
+
+    // The producer goes down, as the keepalive leaves a stream nobody
+    // consumes - and nobody has a consumer open here, ever: the ask is
+    // all the server sees.
+    let name = format!("{DEVICE_ID}-high");
+    h.go2rtc.disconnect_producer(&name);
+
+    let played = browser
+        .get(format!("{}/go2rtc/api/stream.m3u8?src={name}", h.base))
+        .send()
+        .await
+        .expect("the viewer's fallback request");
+    assert_eq!(played.status(), reqwest::StatusCode::OK);
+
+    let healed = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(
+        healed,
+        "the ask re-minted a fresh URL: {:?}",
+        h.go2rtc.puts()
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
