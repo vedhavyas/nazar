@@ -17,8 +17,10 @@
   let day = $state<string | null>(null);
   let clips = $state<Clip[]>([]);
   let loaded = $state(false);
-  /** The running playback: the stream, and where it sits. */
-  let playing = $state<{ stream: string; at: number } | null>(null);
+  /** The running playback: the stream, where it sits, and whose it is -
+   * the release must go to the camera the session was minted for, not
+   * whichever tab is showing when the player leaves. */
+  let playing = $state<{ stream: string; at: number; camera: string } | null>(null);
 
   /** How far back the day picker looks. */
   const DAYS_WINDOW_MS = 30 * 86_400_000;
@@ -87,25 +89,46 @@
     await loadDays();
   }
 
+  /** Bumped whenever the screen moves on - a camera switch, a departure,
+   * a newer seek: a mint that lands after it is nobody's. */
+  let generation = 0;
+
   /** Start (or move) the playback: a mint at the instant asked for. */
   async function seek(timestamp: number) {
     error = '';
+    const mine = ++generation;
+    const forCamera = camera;
     try {
-      const started = await api.playback(camera, timestamp);
-      playing = { stream: started.stream, at: timestamp };
+      const started = await api.playback(forCamera, timestamp);
+      if (mine !== generation) {
+        // The screen moved on while the mint was in flight: the session is
+        // nobody's, and it is released against the camera it was minted
+        // for - never the one showing now.
+        await release(forCamera);
+        return;
+      }
+      playing = { stream: started.stream, at: timestamp, camera: forCamera };
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
   }
 
-  /** The player left: release the session rather than leave it to idle. */
-  async function stop() {
-    if (!playing) return;
-    playing = null;
+  /** Release one camera's session, whatever this screen is showing now. */
+  async function release(forCamera: string) {
     try {
-      await api.playbackStop(camera);
+      await api.playbackStop(forCamera);
     } catch {
       // The session still idles out on the server; nothing to tell here.
+    }
+  }
+
+  /** The player left: release the session rather than leave it to idle. */
+  async function stop() {
+    generation += 1;
+    const open = playing;
+    playing = null;
+    if (open) {
+      await release(open.camera);
     }
   }
 

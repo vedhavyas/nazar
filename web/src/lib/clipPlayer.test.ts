@@ -264,6 +264,67 @@ test('a tab that comes back asks for the session again', async () => {
   });
 });
 
+test('a mint that lands after the tab moved is released against its camera', async () => {
+  const calls: string[] = [];
+  let landTheMint: (() => void) | null = null;
+  const mock = vi.fn(async (url: string, init?: RequestInit) => {
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    if (url === '/api/cameras') {
+      return json({
+        cameras: [
+          { id: 'cam-1', name: 'Hall', state: 'live', reason: null },
+          { id: 'cam-2', name: 'Gate', state: 'live', reason: null },
+        ],
+        needsLogin: false,
+      });
+    }
+    if (url.includes('/recordings/days')) return json({ days: ['16-10-2026'] });
+    if (url.includes('/recordings?'))
+      return json({
+        clips: [{ id: 'c1', start_ms: DAY_START + 7 * HOUR, snapshot_url: null }],
+      });
+    // The mint hangs until the test lets it land.
+    if (url.includes('/playback') && init?.method === 'POST') {
+      await new Promise<void>((resolve) => {
+        landTheMint = resolve;
+      });
+      return json({ stream: 'vod-cam-1', expires_in: 120 });
+    }
+    if (url.includes('/playback')) return new Response(null, { status: 204 });
+    return json({});
+  });
+  vi.stubGlobal('fetch', mock);
+  render(Recordings, { id: 'cam-1', onback: vi.fn(), onlocked: vi.fn() });
+
+  // The clip is clicked, then the tab moves before the mint lands.
+  (await screen.findByRole('button', { name: '07:00' })).click();
+  await vi.waitFor(() =>
+    expect(
+      calls.some((call) => call.startsWith('POST /api/cameras/cam-1/playback')),
+      'the mint for the first camera went out',
+    ).toBe(true),
+  );
+  screen.getByRole('button', { name: 'Gate' }).click();
+  await vi.waitFor(() =>
+    expect(
+      calls.some((call) => call.startsWith('GET /api/cameras/cam-2/recordings/days')),
+      'the tab moved while the mint hung',
+    ).toBe(true),
+  );
+
+  landTheMint?.();
+  await vi.waitFor(() => {
+    expect(
+      calls.some((call) => call.startsWith('DELETE /api/cameras/cam-1/playback')),
+      'the stale session is released against the camera it was minted for',
+    ).toBe(true);
+  });
+  expect(
+    screen.queryByRole('button', { name: 'Close' }),
+    'and the new tab never shows the old camera player',
+  ).toBeNull();
+});
+
 test('the exit releases the session', async () => {
   const { calls } = stubServer();
   const onback = vi.fn();
