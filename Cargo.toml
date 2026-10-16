@@ -8,10 +8,14 @@ edition = "2024"
 authors = ["Vedhavyas Singareddi <7549475+vedhavyas@users.noreply.github.com>"]
 
 [workspace.dependencies]
+aes = "0.8"
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+base64 = "0.22"
+ctr = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 qubo = { path = "crates/qubo" }
+rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 # native-tls, not rustls: rumqttc 0.25 pins rustls-webpki 0.102, which
 # carries four live RUSTSEC advisories with no patched 0.102 release.
