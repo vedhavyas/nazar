@@ -189,6 +189,41 @@ test('the retry re-mints where the clock stood, not where the clip began', async
   ).toHaveBeenCalledWith(at + 42_000);
 });
 
+test('the fallback gets the same watch and re-ask as the socket', async () => {
+  vi.useFakeTimers();
+  // Native HLS: the fallback engages as soon as the socket is given up.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('maybe');
+  const at = DAY_START + 3 * HOUR;
+  const onseek = vi.fn();
+  render(ClipPlayer, {
+    stream: 'vod-cam-1',
+    dayStart: DAY_START,
+    at,
+    onseek,
+    onexit: vi.fn(),
+  });
+
+  await vi.advanceTimersByTimeAsync(12_500);
+  const hls = document.querySelector('[data-testid=hls]') as HTMLVideoElement | null;
+  expect(hls, 'the fallback is what plays').toBeTruthy();
+  if (!hls) return;
+
+  hls.dispatchEvent(new Event('playing'));
+  hls.currentTime = 30;
+  await vi.advanceTimersByTimeAsync(5000);
+
+  // Away, and the session dies while nobody consumes it: the clock is
+  // where it was on return, and the fallback has nobody else to ask.
+  setHidden(true);
+  setHidden(false);
+
+  await vi.waitFor(() => {
+    expect(onseek, 'the fallback re-asks where the clock stood').toHaveBeenCalledWith(
+      at + 30_000,
+    );
+  });
+});
+
 /** Hide or show the page, as a browser tab switch does. */
 function setHidden(hidden: boolean) {
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });

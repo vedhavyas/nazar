@@ -217,6 +217,73 @@
     };
   });
 
+  // The fallback is a picture like any other: a stalled one must not stand
+  // there, and a session that died underneath must be asked for again when
+  // the tab comes back - HLS re-attaches on its own, but nothing re-mints.
+  $effect(() => {
+    const video = picture;
+    if (!fallback || !video) return;
+
+    let watching: ReturnType<typeof setInterval> | null = null;
+    let lastTime = -1;
+    let paused = false;
+    let started = false;
+    let awayAt = -1;
+
+    const tick = () => {
+      if (paused) {
+        // A deliberate pause is not a stall here either.
+        lastTime = video.currentTime;
+        return;
+      }
+      if (video.currentTime <= lastTime) {
+        if (watching) clearInterval(watching);
+        watching = null;
+        onsettled?.('frozen', video.currentTime);
+        return;
+      }
+      lastTime = video.currentTime;
+    };
+    const watch = () => {
+      if (watching) return;
+      watching = setInterval(tick, WATCH_EVERY_MS);
+    };
+    const onplaying = () => {
+      started = true;
+      paused = false;
+      watch();
+    };
+    const onpause = () => {
+      paused = true;
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        awayAt = started ? video.currentTime : -1;
+        if (watching) clearInterval(watching);
+        watching = null;
+        return;
+      }
+      const here = video.currentTime;
+      if (!started || (awayAt >= 0 && here <= awayAt)) {
+        onsettled?.('recovered', here >= 0 ? here : undefined);
+        return;
+      }
+      awayAt = -1;
+      lastTime = -1;
+      watch();
+    };
+
+    video.addEventListener('playing', onplaying);
+    video.addEventListener('pause', onpause);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      if (watching) clearInterval(watching);
+      video.removeEventListener('playing', onplaying);
+      video.removeEventListener('pause', onpause);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  });
+
   // The video element arrives with the connection, so the mute the caller
   // set has to be re-applied to whatever is on the stage.
   $effect(() => {
