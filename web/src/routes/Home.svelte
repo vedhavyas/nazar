@@ -3,10 +3,21 @@
 
   import { ApiError, api, type Camera, type Quality } from '../lib/api';
   import CameraTile from '../lib/CameraTile.svelte';
+  import NotifyBell from '../lib/NotifyBell.svelte';
   import Settings from '../lib/Settings.svelte';
   import { createHero } from '../lib/useHero.svelte';
 
-  let { onlocked, onopen }: { onlocked: () => void; onopen: (id: string) => void } = $props();
+  let {
+    onlocked,
+    onopen,
+    unread = 0,
+    onnotifications,
+  }: {
+    onlocked: () => void;
+    onopen: (id: string) => void;
+    unread?: number;
+    onnotifications?: () => void;
+  } = $props();
 
   let cameras = $state<Camera[]>([]);
   /** The stream each camera was granted, by device id. */
@@ -110,7 +121,10 @@
 <main class="home">
   <header>
     <h1>nazar</h1>
-    <Settings away={house.away} onaway={setAway} />
+    <div class="tools">
+      <NotifyBell {unread} onopen={() => onnotifications?.()} />
+      <Settings away={house.away} onaway={setAway} />
+    </div>
   </header>
 
   {#if error}
@@ -147,11 +161,17 @@
 
   header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     gap: 16px;
     flex-wrap: wrap;
     margin-bottom: 20px;
+  }
+
+  .tools {
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
 
   h1 {

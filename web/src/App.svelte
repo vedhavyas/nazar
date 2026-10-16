@@ -3,19 +3,35 @@
 
   import { api } from './lib/api';
   import { reachable, watchHealth } from './lib/health';
+  import { createNotifications } from './lib/notifyBridge.svelte';
   import Camera from './routes/Camera.svelte';
   import Home from './routes/Home.svelte';
   import Login from './routes/Login.svelte';
+  import Notifications from './routes/Notifications.svelte';
 
-  type Screen = 'checking' | 'login' | 'home' | 'camera';
+  type Screen = 'checking' | 'login' | 'home' | 'camera' | 'notifications';
 
   let screen = $state<Screen>('checking');
   let openId = $state<string | null>(null);
 
+  // The bell is app-wide: an arrival while any screen is open is told.
+  const notes = createNotifications();
+
+  // Looking at the list is seeing: everything is marked as the list shows
+  // it.
+  $effect(() => {
+    if (screen === 'notifications') notes.markSeen();
+  });
+
   onMount(() => {
     const stop = watchHealth();
+    const stopNotes = notes.follow();
     void boot();
-    return stop;
+    void notes.load();
+    return () => {
+      stop();
+      stopNotes();
+    };
   });
 
   /** A stored session answers the camera list; anything else is login. */
@@ -41,8 +57,20 @@
   <Login onloggedin={() => (screen = 'home')} />
 {:else if screen === 'camera' && openId}
   <Camera id={openId} onback={() => (screen = 'home')} onlocked={() => (screen = 'login')} />
+{:else if screen === 'notifications'}
+  <Notifications
+    entries={notes.entries}
+    names={notes.names}
+    onback={() => (screen = 'home')}
+    onopen={(id) => {
+      openId = id;
+      screen = 'camera';
+    }}
+  />
 {:else}
   <Home
+    unread={notes.unread}
+    onnotifications={() => (screen = 'notifications')}
     onopen={(id) => {
       openId = id;
       screen = 'camera';

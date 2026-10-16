@@ -34,6 +34,21 @@ export interface MotionHero {
   hero: string | null;
 }
 
+/** A told entry's shape on the wire; the air reading rides only on an aqi
+ * entry. */
+interface Told {
+  id: string;
+  device_id: string;
+  /** Milliseconds since the epoch. */
+  at: number;
+  snapshot_url: string | null;
+}
+
+/** What the house found worth telling. */
+export type Notification =
+  | (Told & { kind: 'motion' | 'offline' | 'online' })
+  | (Told & { kind: 'aqi'; value: number });
+
 /** A move's outcome: the camera's own shadow, never its ack. */
 export interface PtzResult {
   ok: boolean;
@@ -91,6 +106,7 @@ export const api = {
       { method: 'POST' },
     ),
   hero: () => call<MotionHero>('/api/motion/hero'),
+  notifications: () => call<{ notifications: Notification[] }>('/api/notifications'),
   ptz: (id: string, dx: number, dy: number) =>
     call<PtzResult>(`/api/cameras/${id}/ptz`, { method: 'POST', body: JSON.stringify({ dx, dy }) }),
   privacy: (id: string, on: boolean) =>
