@@ -250,6 +250,74 @@ async fn a_seek_releases_the_old_session_before_it_sets_the_new_one() {
     );
 }
 
+/// A release landing inside a seek's own release step: whichever way the
+/// two interleave, one session is released per session minted, nothing is
+/// deleted that was never set, and no stream is left behind for a player
+/// who left.
+#[tokio::test]
+async fn a_release_landing_during_a_seek_leaves_nothing_running() {
+    let h = harness(Duration::from_secs(120)).await;
+    mount_vod(&h.qubo).await;
+    assert_eq!(play(&h, CLIP_MS).await.status(), reqwest::StatusCode::OK);
+
+    // The seek's own release of the old session takes its time, opening
+    // the window for the player's release to land inside it.
+    h.go2rtc.set_delete_delay(Duration::from_millis(300));
+    let seeking = play(&h, CLIP_MS + 60_000);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let leaving = client()
+        .delete(format!("{}/api/cameras/{CAMERA}/playback", h.base))
+        .send();
+
+    let (seeked, released) = tokio::join!(seeking, leaving);
+    assert_eq!(seeked.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        released.expect("the release").status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    // However it landed, the state now converges: one more release is a
+    // no-op if the racing one already took the fresh session, and takes it
+    // if it did not.
+    let name = format!("vod-{CAMERA}");
+    let settled = client()
+        .delete(format!("{}/api/cameras/{CAMERA}/playback", h.base))
+        .send()
+        .await
+        .expect("the settling release");
+    assert_eq!(settled.status(), reqwest::StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![name.clone(), name.clone()],
+        "two sessions minted, two released - and nothing else: {:?}",
+        h.go2rtc.ops()
+    );
+    assert_eq!(
+        h.go2rtc
+            .ops()
+            .iter()
+            .filter(|op| op.as_str() == format!("put:{name}"))
+            .count(),
+        2,
+        "both mints reached go2rtc: {:?}",
+        h.go2rtc.ops()
+    );
+    // And nothing re-appears: the final release found nothing to release.
+    let again = client()
+        .delete(format!("{}/api/cameras/{CAMERA}/playback", h.base))
+        .send()
+        .await
+        .expect("the last release");
+    assert_eq!(again.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.go2rtc.deletes().len(),
+        2,
+        "no third delete appeared: {:?}",
+        h.go2rtc.ops()
+    );
+}
+
 #[tokio::test]
 async fn the_player_leaving_releases_the_session() {
     let h = harness(Duration::from_secs(120)).await;
