@@ -30,7 +30,7 @@ use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
 use crate::recordings::clips_for;
-use crate::supervisor::{StreamState, Supervisor, SupervisorError, stream_name};
+use crate::supervisor::{StreamState, Supervisor, SupervisorError, VOD_PREFIX, stream_name};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
 #[derive(Embed)]
@@ -200,9 +200,7 @@ impl From<SupervisorError> for ApiError {
             SupervisorError::UnknownDevice(id) => {
                 Self::new(StatusCode::NOT_FOUND, format!("unknown device {id}"))
             }
-            SupervisorError::VodUnavailable => {
-                Self::new(StatusCode::NOT_IMPLEMENTED, err.to_string())
-            }
+            SupervisorError::Go2rtc(reason) => Self::new(StatusCode::BAD_GATEWAY, reason),
             SupervisorError::Qubo(err) => err.into(),
         }
     }
@@ -216,6 +214,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/login/verify", post(login_verify))
         .route("/api/cameras", get(cameras))
         .route("/api/cameras/{id}/live", post(camera_live))
+        .route(
+            "/api/cameras/{id}/playback",
+            post(camera_playback).delete(camera_playback_stop),
+        )
         .route("/api/cameras/{id}/ptz", post(camera_ptz))
         .route(
             "/api/cameras/{id}/privacy",
@@ -391,6 +393,40 @@ async fn camera_recordings(
         )
     })?;
     Ok(Json(json!({ "clips": clips })))
+}
+
+#[derive(Deserialize)]
+struct PlaybackRequest {
+    timestamp: Option<i64>,
+}
+
+/// Seek: a playback session minted at the clip's instant.
+async fn camera_playback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PlaybackRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(timestamp) = body.timestamp else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a seek needs {\"timestamp\": <epoch milliseconds>}",
+        ));
+    };
+    ensure_devices(&state).await?;
+    let started = state.supervisor.ensure_vod(&id, timestamp).await?;
+    Ok(Json(json!({
+        "stream": started.name,
+        "expires_in": started.expires_in,
+    })))
+}
+
+/// The player left: release the session now, not on its idle window.
+async fn camera_playback_stop(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.supervisor.release_vod(&id).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The camera the house is watching: the supervisor's hysteresis decision,
@@ -688,13 +724,19 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
         if !safe {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
         }
-        // A stream is a camera plus its quality class, and only those two.
-        let Some((camera, quality)) = src.rsplit_once('-') else {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+        // A live stream is a camera plus its quality class; a playback
+        // stream is the camera under the vod- prefix. Nothing else.
+        let camera = if let Some(camera) = src.strip_prefix(VOD_PREFIX) {
+            camera.to_owned()
+        } else {
+            let Some((camera, quality)) = src.rsplit_once('-') else {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+            };
+            if !matches!(quality, "high" | "low") {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
+            }
+            camera.to_owned()
         };
-        if !matches!(quality, "high" | "low") {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown camera"));
-        }
         let known = state
             .supervisor
             .devices()

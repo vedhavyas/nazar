@@ -17,6 +17,6 @@ pub use client::{BASE_URL, QuboClient, ServiceProvider, Url};
 pub use control::{Attributes, Shadow, read_shadow, write_service};
 pub use devices::{Device, list_devices};
 pub use error::QuboError;
-pub use recordings::recorded_days;
+pub use recordings::{mint_vod, recorded_days};
 pub use session::{Session, SessionStore};
 pub use stream::{Mint, Quality, mint_live};
