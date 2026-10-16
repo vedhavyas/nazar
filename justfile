@@ -65,6 +65,167 @@ shell-check:
 desktop-build:
     npm --prefix web run tauri -- build --ci -- --locked
 
+# Build the debug APK for the phone: debug-signed, installable by hand with
+# adb, Arm64 alone to match the release, and the Kotlin unit tests run once
+# it is built. Needs the SDK, a JDK and the aarch64-linux-android Rust
+# target; scripts/android-env.sh finds the rest.
+android-build-debug:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/android-env.sh
+    npm --prefix web run tauri -- android build --debug --apk --ci --target aarch64
+    # The build compiles the Kotlin but not its unit tests, and its success
+    # prints no test count; the CLI wrote the gradle glue, so gradle runs
+    # alone here. Universal is the variant `--target aarch64` builds.
+    (cd web/src-tauri/gen/android && ./gradlew --console=plain :app:testUniversalDebugUnitTest)
+
+# Mint the release identity once: ~/.android/nazar-release.keystore, the
+# gitignored key.properties beside the android project, and the key's
+# fingerprint recorded in the repo. The fingerprint is the tripwire - a
+# regenerated keystore signs happily, and only the installed phones would
+# find out.
+android-keystore:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if ! command -v java >/dev/null 2>&1; then
+        echo "[ERROR] no java on PATH - keytool needs a JDK 17 or newer" >&2
+        exit 1
+    fi
+
+    keystore="$HOME/.android/nazar-release.keystore"
+    props=web/src-tauri/gen/android/app/key.properties
+    fingerprint=web/src-tauri/gen/android/release-keystore.sha256
+    if [ -e "$keystore" ] || [ -e "$props" ]; then
+        echo "[ERROR] the release identity already exists ($keystore or $props) - change it deliberately, not by accident" >&2
+        exit 1
+    fi
+    if [ -e "$fingerprint" ]; then
+        echo "[ERROR] $fingerprint already records a keystore - that keystore is the release, not a new one" >&2
+        exit 1
+    fi
+
+    password=$(openssl rand -base64 24)
+    mkdir -p "$(dirname "$keystore")"
+    keytool -genkeypair -keystore "$keystore" -alias nazar -keyalg RSA -keysize 4096 \
+        -validity 10000 -storepass "$password" -keypass "$password" -dname "CN=nazar release"
+    chmod 600 "$keystore"
+    printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=nazar\nkeyPassword=%s\n' \
+        "$keystore" "$password" "$password" > "$props"
+    chmod 600 "$props"
+    keytool -list -v -keystore "$keystore" -alias nazar -storepass "$password" \
+        | sed -n 's/.*SHA256: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' > "$fingerprint"
+    echo "[OK] minted $keystore; wrote $props; recorded the fingerprint in $fingerprint"
+    echo "     commit $fingerprint - the release checks against it"
+
+# Build and stage the Android release: nazar-<version>-arm64.apk, signed
+# with the release keystore. What the build produced is read back rather
+# than assumed - the version off the APK, its ABI, and its signer against
+# both the keystore and the fingerprint the repo records - because a stale
+# APK, a wrong-ABI APK and a differently-signed APK all install exactly as
+# quietly as a fresh one.
+android-release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/android-env.sh
+
+    keystore="$HOME/.android/nazar-release.keystore"
+    keyprops=web/src-tauri/gen/android/app/key.properties
+    fingerprint=web/src-tauri/gen/android/release-keystore.sha256
+    if [ ! -e "$keystore" ] || [ ! -e "$keyprops" ]; then
+        echo "[ERROR] the release keystore is not set up - mint it once with 'just android-keystore'" >&2
+        exit 1
+    fi
+
+    # Existence is not enough: a field missing from the file mislabels the
+    # failure as a missing APK later, so each is required by name.
+    keyfile=$(sed -n 's/^storeFile=//p' "$keyprops" || true)
+    password=$(sed -n 's/^storePassword=//p' "$keyprops" || true)
+    keyalias=$(sed -n 's/^keyAlias=//p' "$keyprops" || true)
+    keypassword=$(sed -n 's/^keyPassword=//p' "$keyprops" || true)
+    missing=""
+    [ -n "$keyfile" ] || missing="$missing storeFile"
+    [ -n "$password" ] || missing="$missing storePassword"
+    [ -n "$keyalias" ] || missing="$missing keyAlias"
+    [ -n "$keypassword" ] || missing="$missing keyPassword"
+    if [ -n "$missing" ]; then
+        echo "[ERROR] $keyprops is missing:$missing" >&2
+        exit 1
+    fi
+
+    # A keystore readable past its owner is worth one line, not a refusal.
+    # GNU stat first (the common case on this machine's PATH), BSD second.
+    mode=$(stat -c '%a' "$keystore" 2>/dev/null || stat -f '%Lp' "$keystore" 2>/dev/null || true)
+    if [ "$mode" != "600" ]; then
+        echo "[WARN] $keystore is readable beyond its owner - chmod 600 it" >&2
+    fi
+
+    # What the build may not do is CHANGE the tree - a Cargo.lock or gen/
+    # rewrite riding out of a release. Compared before and after rather than
+    # against clean, so a standalone retry works from whatever the tree
+    # holds.
+    before=$(git status --porcelain || true)
+    npm --prefix web run tauri -- android build --apk --ci --target aarch64
+
+    built=web/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+    if [ ! -e "$built" ]; then
+        echo "[ERROR] the build produced no APK at $built" >&2
+        exit 1
+    fi
+
+    aapt2=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name aapt2 -type f 2>/dev/null | sort -V | tail -1 || true)
+    apksigner=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f 2>/dev/null | sort -V | tail -1 || true)
+    if [ -z "$aapt2" ] || [ -z "$apksigner" ]; then
+        echo "[ERROR] no aapt2/apksigner under $ANDROID_HOME/build-tools - the SDK is incomplete" >&2
+        exit 1
+    fi
+
+    got=$("$aapt2" dump badging "$built" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" || true)
+    if [ "$got" != "{{version}}" ]; then
+        echo "[ERROR] the built APK is version $got, expected {{version}}" >&2
+        exit 1
+    fi
+
+    # The whole field, not its first token: a multi-ABI APK lists several and
+    # a first-token read would stage it under the arm64 name.
+    abi=$("$aapt2" dump badging "$built" | sed -n 's/^native-code: //p' | tr -d "'" || true)
+    if [ "$abi" != "arm64-v8a" ]; then
+        echo "[ERROR] the built APK's native code is '$abi', expected arm64-v8a" >&2
+        exit 1
+    fi
+
+    # keytool prints the digest upper-case with colons and apksigner
+    # lower-case without, so both sides are normalised before they are
+    # compared. The password rides argv here, which the threat model allows:
+    # one trusted user on their own machine.
+    want=$(keytool -list -v -keystore "$keystore" -alias "$keyalias" -storepass "$password" 2>/dev/null | sed -n 's/.*SHA256: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' || true)
+    if [ -z "$want" ]; then
+        echo "[ERROR] the release keystore could not be read - check key.properties' alias and password" >&2
+        exit 1
+    fi
+    recorded=$(tr -d '[:space:]' < "$fingerprint" || true)
+    if [ "$recorded" != "$want" ]; then
+        echo "[ERROR] the keystore's fingerprint is ${want:-none}, the repo records ${recorded:-none}" >&2
+        echo "        a regenerated keystore signs happily and every installed phone refuses it" >&2
+        exit 1
+    fi
+    signed=$("$apksigner" verify --print-certs "$built" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' || true)
+    if [ "$signed" != "$want" ]; then
+        echo "[ERROR] the APK is not signed by the release keystore (signer ${signed:-none}, expected $want)" >&2
+        exit 1
+    fi
+
+    if [ "$(git status --porcelain)" != "$before" ]; then
+        echo "[ERROR] the Android build changed the tree - commit or undo before releasing" >&2
+        git status --short >&2
+        exit 1
+    fi
+
+    out=web/src-tauri/target/release/bundle/android
+    mkdir -p "$out"
+    cp "$built" "$out/nazar-{{version}}-arm64.apk"
+    echo "[OK] staged the Android release: $out/nazar-{{version}}-arm64.apk (arm64, release-signed)"
+
 # What to check by hand on the desktop shell, with the server reachable.
 smoke-desktop:
     @echo "1. just run   (or point the shells at a running server; the"
