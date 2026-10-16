@@ -1,31 +1,50 @@
 # Qubo VOD verification (recording playback)
 
-Attempted 2026-10-15, ~18:42-18:50 IST (13:12-13:20 UTC). Status: blocked before any live call. Nothing in this file is verified against the API yet; the decompile-derived shapes stay unverified until a re-run lands.
+**VERIFIED 2026-10-16, 07:07-07:20 IST** against a live session (the hub's own OTP login, 06:54 IST; token valid one hour). Probes ran from the Studio over the hub's session file, with the six qubopy headers (`Content-Type`, `Authorization: Bearer`, `Token-Type: USER`, `User-UUID`, `Subscriber-Key`, `Source-Device-Id`, `App-Id: com.hero.iot`, `Source: Android`) - without `User-UUID`/`Token-Type` every call answers `ERR_AUTH_001`.
 
-## Blocker chain
+Blocked attempt on 2026-10-15 is superseded; its blocker chain stays below for the record.
 
-1. Phone-OTP login is the only usable auth path on this machine. The stored session (`~/.qubopy_session.json`) was minted today at 15:28 IST and expired at 16:28 IST, and the phone route issues no refreshToken.
-2. Server-side confirmation that the stored token is dead, not just past its own exp claim. Read-only `GET /unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units` returned:
+## Calendar (recorded days)
 
+`GET /content-manager/api/v1/sp/{sp}/unit/{unit}/device/{dev}/calendar?fromTimeStamp=<ms>&toTimeStamp=<ms>&timezone=Asia/Kolkata` -> **200**.
+
+Body is a bare JSON array of day strings in **DD-MM-YYYY**, **unordered**:
+
+```json
+["14-10-2026","13-10-2026","16-10-2026","15-10-2026"]
 ```
-HTTP 401
-{"code":"ERR_AUTH_002","message":["User Token expired, Access denied"]}
+
+`timezone=Asia/Kolkata` works first try. The server must sort; camera c0000000 (Cam360) has 13-16 Oct recorded.
+
+## VOD mint
+
+`POST /stream-manager/api/v2/sp/{sp}/stream/unit/{unit}/device/{dev}?timestamp=<ms>&type=high&streamSourceCamera=primary&singleRecord=0` with body `{"userAppID": "<the session's device_id>"}` -> **200. POST works; no PUT fallback needed.**
+
+```json
+{"appSessionId":"d0000000-0000-4000-8000-000000000013","streamURL":"rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/<device_id>?wowzatoken=...&sourceDevice=<camera>&sessionId=<appSessionId>&userUUID=<uuid>&unitUUID=<unit>&?vodContent=true","instanceId":"0"}
 ```
 
-3. A fresh OTP needs the phone's SMS, and no adb device is attached:
-   - `adb devices -l` lists nothing, before and after `adb kill-server` / `start-server`.
-   - The USB bus (via `ioreg -p IOUSB`) carries only known peripherals: webcam, hubs, keyboard, trackpad, audio, and one unknown "AIRHUG 28" (vendor 0x2F9D, product 0x1014, USB 1.1 full speed) with no adb interface. No Android vendor ID (0x18D1/0x04E8/0x2717/0x2A70/0x05C6/0x0E8D) is present. `system_profiler SPUSBDataType` printed an empty tree here, which is wrong for this machine - do not trust it on its own.
-   - No wireless adb target exists: no address recorded in the spike tree or history, and the PCAPdroid captures show the phone on mobile data (100.64.0.x), never on the home LAN (192.0.2.x).
-4. No alternative login exists: no `QUBO_PASSWORD` in the environment or shell rc, no other `.qubopy_session.json` on the machine, `qubopy login` needs the account password (not held), and qubopy has no Google sign-in tooling.
+Key spellings: **`streamURL`** (capital URL), `appSessionId`, `instanceId`. Host is **wowza2** (live is wowza) - playback and live do not share a slot. The literal `&?vodContent=true` suffix is theirs, not a typo. A timestamp in any recorded stretch mints; 2h back from now played.
 
-## Steps 5, 7, 8
+## Playback probe (ffprobe)
 
-Not executed, so no statuses or bodies to record. Unchanged, still decompile-derived:
+`ffprobe -rtsp_transport tcp` on the returned URL: **rc 0**, streams = **aac + h264 640x368**. Recordings are already H.264 at a low rendition - the live path's HEVC transcode is NOT needed for VOD; the pipeline's h264 output is a pass-through here.
 
-- Calendar: `GET /content-manager/api/v1/sp/{sp}/unit/{unit}/device/{device}/calendar?fromTimeStamp&toTimeStamp&timezone` (timezone format and response schema unverified).
-- VOD mint: `POST/PUT /stream-manager/api/v2/sp/{sp}/stream/unit/{unit}/device/{device}?timestamp=<clip-start-epoch-ms>&type=high&streamSourceCamera=primary&singleRecord=0`, body `{"userAppID": "<~/.qubopy_device_id>"}` (method, streaming-path v2, and streamUrl/appSessionId key spellings unverified).
-- ffprobe on the returned URL: unverified. The verified live mint (2026-10-13) produces `rtsps://` URLs; whether VOD does the same is exactly what this probe was to settle.
+## Clip list: no server endpoint exists
 
-## Unblock
+Ten path candidates under `/content-manager/api/v1/sp/{sp}/unit/{unit}/device/{dev}/` (recordings, recording, metadata, content, media, list, clips, timeline, events, vod) all **404**; the native libs' path strings carry the module bases only. The app's own timeline (`RecordingManager.getRecordedContentMetaData` is a native range query) is a client-side metadata cache fed by the MQTT event stream.
 
-Re-run with the phone attached over USB and adb debugging on. Phone sessions last one hour, so request the OTP and run the probe in the same sitting. Everything else (calendar, mint, ffprobe) is then a single pass.
+**Shape for M3:** days from the calendar, time-seek by re-minting at any timestamp, and clip segments from the server's own event store (the M3 notification store's motion events - `recordingControl` carries `record: start` + `imageFileName` per event). This matches the app's own timeline behaviour.
+
+## Measured stream-session semantics (live path, same scripts)
+
+- Mints are **last-mint-wins**: one stream slot per device path; minting low while high plays leaves the old high URL serving the NEW stream (old URL's old token still opens the path, content = latest mint).
+- An idle stream dies fast: **404 within ~40s of its last consumer leaving** (measured with no second mint - not a collision).
+- Consequence for M2: hero-high + tiles-low via two mints is impossible; one mint plus a go2rtc-side second rendition is the shape (folded into the M2 plan).
+
+## Superseded 2026-10-15 blocker chain (for the record)
+
+1. Phone-OTP login was the only auth path; the stored session expired hourly with no refresh.
+2. `GET /units` with the expired token: `HTTP 401 {"code":"ERR_AUTH_002","message":["User Token expired, Access denied"]}`.
+3. No adb device attached; no wireless adb target; no alternative login.
+4. Unblock: a fresh session - which arrived 2026-10-16 06:54 IST via the hub's own login, no phone needed.
