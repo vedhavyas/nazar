@@ -196,7 +196,13 @@ impl NotificationStore {
     pub fn push(&self, event: &UnitEvent, now: Instant) -> Option<Notification> {
         let mut inner = self.lock();
         let made = inner.record(event, now, self.window, self.aqi_alert_at);
-        self.save(&inner);
+        // Only a new entry is worth a write: the coalesced branch bumped an
+        // entry's `at` in memory, and the entry itself is already
+        // persisted - a crash losing the bump is cosmetic, and the ring
+        // write is O(ring) per sighting.
+        if made.is_some() {
+            self.save(&inner);
+        }
         made
     }
 
