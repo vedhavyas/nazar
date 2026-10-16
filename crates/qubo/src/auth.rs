@@ -122,6 +122,38 @@ pub async fn verify_otp(
     Ok(profiles)
 }
 
+/// The profile the login continues as, by uuid: the picker's answer
+/// resolves against the profiles verify returned (spec §3.4).
+pub fn select_profile(
+    profiles: &[AccountProfile],
+    uuid: &str,
+) -> Result<AccountProfile, QuboError> {
+    profiles
+        .iter()
+        .find(|profile| profile.uuid == uuid)
+        .cloned()
+        .ok_or(QuboError::Auth {
+            code: None,
+            message: "no account profile with that id".to_owned(),
+        })
+}
+
+/// The profile-select mint: what the app's own pick-then-enter runs,
+/// returning the durable pair the verify step never carries (a 1-hour
+/// accessToken and a 180-day refreshToken). The wire shape lands from the
+/// live capture; until then this refuses rather than fall back to the
+/// verify token.
+pub async fn phone_login(
+    client: &QuboClient,
+    profile: &AccountProfile,
+) -> Result<Session, QuboError> {
+    let _ = (client, profile);
+    Err(QuboError::Auth {
+        code: None,
+        message: "mint call not yet pinned".to_owned(),
+    })
+}
+
 /// Exchange a Google ID token for a Qubo session (the app's own `system=GM`
 /// v4 login; docs/qubo-google-login.md §3). Its response carries the refresh
 /// token the phone route never does - the token comes from the Qubo app's

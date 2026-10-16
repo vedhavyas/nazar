@@ -21,8 +21,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use qubo::{
-    Device, Quality, QuboClient, QuboError, Session, SessionStore, read_shadow, request_otp,
-    verify_google, verify_otp, write_service,
+    AccountProfile, Device, Quality, QuboClient, QuboError, Session, SessionStore, phone_login,
+    read_shadow, request_otp, verify_google, verify_otp, write_service,
 };
 
 use crate::episodes::EpisodeStore;
@@ -260,6 +260,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/login/otp", post(login_otp))
         .route("/api/login/verify", post(login_verify))
+        .route("/api/login/select", post(login_select))
         .route("/api/login/google", post(login_google))
         .route("/api/cameras", get(cameras))
         .route("/api/cameras/{id}/live", post(camera_live))
@@ -310,32 +311,64 @@ struct VerifyRequest {
     code: String,
 }
 
+/// The verified number's accounts: one profile signs straight in, several
+/// wait for the browser to pick one by uuid (Ved's number maps to two).
 async fn login_verify(
     State(state): State<AppState>,
     Json(body): Json<VerifyRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let profiles = verify_otp(&state.qubo, &body.phone, &body.code).await?;
-    // The family account is the first profile the number maps to.
-    let Some(profile) = profiles.into_iter().next() else {
-        return Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "the login returned no account profile",
-        ));
-    };
-    let session = Session {
-        access_token: profile.access_token,
-        uuid: profile.uuid,
-        email: profile.email,
-        refresh_token: profile.refresh_token,
-    };
+    if let [only] = profiles.as_slice() {
+        finish_login(&state, only).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let choices: Vec<Value> = profiles
+        .iter()
+        .map(|profile| {
+            json!({
+                "uuid": profile.uuid,
+                "name": profile.name,
+                "email": profile.email,
+            })
+        })
+        .collect();
+    state.qubo.set_pending_profiles(profiles);
+    Ok(Json(json!({ "profiles": choices })).into_response())
+}
+
+#[derive(Deserialize)]
+struct SelectRequest {
+    uuid: String,
+}
+
+/// The picker's answer: finish the login with the chosen profile.
+async fn login_select(
+    State(state): State<AppState>,
+    Json(body): Json<SelectRequest>,
+) -> Result<StatusCode, ApiError> {
+    let profile = state.qubo.pending_profile(&body.uuid)?;
+    finish_login(&state, &profile).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The chosen profile's mint, and the session it becomes.
+async fn finish_login(state: &AppState, profile: &AccountProfile) -> Result<(), ApiError> {
+    let session = phone_login(&state.qubo, profile).await?;
+    persist_login(state, session).await
+}
+
+/// Store the finished session and wake discovery: the one path every login
+/// route ends in.
+async fn persist_login(state: &AppState, session: Session) -> Result<(), ApiError> {
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
         .await?
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    state.qubo.clear_pending_profiles();
     if let Err(err) = state.supervisor.refresh_devices().await {
         tracing::warn!(%err, "device discovery after login failed");
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -351,13 +384,7 @@ async fn login_google(
     Json(body): Json<GoogleLoginRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = verify_google(&state.qubo, &body.id_token).await?;
-    let sessions = state.sessions.clone();
-    blocking(move || sessions.save(&session))
-        .await?
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if let Err(err) = state.supervisor.refresh_devices().await {
-        tracing::warn!(%err, "device discovery after login failed");
-    }
+    persist_login(&state, session).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

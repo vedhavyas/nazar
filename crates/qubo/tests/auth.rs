@@ -25,7 +25,10 @@ use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::Session;
-use qubo::auth::{refresh_session, request_otp, verify_google, verify_otp};
+use qubo::auth::{
+    AccountProfile, phone_login, refresh_session, request_otp, select_profile, verify_google,
+    verify_otp,
+};
 use qubo::client::{BASE_URL, QuboClient, ServiceProvider};
 use qubo::error::QuboError;
 
@@ -224,6 +227,74 @@ async fn verify_returns_every_profile_the_number_maps_to() {
             "each profile keeps its own token"
         );
     }
+}
+
+#[test]
+fn select_profile_picks_the_asked_account_by_uuid() {
+    let entries = fixture(include_str!("fixtures/otp_verify_two.json"));
+    let profiles: Vec<AccountProfile> =
+        serde_json::from_value(entries).expect("the fixture parses");
+
+    let chosen = select_profile(&profiles, &profiles[1].uuid).expect("the second account resolves");
+    assert_eq!(chosen.uuid, profiles[1].uuid, "the pick is keyed by uuid");
+    assert_eq!(
+        chosen.access_token, profiles[1].access_token,
+        "the whole profile rides the pick"
+    );
+
+    let first = select_profile(&profiles, &profiles[0].uuid).expect("the first account resolves");
+    assert_eq!(
+        first.email, profiles[0].email,
+        "each uuid resolves to itself"
+    );
+}
+
+#[test]
+fn select_profile_refuses_a_uuid_that_is_not_a_candidate() {
+    let entries = fixture(include_str!("fixtures/otp_verify_two.json"));
+    let profiles: Vec<AccountProfile> =
+        serde_json::from_value(entries).expect("the fixture parses");
+
+    let err = select_profile(&profiles, "00000000-0000-0000-0000-000000000000")
+        .expect_err("a uuid nobody offered cannot be chosen");
+    assert!(matches!(err, QuboError::Auth { .. }), "{err:?}");
+}
+
+/// The mint's wire shape lands from the live capture; until then the seam
+/// is a typed refusal, never a silent fallback to the verify token.
+#[tokio::test]
+async fn the_phone_mint_refuses_until_the_wire_shape_is_pinned() {
+    let server = MockServer::start().await;
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "token-1".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        name: None,
+        email: None,
+        refresh_token: None,
+    };
+
+    let err = phone_login(&client, &profile)
+        .await
+        .expect_err("the mint refuses until it is pinned");
+
+    match err {
+        QuboError::Auth { message, .. } => {
+            assert_eq!(
+                message, "mint call not yet pinned",
+                "the refusal names the seam"
+            );
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "nothing is sent while the shape is unpinned"
+    );
 }
 
 #[tokio::test]

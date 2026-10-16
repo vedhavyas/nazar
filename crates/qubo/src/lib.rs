@@ -12,7 +12,10 @@ pub mod recordings;
 pub mod session;
 pub mod stream;
 
-pub use auth::{refresh_session, request_otp, verify_google, verify_otp};
+pub use auth::{
+    AccountProfile, phone_login, refresh_session, request_otp, select_profile, verify_google,
+    verify_otp,
+};
 pub use client::{BASE_URL, QuboClient, ServiceProvider, Url};
 pub use control::{Attributes, Shadow, read_shadow, write_service};
 pub use devices::{Device, list_devices};
