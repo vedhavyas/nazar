@@ -156,6 +156,7 @@ pub struct FakeApi {
     taken: Arc<Mutex<Vec<(String, String)>>>,
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
+    put_refused_marker: Arc<Mutex<Option<String>>>,
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
     producers: Arc<AtomicBool>,
@@ -195,6 +196,7 @@ impl FakeApi {
         let taken = Arc::new(Mutex::new(Vec::new()));
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
+        let put_refused_marker = Arc::new(Mutex::new(None));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
         let producers = Arc::new(AtomicBool::new(true));
@@ -211,6 +213,7 @@ impl FakeApi {
             &deletes,
             &Knobs {
                 put_status: &put_status,
+                put_refused_marker: &put_refused_marker,
                 streams_visible: &streams_visible,
                 streams_error: &streams_error,
                 producers: &producers,
@@ -238,6 +241,7 @@ impl FakeApi {
             taken,
             deletes,
             put_status,
+            put_refused_marker,
             streams_visible,
             streams_error,
             producers,
@@ -292,6 +296,15 @@ impl FakeApi {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::SeqCst,
         );
+    }
+
+    /// Refuse PUTs whose source contains `marker` (accept the rest as
+    /// configured), so a test can fail one source without failing all.
+    pub fn set_put_refused_marker(&self, marker: Option<&str>) {
+        *self
+            .put_refused_marker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = marker.map(str::to_owned);
     }
 
     /// Report `count` viewers on the stream, as go2rtc does while a browser
@@ -446,6 +459,7 @@ impl Drop for FakeLease {
 /// them as one argument.
 struct Knobs<'a> {
     put_status: &'a Arc<AtomicU16>,
+    put_refused_marker: &'a Arc<Mutex<Option<String>>>,
     streams_visible: &'a Arc<AtomicBool>,
     streams_error: &'a Arc<AtomicBool>,
     producers: &'a Arc<AtomicBool>,
@@ -501,6 +515,7 @@ fn streams_methods(
 ) -> axum::routing::MethodRouter {
     let recorded = Arc::clone(puts);
     let status = Arc::clone(knobs.put_status);
+    let refused = Arc::clone(knobs.put_refused_marker);
     let ops = Arc::clone(knobs.ops);
     let urls = Arc::clone(knobs.url_state);
     let dialed = Arc::clone(knobs.dialed);
@@ -510,6 +525,7 @@ fn streams_methods(
     let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
         let recorded = Arc::clone(&recorded);
         let status = Arc::clone(&status);
+        let refused = Arc::clone(&refused);
         let ops = Arc::clone(&ops);
         let urls = Arc::clone(&urls);
         let dialed = Arc::clone(&dialed);
@@ -518,10 +534,8 @@ fn streams_methods(
         let held = Arc::clone(&held);
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
-            recorded
-                .lock()
-                .unwrap()
-                .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
+            let source = params.get("src").cloned().unwrap_or_default();
+            recorded.lock().unwrap().push((name.clone(), source.clone()));
             // A fresh source is a fresh URL. Attached consumers - viewers
             // or narar's own hold - ride the swap, as go2rtc swaps the
             // source under the stream's name: their producer restarts and
@@ -544,22 +558,24 @@ fn streams_methods(
                 dialed.lock().unwrap().remove(&name);
             }
             ops.lock().unwrap().push(format!("put:{name}"));
-            let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+            let marker = refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let code = if marker.is_some_and(|marker| source.contains(&marker)) {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status")
+            };
             if code.is_success() {
-                taken
-                    .lock()
-                    .unwrap()
-                    .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
+                taken.lock().unwrap().push((name.clone(), source.clone()));
             }
             // A rejected PUT quotes the source back, as go2rtc's own
             // refusals do - token and all.
             let body = if code.is_success() {
                 String::new()
             } else {
-                format!(
-                    "streams: source from insecure producer: {}",
-                    params.get("src").cloned().unwrap_or_default()
-                )
+                format!("streams: source from insecure producer: {source}")
             };
             (code, body)
         }

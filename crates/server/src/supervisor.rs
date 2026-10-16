@@ -492,18 +492,6 @@ impl Supervisor {
         Ok(session)
     }
 
-    /// The session's source for this stream: the armed session when live,
-    /// else a fresh (bounded) arm. Any failure is the caller's fallback.
-    async fn lane_source(
-        &self,
-        lane: &Arc<dyn Lane>,
-        device: &Device,
-        name: &str,
-    ) -> Result<String, String> {
-        let session = self.lane_session(lane, device).await?;
-        session.source_for(name)
-    }
-
     /// Whether a refused session's re-discovery is worth trying yet.
     pub fn discovery_due(&self) -> bool {
         let last = *self
@@ -1096,11 +1084,31 @@ impl Supervisor {
         if let Some(lane) = &self.lane
             && self.prefer_p2p.contains(&device.device_id)
         {
-            match self.lane_source(lane, device, &name).await {
-                Ok(source) => {
-                    tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
-                    return self.put_and_confirm(&name, &source).await;
-                }
+            match self.lane_session(lane, device).await {
+                Ok(session) => match session.source_for(&name) {
+                    Ok(source) => match self.put_and_confirm(&name, &source).await {
+                        Ok(()) => {
+                            tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
+                            return Ok(());
+                        }
+                        Err(reason) => {
+                            // go2rtc refused the source: this session cannot
+                            // serve the pass, so end it and take the cloud
+                            // path now rather than retrying it blindly.
+                            tracing::info!(
+                                stream = %name,
+                                %reason,
+                                "go2rtc refused the fast-lane source; the cloud path takes this pass"
+                            );
+                            session.shutdown();
+                            self.armed.write().await.remove(&device.device_id);
+                        }
+                    },
+                    Err(reason) => {
+                        tracing::info!(stream = %name, %reason, "the fast-lane session ended; using the cloud path");
+                        self.armed.write().await.remove(&device.device_id);
+                    }
+                },
                 Err(reason) => {
                     tracing::info!(stream = %name, %reason, "fast lane unavailable; using the cloud path");
                 }
