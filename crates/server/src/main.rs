@@ -34,8 +34,16 @@ async fn main() -> anyhow::Result<()> {
         config.device_id(),
     );
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
-    let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default())
-        .with_hold(Arc::new(FfmpegHold::new(config.ffmpeg_bin.clone())));
+    let supervisor = Supervisor::new(
+        qubo.clone(),
+        sessions.clone(),
+        go2rtc,
+        Pacing {
+            arm_timeout: config.p2p_arm_timeout,
+            ..Pacing::default()
+        },
+    )
+    .with_hold(Arc::new(FfmpegHold::new(config.ffmpeg_bin.clone())));
     // The fast lane is opt-in per camera; without a preference the server
     // never arms it and the cloud path is the only one.
     let supervisor = if config.prefer_p2p.is_empty() {
