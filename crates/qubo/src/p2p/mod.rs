@@ -58,8 +58,6 @@ pub enum P2pError {
     KeyFormat,
     #[error("the control envelope is too large for a 2001 frame: {len} bytes")]
     EnvelopeTooLarge { len: usize },
-    #[error("the camera did not answer the start call within {0:?}")]
-    NoAnswer(Duration),
     #[error("the handshake did not complete within {timeout:?} (relay engaged: {relay_engaged})")]
     Handshake {
         timeout: Duration,
@@ -199,14 +197,24 @@ impl P2pEngine {
         let answer = self
             .wait_for_answer(&mut broker.answers, &session_id)
             .await?;
-        tracing::debug!(
-            event = %answer.event,
-            handle = ?answer.handle_name,
-            candidates = ?candidate_endpoints(&answer.candidates),
-            "camera answered",
-        );
-
-        let (targets, relay_endpoint) = handshake_targets(&answer, &allocation);
+        let (targets, relay_endpoint) = if let Some(answer) = &answer {
+            tracing::debug!(
+                event = %answer.event,
+                handle = ?answer.handle_name,
+                candidates = ?candidate_endpoints(&answer.candidates),
+                "camera answered",
+            );
+            handshake_targets(answer, &allocation)
+        } else {
+            // The reference proceeds on the relay leg alone when the answer
+            // never lands - the relay endpoint comes from the allocation,
+            // not from the answer.
+            tracing::info!(
+                window = ?self.config.answer_timeout,
+                "no p2pCallStarted within the window; proceeding on the relay leg alone",
+            );
+            (Vec::new(), relay_endpoint(&allocation))
+        };
         if targets.is_empty() && relay_endpoint.is_none() {
             return Err(P2pError::NoTargets);
         }
@@ -383,12 +391,13 @@ impl P2pEngine {
         })
     }
 
-    /// Wait for the camera's answer to our session, bounded.
+    /// Wait for the camera's answer to our session, bounded; `None` on the
+    /// bound running out (the relay leg alone is still a valid attempt).
     async fn wait_for_answer(
         &self,
         answers: &mut mpsc::Receiver<(String, String)>,
         session_id: &str,
-    ) -> Result<Callback, P2pError> {
+    ) -> Result<Option<Callback>, P2pError> {
         let answer = tokio::time::timeout(self.config.answer_timeout, async {
             loop {
                 let (topic, payload) = answers.recv().await.ok_or(P2pError::BrokerClosed)?;
@@ -399,8 +408,8 @@ impl P2pEngine {
         })
         .await;
         match answer {
-            Ok(result) => result,
-            Err(_elapsed) => Err(P2pError::NoAnswer(self.config.answer_timeout)),
+            Ok(result) => result.map(Some),
+            Err(_elapsed) => Ok(None),
         }
     }
 
@@ -448,11 +457,15 @@ fn handshake_targets(
         .iter()
         .filter_map(|(ip, port)| relay::endpoint_of(ip, *port))
         .collect();
-    let relay_endpoint = match (&allocation.server_ip, allocation.server_port) {
+    (targets, relay_endpoint(allocation))
+}
+
+/// The relay endpoint from the allocation, when it names one.
+fn relay_endpoint(allocation: &Allocation) -> Option<SocketAddr> {
+    match (&allocation.server_ip, allocation.server_port) {
         (Some(ip), Some(port)) => relay::endpoint_of(ip, port),
         _ => None,
-    };
-    (targets, relay_endpoint)
+    }
 }
 
 /// The engine's session-scoped broker connection and its answer feed.
@@ -730,5 +743,30 @@ mod tests {
             "a disarmed guard never stops the pump"
         );
         broker.pump.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_start_call_yields_no_callback() {
+        // The bound running out is not an error: the reference proceeds on
+        // the relay leg alone, so arm must too.
+        let engine = P2pEngine::new(
+            QuboClient::new(
+                "http://127.0.0.1:9".parse().expect("a url"),
+                crate::client::ServiceProvider::default(),
+            ),
+            P2pConfig {
+                answer_timeout: Duration::from_millis(50),
+                ..P2pConfig::default()
+            },
+        );
+        let (_sender, mut answers) = mpsc::channel::<(String, String)>(1);
+        let answer = engine
+            .wait_for_answer(&mut answers, "session")
+            .await
+            .expect("a quiet broker is not a channel error");
+        assert!(
+            answer.is_none(),
+            "no answer within the bound yields None, not an error"
+        );
     }
 }
