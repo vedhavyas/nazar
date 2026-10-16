@@ -408,6 +408,74 @@ async fn phone_login_refuses_a_profile_without_an_email() {
 }
 
 #[tokio::test]
+async fn phone_login_needs_a_refresh_token_in_the_response() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        EMAILPROFILE_PATH,
+        200,
+        r#"{"accessToken":"a","uuid":"user-uuid-1"}"#,
+    )
+    .await;
+
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "profile-1h-token".to_owned(),
+        uuid: "picked-uuid-1".to_owned(),
+        name: None,
+        email: Some("vedhavyas@example.com".to_owned()),
+        refresh_token: None,
+    };
+
+    let err = phone_login(&client, &profile)
+        .await
+        .expect_err("a mint without a refresh token is not a durable login");
+    match err {
+        QuboError::Parse(inner) => {
+            assert!(
+                inner.to_string().contains("refreshToken"),
+                "the parse names the missing field: {inner}"
+            );
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn phone_login_refuses_empty_minted_fields() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        EMAILPROFILE_PATH,
+        200,
+        r#"{"accessToken":"","refreshToken":"r","uuid":"user-uuid-1"}"#,
+    )
+    .await;
+
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "profile-1h-token".to_owned(),
+        uuid: "picked-uuid-1".to_owned(),
+        name: None,
+        email: Some("vedhavyas@example.com".to_owned()),
+        refresh_token: None,
+    };
+
+    let err = phone_login(&client, &profile)
+        .await
+        .expect_err("an empty token is not a token");
+    match err {
+        QuboError::Parse(inner) => {
+            assert!(
+                inner.to_string().contains("empty"),
+                "the parse says the field carried nothing: {inner}"
+            );
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn verify_refuses_a_different_phone_than_the_pending_code() {
     let server = MockServer::start().await;
     mount_json(
@@ -447,6 +515,52 @@ async fn verify_refuses_a_different_phone_than_the_pending_code() {
         .await
         .expect("the code still works for its own number");
     assert_eq!(profiles[0].uuid, profile_uuid(), "the right number logs in");
+}
+
+#[tokio::test]
+async fn a_spent_code_reads_as_spent_not_as_never_requested() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        REQUEST_PATH,
+        200,
+        include_str!("fixtures/otp_request.json"),
+    )
+    .await;
+    mount_json(
+        &server,
+        VERIFY_PATH,
+        200,
+        include_str!("fixtures/otp_verify.json"),
+    )
+    .await;
+
+    let client = client_for(&server);
+    request_otp(&client, "9876543210")
+        .await
+        .expect("request ok");
+    verify_otp(&client, "9876543210", "123456")
+        .await
+        .expect("the first verify succeeds");
+
+    // The mint after this verify can fail on a blip, and the retry comes
+    // from the code step, not a new request.
+    let err = verify_otp(&client, "9876543210", "123456")
+        .await
+        .expect_err("a spent code cannot be verified twice");
+    match err {
+        QuboError::Auth { message, .. } => {
+            assert!(
+                message.contains("pending"),
+                "names the pending state, not a phantom request: {message}"
+            );
+            assert!(
+                message.contains("new code"),
+                "and the action that fixes it: {message}"
+            );
+        }
+        other => panic!("expected Auth, got {other:?}"),
+    }
 }
 
 #[tokio::test]

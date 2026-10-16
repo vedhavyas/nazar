@@ -48,13 +48,29 @@ struct Refreshed {
     refresh_token: Option<String>,
 }
 
-/// The mint response: the durable pair and the account it belongs to.
+/// The mint response: the durable pair and the account it belongs to. A
+/// field that is absent or empty is not a login.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Minted {
+    #[serde(deserialize_with = "non_empty")]
     access_token: String,
+    #[serde(deserialize_with = "non_empty")]
     refresh_token: String,
+    #[serde(deserialize_with = "non_empty")]
     uuid: String,
+}
+
+/// A minted field that must carry something, not merely be present.
+fn non_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("empty"));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +101,8 @@ pub async fn request_otp(client: &QuboClient, phone: &str) -> Result<(), QuboErr
     let response = client.post_json(&path, &body, None).await?;
     let request: OtpRequestResponse = serde_json::from_value(response)?;
     client.set_pending_login(&request.uuid, phone);
+    // A new code ends the previous attempt, picker included.
+    client.clear_pending_profiles();
     Ok(())
 }
 
@@ -96,9 +114,14 @@ pub async fn verify_otp(
     phone: &str,
     code: &str,
 ) -> Result<Vec<AccountProfile>, QuboError> {
+    // Also what a retry sees after a verify whose mint then failed.
+    // Whether the gateway replays a spent code on the same login session
+    // is unmeasured (measuring it texts a real SMS), so the refusal names
+    // both causes rather than guessing.
     let pending = client.pending_login().ok_or(QuboError::Auth {
         code: None,
-        message: "no OTP was requested for this client".to_owned(),
+        message: "no code is pending for this number - it was already verified, or none was requested; request a new code"
+            .to_owned(),
     })?;
     if pending.phone != phone {
         // Deliberately silent about the other number: the mismatch is the

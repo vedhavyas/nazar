@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::QuboError;
 
-/// A logged-in Qubo account session. The phone-OTP route issues no refresh
-/// token; the Google route does, and it is what makes the session durable
+/// A logged-in Qubo account session. Both login routes mint a refresh
+/// token - the phone route through the app's profile-select mint, Google
+/// through the GM login - and it is what makes the session durable
 /// (spec §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
