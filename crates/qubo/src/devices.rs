@@ -16,6 +16,10 @@ pub struct Device {
     pub device_type: String,
     pub unit_id: String,
     pub entity_id: String,
+    /// The device's controllerUUID, when the listing carries one. The P2P
+    /// device-access-token dest needs exactly this, never the deviceUUID
+    /// (the capture's tokens all carry `dest` = the target's controller).
+    pub controller_id: Option<String>,
 }
 
 impl Device {
@@ -128,12 +132,14 @@ fn device_of(value: &Value, unit_id: &str) -> Option<Device> {
     // reference client's fallback for a listing that omits it.
     let entity_id =
         string_of(value, &["entityUUID", "entityId"]).unwrap_or_else(|| "default".to_owned());
+    let controller_id = string_of(value, &["controllerUUID", "controllerId"]);
     Some(Device {
         device_id,
         name,
         device_type,
         unit_id: unit_id.to_owned(),
         entity_id,
+        controller_id,
     })
 }
 

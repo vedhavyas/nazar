@@ -7,6 +7,7 @@
       "aModelNo": "HCP01",
       "extraData": { "serialNumber": "SN0001" },
       "entityUUID": "default",
+      "controllerUUID": "d0000000-0000-4000-8000-000000000001",
       "isOnline": true
     },
     {

@@ -297,10 +297,13 @@ impl P2pEngine {
         device: &Device,
         identity: &P2pIdentity,
     ) {
-        let dest = identity
-            .camera_controller
-            .as_deref()
-            .unwrap_or(&device.device_id);
+        let Some(dest) = token_dest(identity, device) else {
+            tracing::warn!(
+                camera = %device.device_id,
+                "no controllerUUID for the device-access token; skipping the preflight",
+            );
+            return;
+        };
         match signaling::fetch_device_access_token(
             &self.client,
             session,
@@ -466,6 +469,16 @@ fn relay_endpoint(allocation: &Allocation) -> Option<SocketAddr> {
         (Some(ip), Some(port)) => relay::endpoint_of(ip, port),
         _ => None,
     }
+}
+
+/// The device-access-token dest: the controllerUUID - from config first,
+/// then the device listing - never the deviceUUID (protocol 2.2: the
+/// capture's tokens all carry the target's controller as `dest`).
+fn token_dest<'a>(identity: &'a P2pIdentity, device: &'a Device) -> Option<&'a str> {
+    identity
+        .camera_controller
+        .as_deref()
+        .or(device.controller_id.as_deref())
 }
 
 /// The engine's session-scoped broker connection and its answer feed.
@@ -826,6 +839,42 @@ mod tests {
             "a disarmed guard never stops the pump"
         );
         broker.pump.abort();
+    }
+
+    #[test]
+    fn the_token_dest_is_always_a_controller_uuid() {
+        let device = |controller: Option<&str>| Device {
+            device_id: "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01".to_owned(),
+            name: "Hall".to_owned(),
+            device_type: "HCP01".to_owned(),
+            unit_id: "unit".to_owned(),
+            entity_id: "default".to_owned(),
+            controller_id: controller.map(str::to_owned),
+        };
+        let identity = |controller: Option<&str>| P2pIdentity {
+            self_device: "self".to_owned(),
+            src_device_id: "src".to_owned(),
+            camera_controller: controller.map(str::to_owned),
+        };
+
+        assert_eq!(
+            token_dest(
+                &identity(Some("config-controller")),
+                &device(Some("listed-controller"))
+            ),
+            Some("config-controller"),
+            "the configured controller wins"
+        );
+        assert_eq!(
+            token_dest(&identity(None), &device(Some("listed-controller"))),
+            Some("listed-controller"),
+            "the listing's controllerUUID is the fallback"
+        );
+        assert_eq!(
+            token_dest(&identity(None), &device(None)),
+            None,
+            "without a controllerUUID there is no dest - the deviceUUID is never sent"
+        );
     }
 
     #[cfg(target_os = "macos")]

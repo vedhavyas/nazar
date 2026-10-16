@@ -48,6 +48,7 @@ fn camera() -> Device {
         device_type: "HCP01".into(),
         unit_id: UNIT.into(),
         entity_id: ENTITY.into(),
+        controller_id: None,
     }
 }
 

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         device_type: String::new(),
         unit_id: args.unit.clone(),
         entity_id: String::new(),
+        controller_id: Some(args.camera_controller.clone()),
     };
     let identity = P2pIdentity {
         self_device: args.self_device.clone(),

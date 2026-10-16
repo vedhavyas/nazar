@@ -49,6 +49,7 @@ fn device(device_type: &str) -> Device {
         device_type: device_type.into(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
+        controller_id: None,
     }
 }
 
