@@ -289,7 +289,7 @@ pub fn build_end_call(camera: &str, src_device_id: &str, session_id: &str) -> Va
     command_envelope(camera, src_device_id, "endP2pCall", &parameters, timestamp)
 }
 
-fn epoch_millis() -> i64 {
+pub(crate) fn epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()

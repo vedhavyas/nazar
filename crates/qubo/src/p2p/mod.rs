@@ -12,6 +12,7 @@
 //! not a fact.
 
 pub mod media;
+pub mod ptt;
 pub mod relay;
 pub mod signaling;
 
@@ -70,6 +71,8 @@ pub enum P2pError {
     Broker(String),
     #[error("the broker event loop ended")]
     BrokerClosed,
+    #[error("talkback has not started")]
+    NotTalking,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -287,6 +290,14 @@ impl P2pEngine {
             src_device_id: identity.src_device_id.clone(),
             disarmed: false,
             beat,
+            talk_context: ptt::TalkContext {
+                client: self.client.clone(),
+                session: session.clone(),
+                unit_id: device.unit_id.clone(),
+                user_app_id: identity.self_device.clone(),
+                quality: self.config.quality,
+            },
+            talk: None,
         })
     }
 
@@ -764,8 +775,13 @@ pub struct ArmedSession {
     /// Whether `disarm` ended the call; a drop that finds this false ends
     /// it, so abandoning a session never leaves the camera in a call.
     disarmed: bool,
-    /// The relay keepalive beat, when `P2pConfig::hold_beat` asked for one.
+    /// The relay keepalive beat, when `P2pConfig::switches.hold_beat`
+    /// asked for one.
     beat: Option<tokio::task::AbortHandle>,
+    /// What a talk burst needs from the arm.
+    talk_context: ptt::TalkContext,
+    /// The running talk burst, one per session.
+    talk: Option<ptt::Talk>,
 }
 
 impl ArmedSession {
@@ -830,10 +846,70 @@ impl ArmedSession {
     /// Send one control envelope as a `2001` data-channel frame - the
     /// low-latency twin of the MQTT `/control` path (protocol 6.7).
     pub async fn send_control(&mut self, envelope: &Value) -> Result<(), P2pError> {
+        self.send_envelope(envelope).await
+    }
+
+    /// One data-channel frame carrying `envelope`.
+    async fn send_envelope(&mut self, envelope: &Value) -> Result<(), P2pError> {
         let json = serde_json::to_vec(envelope).map_err(QuboError::from)?;
         let frame = relay::control_frame(&self.names.generate(), &json, &random_nonce())?;
         self.socket.send_to(&frame, self.peer).await?;
         Ok(())
+    }
+
+    /// Begin a talk burst: the PTT update rides the data channel (the
+    /// `setStreamState` the native `updateP2PStream` ADD_PTT sends) and the
+    /// cloud heartbeat starts. One burst per session; a second call is a
+    /// no-op.
+    pub async fn start_talk(&mut self) -> Result<(), P2pError> {
+        if self.talk.is_some() {
+            return Ok(());
+        }
+        let envelope = ptt::set_stream_state(
+            &self.camera,
+            &self.session_id,
+            true,
+            self.talk_context.quality,
+        );
+        self.send_envelope(&envelope).await?;
+        let path = self
+            .talk_context
+            .heartbeat_path(&self.camera, &self.session_id);
+        self.talk = Some(ptt::Talk::start(
+            &self.talk_context,
+            path,
+            ptt::PTT_HEARTBEAT,
+        ));
+        Ok(())
+    }
+
+    /// Push one burst of mic audio over the session's audio channel; `Err`
+    /// when no talk is running. The frame is the PT 97 RTP shape
+    /// ([UNCERTAIN] the uplink encoding - the live wiring test against the
+    /// camera's response settles it).
+    pub async fn push_audio(&mut self, samples: &[u8]) -> Result<(), P2pError> {
+        let Some(talk) = &mut self.talk else {
+            return Err(P2pError::NotTalking);
+        };
+        let frame = talk.next_frame(samples);
+        self.socket.send_to(&frame, self.peer).await?;
+        Ok(())
+    }
+
+    /// End the burst: the PTT-off update rides the data channel and the
+    /// heartbeat stops. A stop without a running burst is a no-op.
+    pub async fn stop_talk(&mut self) -> Result<(), P2pError> {
+        let Some(talk) = self.talk.take() else {
+            return Ok(());
+        };
+        talk.stop();
+        let envelope = ptt::set_stream_state(
+            &self.camera,
+            &self.session_id,
+            false,
+            self.talk_context.quality,
+        );
+        self.send_envelope(&envelope).await
     }
 
     /// Tear the call down: `endP2pCall` on the control topic, a moment for
@@ -852,6 +928,9 @@ impl ArmedSession {
         if let Some(beat) = self.beat.take() {
             beat.abort();
         }
+        if let Some(talk) = self.talk.take() {
+            talk.stop();
+        }
         self.broker.pump.abort();
     }
 }
@@ -860,6 +939,9 @@ impl Drop for ArmedSession {
     fn drop(&mut self) {
         if let Some(beat) = self.beat.take() {
             beat.abort();
+        }
+        if let Some(talk) = self.talk.take() {
+            talk.stop();
         }
         if self.disarmed {
             self.broker.pump.abort();
@@ -1025,6 +1107,18 @@ mod tests {
             src_device_id: "src".to_owned(),
             disarmed: false,
             beat: None,
+            talk_context: ptt::TalkContext {
+                client: idle_client(),
+                session: Session {
+                    access_token: "token".to_owned(),
+                    uuid: "user".to_owned(),
+                    email: None,
+                },
+                unit_id: "unit".to_owned(),
+                user_app_id: "self".to_owned(),
+                quality: signaling::StreamQuality::High,
+            },
+            talk: None,
         };
         drop(session);
         // The teardown publishes first and stops the pump only after its
@@ -1046,9 +1140,23 @@ mod tests {
         );
     }
 
+    /// A client that answers nothing: the paths under test make no call it
+    /// would have to fake.
+    fn idle_client() -> QuboClient {
+        QuboClient::new(
+            "http://127.0.0.1:9".parse().expect("a url"),
+            crate::client::ServiceProvider::default(),
+        )
+    }
+
     /// A session reading a fresh loopback socket, its target address, and a
-    /// sender that can feed it datagrams.
-    async fn media_session(key: &str, iv: &str) -> (ArmedSession, SocketAddr, UdpSocket) {
+    /// sender that can feed it datagrams and read what it sends back (the
+    /// session's peer is the sender).
+    async fn media_session(
+        key: &str,
+        iv: &str,
+        client: QuboClient,
+    ) -> (ArmedSession, SocketAddr, UdpSocket) {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a socket");
@@ -1056,9 +1164,10 @@ mod tests {
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a sender");
+        let peer = sender.local_addr().expect("bound address");
         let session = ArmedSession {
             socket: Arc::new(socket),
-            peer: target,
+            peer,
             decryptor: MediaDecryptor::new(media::AesMode::CtrCont, key, iv).expect("a decryptor"),
             names: relay::NameGen::new(),
             broker: idle_broker(),
@@ -1068,6 +1177,18 @@ mod tests {
             src_device_id: "src".to_owned(),
             disarmed: false,
             beat: None,
+            talk_context: ptt::TalkContext {
+                client,
+                session: Session {
+                    access_token: "token".to_owned(),
+                    uuid: "user".to_owned(),
+                    email: None,
+                },
+                unit_id: "unit".to_owned(),
+                user_app_id: "self".to_owned(),
+                quality: signaling::StreamQuality::High,
+            },
+            talk: None,
         };
         (session, target, sender)
     }
@@ -1150,7 +1271,7 @@ mod tests {
 
         // A control probe between the two captured packets must not
         // advance the keystream.
-        let (mut session, target, sender) = media_session(key, iv).await;
+        let (mut session, target, sender) = media_session(key, iv, idle_client()).await;
         sender.send_to(&p1, target).await.expect("send p1");
         sender
             .send_to(&media_probe(), target)
@@ -1172,7 +1293,7 @@ mod tests {
 
         // A non-control datagram with a valid header length does advance
         // it, exactly as the reference's loop would.
-        let (mut session, target, sender) = media_session(key, iv).await;
+        let (mut session, target, sender) = media_session(key, iv, idle_client()).await;
         let garbage = vec![0x40_u8; 20];
         sender.send_to(&p1, target).await.expect("send p1");
         sender
@@ -1193,6 +1314,104 @@ mod tests {
             second.payload(),
             cont2,
             "a datagram the reference processed advances the keystream here too"
+        );
+    }
+
+    /// One datagram off the sender's socket, with a bound.
+    async fn next_frame(sender: &UdpSocket, buf: &mut [u8; 4096]) -> Vec<u8> {
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), sender.recv_from(buf))
+            .await
+            .expect("a frame within the bound")
+            .expect("a datagram");
+        buf[..len].to_vec()
+    }
+
+    /// The JSON inside a `2001` frame.
+    fn frame_envelope(frame: &[u8]) -> serde_json::Value {
+        assert_eq!(
+            frame[0..2],
+            [0x20, 0x01],
+            "the frame is a 2001 control frame"
+        );
+        let len = usize::from(u16::from_be_bytes([frame[22], frame[23]]));
+        serde_json::from_slice(&frame[24..24 + len]).expect("the frame carries JSON")
+    }
+
+    #[tokio::test]
+    async fn the_talk_sequence_rides_the_data_channel() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::header("User-UUID", "user"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let client = QuboClient::new(
+            server.uri().parse().expect("a url"),
+            crate::client::ServiceProvider::default(),
+        );
+
+        let (mut session, _target, sender) = media_session(
+            "82458EA37F4740361F47B4E68946546F",
+            "A3B6C1B75EEB65ACF59802CE5A6995B3",
+            client,
+        )
+        .await;
+        let mut buf = [0_u8; 4096];
+
+        session.start_talk().await.expect("the talk starts");
+        let update = frame_envelope(&next_frame(&sender, &mut buf).await);
+        let set_state = "/command/devices/services/p2pStreaming/commands/setStreamState/parameters";
+        assert_eq!(
+            update.pointer(&format!("{set_state}/pttEnabled")),
+            Some(&serde_json::json!(true)),
+            "the start rides as pttEnabled true"
+        );
+        assert_eq!(
+            update.pointer(&format!("{set_state}/sessionId")),
+            Some(&serde_json::json!("session")),
+            "the update names the armed session"
+        );
+
+        // The heartbeat's first beat goes out with the start: the exact
+        // path the decompile pins, authenticated, on the port's GET
+        // reading of the verb (ptt.rs's [UNCERTAIN httpMethod]).
+        let beat = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let beats = server.received_requests().await.expect("recorded requests");
+                if beats.iter().any(|request| {
+                    request.url.path()
+                        == "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/unit/unit/device/cam/ptt/heartbeat"
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            beat.is_ok(),
+            "the first heartbeat goes out with the start, on the decompiled path"
+        );
+
+        // The mic rides the session's audio channel as PT 97.
+        session
+            .push_audio(&[0xAA; 320])
+            .await
+            .expect("the audio rides");
+        let audio = next_frame(&sender, &mut buf).await;
+        assert_eq!(audio[1], 97, "the audio frame is PT 97");
+        assert_eq!(audio.len(), 12 + 320, "the samples follow the header");
+
+        session.stop_talk().await.expect("the stop lands");
+        let off = frame_envelope(&next_frame(&sender, &mut buf).await);
+        assert_eq!(
+            off.pointer(&format!("{set_state}/pttEnabled")),
+            Some(&serde_json::json!(false)),
+            "the stop rides as pttEnabled false"
+        );
+        assert!(
+            matches!(session.push_audio(&[0xBB]).await, Err(P2pError::NotTalking)),
+            "audio after the stop is refused, never swallowed"
         );
     }
 
