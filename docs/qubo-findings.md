@@ -812,6 +812,21 @@ Ved's pushback ("OTP is not short-lived... without actually properly testing") w
 
 **Where it comes from.** The verify response on the wire is a LIST of account profiles - one per account the phone maps to (Ved's number: `10000000-...`/<family-email> and `10000000-...`/<family-email>), each carrying a 1h `token`, no refreshToken. The app then shows "Choose your profile"; picking one runs a native `MobileUserManager.userPhoneLogin(UserDto)` (native log string "Post user Phone Login url : %s"; decompile: the fragment's profile-select handler calls it and `ServerInfo.saveUserInformation(uuid, accessToken, refreshToken)` follows), and THAT response carries the durable pair. The refreshToken's iat matches the verify moment, and the prefs commit at the pick - consistent with: mint at profile-select, commit on pick.
 
-**Candidates probed against the mint URL (all ruled out so far):** `POST /user/login?system=USER` -> `ERR_SM_014 Invalid account type`; `system=GM` (v4 and v1, minimal and full UserDto, with and without session headers) -> HTTP 500 `ERR_UNKNOWN_001`; `system=CS` -> email login semantics (`ERR_SM_004`); `PUT /users/{uuid}/phone` -> `Phone already registered` (the update-phone route); `PUT /user/phone?tempUUID=` -> `ERR_SM_026 User not registered` (registration temp-user route). The exact call is the open item; the capture is armed (frida hook on `MobileUserManager.userPhoneLogin` logging the UserDto fields and the raw response body) and runs on the next login cycle once the OTP send budget reopens (it was exhausted 11:56Z, next send ~12:56Z).
+**The mint call, pinned (2026-10-16, captured from the app's own wire and replayed successfully):**
+
+```
+POST /sms/api/v1/sp/{sp}/user/emailprofile/login
+Content-Type: application/json
+App-Id: <app constant>          App-Type: HOME
+Login-Device-Name: <device>     Source: ANDROID
+Source-Device-Id: <android id>  Subscriber-Key: <the chosen profile's 1h token from verify>
+Token-Type: USER                User-UUID: <the chosen profile's uuid>
+
+{"deviceAttribute": "<MANUFACTURER>|<MODEL>|<PRODUCT>", "username": "<the chosen profile's EMAIL>"}
+
+-> 200 {"accessToken": <1h JWT sub USER>, "refreshToken": <180d JWT sub USER_REFRESH>, "newUser": false, "uuid": ...}
+```
+
+How it was pinned: the app's native `MobileUserManager.userPhoneLogin(UserDto)` was called through frida against the running app with a curl `CURLOPT_POSTFIELDS` hook installed (the Qubo API is HTTP/2 over the app's libcurl, so no ASCII request line reaches SSL_write; the curl-layer hook is the instrument). The captured body was exactly the two fields above. Replayed from this machine against the live account: HTTP 200, and the returned JWTs decode to iat+3600 and iat+15552000 (180 days) - the durable pair. The profile token from the verify response works as the Subscriber-Key (an existing session token works too). Routes ruled out on the way: `/user/login?system=USER` (`ERR_SM_014`), `system=GM` (500 `ERR_UNKNOWN_001`), `system=CS` (email-password semantics), `PUT /users/{uuid}/phone` ("Phone already registered"), `PUT /user/phone?tempUUID=` (`ERR_SM_026`).
 
 **Instrument note (root detection).** The app refuses to run on a rooted device: `BaseActivity.onCreate` runs a vendored RootBeer fork whose PATH-scan found `/system/xbin/su` ("Device is untrusted", toast + finish, plus a non-cancelable dialog from the splash). Defeated for instrumentation only: frida 16.7.19 (17.x crashes on this Android 11 emulator, sigchain assertion) + hooks on `com.scottyab.rootbeer.RootBeer.isRooted`, `java.io.File.exists` for `*/su` paths, and the toast/finish pair. The app under test is the genuine APK; nothing was repacked. Also of note: `pm clear` resets runtime permissions, so they must be re-granted (`pm grant`) before the app will pass its own permission flow.
