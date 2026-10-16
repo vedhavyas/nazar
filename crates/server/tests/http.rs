@@ -639,6 +639,45 @@ async fn verify_signs_in_the_lone_mailable_account() {
 }
 
 #[tokio::test]
+async fn an_empty_email_is_not_offered_as_an_account() {
+    let h = harness().await;
+    let profiles = json!([
+        {"accessToken": "token-1", "uuid": "empty-uuid", "name": "A", "email": ""},
+        {"accessToken": "token-2", "uuid": "mailable-uuid", "name": "B", "email": "b@example.com"},
+    ])
+    .to_string();
+    mount_login(&h, &profiles).await;
+    mount_discovery(&h.qubo).await;
+    mount_mint(&h.qubo).await;
+
+    let response = ask_and_verify(&h).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "an empty email is not an account to offer; the mailable one signs in"
+    );
+    let minted = h
+        .qubo
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .find(|request| request.url.path() == EMAILPROFILE_PATH)
+        .expect("the mint reached the gateway");
+    let subscriber = minted
+        .headers
+        .get("subscriber-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("the Subscriber-Key header");
+    assert_eq!(
+        subscriber, "token-2",
+        "the mailable account is what mints, not the empty one"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn a_lone_none_mailable_profile_refuses_cleanly() {
     let h = harness().await;
     let profiles = json!([{"accessToken": "token-1", "uuid": "silent-1", "name": "A"}]).to_string();

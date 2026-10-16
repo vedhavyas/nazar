@@ -468,6 +468,56 @@ async fn verify_google_without_a_refresh_token_still_signs_in() {
 }
 
 #[tokio::test]
+async fn phone_login_refuses_an_empty_email() {
+    let server = MockServer::start().await;
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "profile-1h-token".to_owned(),
+        uuid: "picked-uuid-1".to_owned(),
+        name: None,
+        email: Some(String::new()),
+        refresh_token: None,
+    };
+
+    let err = phone_login(&client, &profile)
+        .await
+        .expect_err("an empty email is no username to mint with");
+    assert!(matches!(err, QuboError::Auth { .. }), "{err:?}");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "nothing is sent without a username"
+    );
+}
+
+#[tokio::test]
+async fn verify_google_normalizes_an_empty_refresh_token_away() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(GM_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"accessToken":"a","uuid":"u","refreshToken":""}"#),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+
+    let session = verify_google(&client, "the-id-token")
+        .await
+        .expect("an empty refresh token is still a login");
+
+    assert_eq!(session.access_token, "a", "the access token rides");
+    assert_eq!(
+        session.refresh_token, None,
+        "an empty token is no token: it must not reach the refresh gate"
+    );
+}
+
+#[tokio::test]
 async fn phone_login_refuses_an_empty_refresh_token() {
     let server = MockServer::start().await;
     mount_json(

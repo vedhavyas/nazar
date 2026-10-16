@@ -239,7 +239,10 @@ pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Sessio
         .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &[], &body)
         .await?;
     let profile: AccountProfile = serde_json::from_value(response)?;
-    if profile.refresh_token.as_deref().is_none_or(str::is_empty) {
+    // An empty token is no token: it would only be a refresh attempt the
+    // gateway refuses later.
+    let refresh_token = profile.refresh_token.filter(|token| !token.is_empty());
+    if refresh_token.is_none() {
         // Warn-only: a hard refusal would turn a working hour into a 502
         // if the shape ever changes; the session simply will not renew
         // silently.
@@ -249,7 +252,7 @@ pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Sessio
         access_token: profile.access_token,
         uuid: profile.uuid,
         email: profile.email,
-        refresh_token: profile.refresh_token,
+        refresh_token,
     })
 }
 
