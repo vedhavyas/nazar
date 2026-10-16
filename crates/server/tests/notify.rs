@@ -596,6 +596,68 @@ async fn the_bell_rings_before_the_still_is_resolved() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The telling went out without the still, so a screen already open holds
+/// an entry that never gains one. When the still lands the entry is told
+/// again, and the screen merges the update by id.
+#[tokio::test]
+async fn the_still_landing_is_told_again() {
+    let dir = temp_dir("notify-still-update");
+    let store = store_in(&dir);
+    let h = harness(Arc::clone(&store)).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/stream-manager/api/v1/sp/{SP}/stream/unit/{UNIT}/device/{CAMERA}"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "streamURL": "rtsps://wowza2.platform.quboworld.com:443/x/cam?token=t",
+                    "sessionId": "s1",
+                })
+                .to_string(),
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+    let started = browser
+        .post(format!("{}/api/cameras/{CAMERA}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+    assert_eq!(started.status(), reqwest::StatusCode::OK);
+    let live = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(name, _)| name == &format!("{CAMERA}-high"))
+    })
+    .await;
+    assert!(live, "a pipeline is running, so the grab is a real one");
+
+    let mut told = store.subscribe();
+    h.events.publish(motion(CAMERA));
+    let first = tokio::time::timeout(Duration::from_secs(2), told.recv())
+        .await
+        .expect("the telling is prompt")
+        .expect("a notification");
+    assert_eq!(first.snapshot_url, None, "it went out before the still");
+
+    let update = tokio::time::timeout(Duration::from_secs(2), told.recv())
+        .await
+        .expect("the still's landing is told")
+        .expect("a notification");
+    assert_eq!(update.id, first.id, "the update is the same entry");
+    assert_eq!(
+        update.snapshot_url,
+        Some(format!("/api/snaps/{}", first.id)),
+        "and it carries the still"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Stills are written per event and their entries age out; a file neither
 /// store references any more must not outlive them.
 #[tokio::test]
