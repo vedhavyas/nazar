@@ -74,9 +74,7 @@ impl Config {
             p2p_camera_controller: var("NAZAR_P2P_CAMERA_CONTROLLER"),
             p2p_login_device_name: var("NAZAR_P2P_LOGIN_DEVICE_NAME")
                 .unwrap_or_else(|| "MobileApp_<mobile-id>".to_owned()),
-            p2p_arm_timeout: var("NAZAR_P2P_ARM_TIMEOUT")
-                .and_then(|seconds| seconds.parse::<u64>().ok())
-                .map_or_else(|| Duration::from_secs(15), Duration::from_secs),
+            p2p_arm_timeout: arm_timeout_from(var("NAZAR_P2P_ARM_TIMEOUT").as_deref()),
         }
     }
 
@@ -108,4 +106,37 @@ impl Config {
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The arm bound from its env value: whole seconds, or the product default.
+fn arm_timeout_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map_or_else(|| Duration::from_secs(15), Duration::from_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn the_arm_timeout_env_parses_seconds_and_defaults() {
+        assert_eq!(
+            arm_timeout_from(None),
+            Duration::from_secs(15),
+            "without the env the product bound stands"
+        );
+        assert_eq!(
+            arm_timeout_from(Some("42")),
+            Duration::from_secs(42),
+            "a number of seconds is honoured"
+        );
+        assert_eq!(
+            arm_timeout_from(Some("soon")),
+            Duration::from_secs(15),
+            "garbage falls back to the default"
+        );
+    }
 }
