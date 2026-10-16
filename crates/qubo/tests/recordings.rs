@@ -47,6 +47,7 @@ fn device() -> Device {
         device_id: DEVICE_ID.into(),
         name: "Cam360".into(),
         device_type: "HCP01".into(),
+        model: "HCP01".into(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
     }
