@@ -10,6 +10,13 @@ use crate::session::Session;
 /// The label this server shows under in the account's logged-in devices.
 const DEVICE_ATTRIBUTE: &str = "Nazar";
 
+/// The server's device identity for the mint's body, in the app's
+/// `MANUFACTURER|MODEL|PRODUCT` shape.
+const MINT_DEVICE_ATTRIBUTE: &str = "nazar|server|nazar";
+
+/// The same identity as a device name, the app's underscore shape.
+const MINT_DEVICE_NAME: &str = "nazar_server";
+
 /// The family account is an Indian number.
 const ISD_CODE: &str = "+91";
 
@@ -39,6 +46,15 @@ struct Refreshed {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+}
+
+/// The mint response: the durable pair and the account it belongs to.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Minted {
+    access_token: String,
+    refresh_token: String,
+    uuid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,18 +155,44 @@ pub fn select_profile(
 }
 
 /// The profile-select mint: what the app's own pick-then-enter runs,
-/// returning the durable pair the verify step never carries (a 1-hour
-/// accessToken and a 180-day refreshToken). The wire shape lands from the
-/// live capture; until then this refuses rather than fall back to the
-/// verify token.
+/// returning the durable pair the verify step never carries (a fresh
+/// 1-hour accessToken and a 180-day refreshToken).
 pub async fn phone_login(
     client: &QuboClient,
     profile: &AccountProfile,
 ) -> Result<Session, QuboError> {
-    let _ = (client, profile);
-    Err(QuboError::Auth {
+    let email = profile.email.as_deref().ok_or(QuboError::Auth {
         code: None,
-        message: "mint call not yet pinned".to_owned(),
+        message: "the account profile carries no email to mint with".to_owned(),
+    })?;
+    let path = format!(
+        "/sms/api/v1/sp/{}/user/emailprofile/login",
+        client.service_provider()
+    );
+    let body = json!({
+        "deviceAttribute": MINT_DEVICE_ATTRIBUTE,
+        "username": email,
+    });
+    let response = client
+        .post_login_json(
+            &path,
+            &[],
+            &[
+                ("App-Type", "HOME"),
+                ("Login-Device-Name", MINT_DEVICE_NAME),
+                ("Subscriber-Key", profile.access_token.as_str()),
+                ("Token-Type", "USER"),
+                ("User-UUID", profile.uuid.as_str()),
+            ],
+            &body,
+        )
+        .await?;
+    let minted: Minted = serde_json::from_value(response)?;
+    Ok(Session {
+        access_token: minted.access_token,
+        uuid: minted.uuid,
+        email: profile.email.clone(),
+        refresh_token: Some(minted.refresh_token),
     })
 }
 
@@ -167,7 +209,7 @@ pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Sessio
         "deviceAttribute": DEVICE_ATTRIBUTE,
     });
     let response = client
-        .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &body)
+        .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &[], &body)
         .await?;
     let profile: AccountProfile = serde_json::from_value(response)?;
     Ok(Session {

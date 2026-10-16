@@ -12,6 +12,9 @@
 //!
 //! `otp_verify_two.json` is the verify shape for a number that maps to two
 //! accounts (the response is a per-number LIST); its values are synthesized.
+//! `emailprofile_login.json` is the profile-select mint's response shape,
+//! captured from the app's own `userPhoneLogin` wire (2026-10-16); its
+//! tokens are synthesized.
 //!
 //! `gm_login.json` carries the GM v4 login's response keys
 //! (docs/qubo-google-login.md §3; live-verified 2026-10-14 that the route
@@ -38,6 +41,8 @@ const VERIFY_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/
 const GM_PATH: &str = "/sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login";
 const REFRESH_PATH: &str =
     "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh";
+const EMAILPROFILE_PATH: &str =
+    "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/emailprofile/login";
 
 fn client_for(server: &MockServer) -> QuboClient {
     let base = server
@@ -260,10 +265,115 @@ fn select_profile_refuses_a_uuid_that_is_not_a_candidate() {
     assert!(matches!(err, QuboError::Auth { .. }), "{err:?}");
 }
 
-/// The mint's wire shape lands from the live capture; until then the seam
-/// is a typed refusal, never a silent fallback to the verify token.
+/// The mint's request is pinned from the app's own `userPhoneLogin` wire
+/// (2026-10-16); the device values are ours (the app sends its build's).
 #[tokio::test]
-async fn the_phone_mint_refuses_until_the_wire_shape_is_pinned() {
+async fn phone_login_mints_the_durable_pair() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        EMAILPROFILE_PATH,
+        200,
+        include_str!("fixtures/emailprofile_login.json"),
+    )
+    .await;
+
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "profile-1h-token".to_owned(),
+        uuid: "picked-uuid-1".to_owned(),
+        name: Some("Vedhavyas".to_owned()),
+        email: Some("vedhavyas@example.com".to_owned()),
+        refresh_token: None,
+    };
+
+    let session = phone_login(&client, &profile).await.expect("the mint");
+
+    let minted = fixture(include_str!("fixtures/emailprofile_login.json"));
+    assert_eq!(
+        session.access_token, minted["accessToken"],
+        "the fresh access token comes from the mint"
+    );
+    assert_eq!(
+        session.refresh_token.as_deref(),
+        minted["refreshToken"].as_str(),
+        "the 180-day refresh token is what makes the session durable"
+    );
+    assert_eq!(
+        session.uuid, minted["uuid"],
+        "the session belongs to the minted account"
+    );
+    assert_eq!(
+        session.email.as_deref(),
+        Some("vedhavyas@example.com"),
+        "the chosen profile's email rides into the session"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1, "one call reaches the gateway");
+    let request = &requests[0];
+    assert_eq!(
+        request.url.path(),
+        EMAILPROFILE_PATH,
+        "the app's own emailprofile route"
+    );
+    assert_eq!(request.url.query(), None, "no query parameters");
+    let sent = |name: &str| {
+        request
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("the {name} header is missing"))
+    };
+    assert_eq!(sent("app-type"), "HOME", "the app's own header set");
+    assert_eq!(sent("token-type"), "USER", "the profile identity's type");
+    assert_eq!(sent("source"), "ANDROID", "the login family's source");
+    assert_eq!(
+        sent("subscriber-key"),
+        "profile-1h-token",
+        "the chosen profile's 1h token is the Subscriber-Key"
+    );
+    assert_eq!(
+        sent("user-uuid"),
+        "picked-uuid-1",
+        "the chosen profile's uuid rides the request"
+    );
+    assert!(
+        request.headers.get("authorization").is_none(),
+        "the mint is not an authorized call"
+    );
+    assert!(
+        !sent("login-device-name").is_empty(),
+        "the client names itself"
+    );
+
+    let body = fixture(&String::from_utf8_lossy(&request.body));
+    let mut fields: Vec<String> = body
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["deviceAttribute", "username"],
+        "exactly the captured two fields"
+    );
+    assert_eq!(
+        body["username"], "vedhavyas@example.com",
+        "the pick's email is the body's username"
+    );
+    let attribute = body["deviceAttribute"].as_str().expect("an attribute");
+    assert_eq!(
+        attribute.matches('|').count(),
+        2,
+        "the app's MANUFACTURER|MODEL|PRODUCT shape: {attribute}"
+    );
+}
+
+#[tokio::test]
+async fn phone_login_refuses_a_profile_without_an_email() {
     let server = MockServer::start().await;
     let client = client_for(&server);
     let profile = AccountProfile {
@@ -276,13 +386,13 @@ async fn the_phone_mint_refuses_until_the_wire_shape_is_pinned() {
 
     let err = phone_login(&client, &profile)
         .await
-        .expect_err("the mint refuses until it is pinned");
+        .expect_err("no username to mint with");
 
     match err {
         QuboError::Auth { message, .. } => {
-            assert_eq!(
-                message, "mint call not yet pinned",
-                "the refusal names the seam"
+            assert!(
+                message.contains("email"),
+                "the refusal names what is missing: {message}"
             );
         }
         other => panic!("expected Auth, got {other:?}"),
@@ -293,7 +403,7 @@ async fn the_phone_mint_refuses_until_the_wire_shape_is_pinned() {
             .await
             .expect("recorded requests")
             .is_empty(),
-        "nothing is sent while the shape is unpinned"
+        "nothing is sent without a username"
     );
 }
 
@@ -489,6 +599,50 @@ async fn live_verify_google_exchanges_the_apps_own_token() {
     assert!(
         session.refresh_token.is_some(),
         "the GM route is what makes the session durable"
+    );
+}
+
+/// Mints from the account a stored session file belongs to, then spends
+/// the fresh pair once. Ignored by default; run deliberately with
+/// `QUBO_E2E_SESSION` pointing at a session file (the lead's e2e one).
+#[tokio::test]
+#[ignore = "live: mints and refreshes against the gateway; run with QUBO_E2E_SESSION set"]
+async fn live_phone_login_mints_and_refreshes_the_pair() {
+    let path = std::env::var("QUBO_E2E_SESSION").expect("set QUBO_E2E_SESSION to a session file");
+    let raw = std::fs::read_to_string(path).expect("the session file reads");
+    let stored: Session = serde_json::from_str(&raw).expect("the file is a stored session");
+    let base = BASE_URL.parse().expect("the gateway URL parses");
+    let client = QuboClient::new(base, ServiceProvider::default());
+
+    let profile = AccountProfile {
+        access_token: stored.access_token.clone(),
+        uuid: stored.uuid.clone(),
+        name: None,
+        email: stored.email.clone(),
+        refresh_token: None,
+    };
+    let minted = phone_login(&client, &profile).await.expect("the mint");
+    assert!(
+        minted.refresh_token.is_some(),
+        "the mint returns the durable refresh token"
+    );
+    println!(
+        "minted: access {} chars, refresh {} chars",
+        minted.access_token.len(),
+        minted.refresh_token.as_deref().map_or(0, str::len)
+    );
+
+    let refreshed = refresh_session(&client, &minted)
+        .await
+        .expect("the fresh pair refreshes");
+    assert!(
+        !refreshed.access_token.is_empty(),
+        "the refresh answers a usable access token"
+    );
+    println!(
+        "refreshed: access {} chars, refresh {} chars",
+        refreshed.access_token.len(),
+        refreshed.refresh_token.as_deref().map_or(0, str::len)
     );
 }
 

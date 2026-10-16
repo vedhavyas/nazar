@@ -34,6 +34,8 @@ const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe
 const OTP_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login";
 const VERIFY_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify";
 const GOOGLE_PATH: &str = "/sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login";
+const EMAILPROFILE_PATH: &str =
+    "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/emailprofile/login";
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -491,6 +493,17 @@ async fn mount_login(h: &Harness, verify_body: &str) {
         .await;
 }
 
+/// Mount the profile-select mint, as the app's own call answers it.
+async fn mount_mint(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(EMAILPROFILE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+            "../../qubo/tests/fixtures/emailprofile_login.json"
+        )))
+        .mount(server)
+        .await;
+}
+
 /// A browser that asked for a code and then verified it.
 async fn ask_and_verify(h: &Harness) -> reqwest::Response {
     let client = client();
@@ -513,18 +526,16 @@ async fn ask_and_verify(h: &Harness) -> reqwest::Response {
         .expect("verify")
 }
 
-/// The two-account verify fixture's offered uuids, in order.
-fn two_profile_uuids() -> Vec<String> {
+/// A field of the two-account verify fixture, by index and key.
+fn two_profile_field(index: usize, key: &str) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../qubo/tests/fixtures/otp_verify_two.json"
     ))
     .expect("the fixture is JSON");
-    fixture
-        .as_array()
-        .expect("a profile array")
-        .iter()
-        .map(|profile| profile["uuid"].as_str().expect("a uuid").to_owned())
-        .collect()
+    fixture[index][key]
+        .as_str()
+        .expect("a string field")
+        .to_owned()
 }
 
 /// The stored session is still the harness's own: no login landed.
@@ -555,9 +566,16 @@ async fn verify_with_two_profiles_asks_for_a_pick() {
     let body: Value = response.json().await.expect("json");
     let offered = body["profiles"].as_array().expect("a profile list");
     assert_eq!(offered.len(), 2, "both accounts are offered");
-    let uuids = two_profile_uuids();
-    assert_eq!(offered[0]["uuid"], uuids[0], "the uuid keys the pick");
-    assert_eq!(offered[1]["uuid"], uuids[1], "both uuids are offered");
+    assert_eq!(
+        offered[0]["uuid"],
+        two_profile_field(0, "uuid"),
+        "the uuid keys the pick"
+    );
+    assert_eq!(
+        offered[1]["uuid"],
+        two_profile_field(1, "uuid"),
+        "both uuids are offered"
+    );
     assert!(
         offered[1]["email"].is_string(),
         "the emails tell the accounts apart: {body}"
@@ -571,68 +589,93 @@ async fn verify_with_two_profiles_asks_for_a_pick() {
 }
 
 #[tokio::test]
-async fn verify_with_one_profile_goes_straight_to_the_mint() {
+async fn verify_with_one_profile_signs_in_without_a_pick() {
     let h = harness().await;
     mount_login(
         &h,
         include_str!("../../qubo/tests/fixtures/otp_verify.json"),
     )
     .await;
+    mount_discovery(&h.qubo).await;
+    mount_mint(&h.qubo).await;
 
     let response = ask_and_verify(&h).await;
 
-    // One account means no picker step: the flow runs on into the mint,
-    // whose wire shape is not pinned yet.
-    assert_ne!(
-        response.status(),
-        reqwest::StatusCode::OK,
-        "a single profile is not a choice"
-    );
-    let body: Value = response.json().await.expect("json");
     assert_eq!(
-        body["error"],
-        json!("auth error: mint call not yet pinned"),
-        "the flow reached the mint seam"
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "one account signs straight in"
     );
-    session_untouched(&h);
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("synthetic.minted.access"),
+        "the minted access token lands in the data dir: {stored}"
+    );
+    assert!(
+        stored.contains("synthetic.minted.refresh"),
+        "with the refresh token that makes the session durable: {stored}"
+    );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
 #[tokio::test]
-async fn selecting_a_profile_reaches_the_mint() {
+async fn selecting_a_profile_signs_in_with_the_chosen_account() {
     let h = harness().await;
     mount_login(
         &h,
         include_str!("../../qubo/tests/fixtures/otp_verify_two.json"),
     )
     .await;
-    let verified = ask_and_verify(&h).await;
+    mount_discovery(&h.qubo).await;
+    mount_mint(&h.qubo).await;
     assert_eq!(
-        verified.status(),
+        ask_and_verify(&h).await.status(),
         reqwest::StatusCode::OK,
         "a pick is asked"
     );
-    let uuids = two_profile_uuids();
+    let second = two_profile_field(1, "uuid");
 
     let response = client()
         .post(format!("{}/api/login/select", h.base))
-        .json(&json!({ "uuid": uuids[1] }))
+        .json(&json!({ "uuid": second }))
         .send()
         .await
         .expect("select");
 
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "the pick runs into the mint, which is not pinned yet"
+        reqwest::StatusCode::NO_CONTENT,
+        "the pick signs in"
     );
-    let body: Value = response.json().await.expect("json");
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("synthetic.minted.access"),
+        "the minted session lands: {stored}"
+    );
+    assert!(
+        stored.contains("synthetic.minted.refresh"),
+        "with its refresh token: {stored}"
+    );
+
+    // The pick rode through: the mint carries the second account's token.
+    let minted = h
+        .qubo
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .find(|request| request.url.path() == EMAILPROFILE_PATH)
+        .expect("the mint reached the gateway");
+    let subscriber = minted
+        .headers
+        .get("subscriber-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("the Subscriber-Key header");
     assert_eq!(
-        body["error"],
-        json!("auth error: mint call not yet pinned"),
-        "the chosen profile reached the seam"
+        subscriber,
+        two_profile_field(1, "accessToken"),
+        "the chosen account's token is what mints, not the first account's"
     );
-    session_untouched(&h);
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
