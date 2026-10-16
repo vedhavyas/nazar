@@ -109,6 +109,86 @@ test('a scrub re-mints at the position it lands on', async () => {
   );
 });
 
+/** The player the component renders, once it grew a video. */
+async function videoOf(): Promise<HTMLVideoElement> {
+  await vi.waitFor(() => expect(document.querySelector('video-rtc video')).toBeTruthy());
+  return document.querySelector('video-rtc video') as HTMLVideoElement;
+}
+
+/** Fail the vendored player's fetch, as a browser that cannot reach it
+ * would: the retry path is what is left. */
+async function failVendoredPlayer() {
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  const script = scripts.item(scripts.length - 1);
+  expect(script, 'the player is only fetched when it is needed').toBeTruthy();
+  script?.dispatchEvent(new Event('error'));
+}
+
+test('a paused clip is not a stalled one', async () => {
+  vi.useFakeTimers();
+  // Native HLS: a stall here would silently swap to the fallback, which is
+  // exactly the symptom a deliberate pause must not produce.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('maybe');
+  const onseek = vi.fn();
+  render(ClipPlayer, {
+    stream: 'vod-cam-1',
+    dayStart: DAY_START,
+    at: DAY_START + 3 * HOUR,
+    onseek,
+    onexit: vi.fn(),
+  });
+
+  const video = await videoOf();
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 12;
+  await vi.advanceTimersByTimeAsync(5000);
+
+  video.dispatchEvent(new Event('pause'));
+  await vi.advanceTimersByTimeAsync(30_000);
+
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'a paused clip never falls back: the clock stands still on purpose',
+  ).toBeNull();
+  expect(onseek, 'and never re-mints').not.toHaveBeenCalled();
+
+  // Resumed, the watch picks the picture back up where it stands.
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 13;
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(onseek, 'a moving picture raises nothing').not.toHaveBeenCalled();
+  expect(document.querySelector('[data-testid=hls]'), 'and stays on the socket').toBeNull();
+});
+
+test('the retry re-mints where the clock stood, not where the clip began', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const at = DAY_START + 3 * HOUR;
+  const onseek = vi.fn();
+  render(ClipPlayer, {
+    stream: 'vod-cam-1',
+    dayStart: DAY_START,
+    at,
+    onseek,
+    onexit: vi.fn(),
+  });
+
+  const video = await videoOf();
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 42;
+  await vi.advanceTimersByTimeAsync(5000);
+  // The clock stops: no advance across two samples.
+  await vi.advanceTimersByTimeAsync(11_000);
+  await failVendoredPlayer();
+  await vi.waitFor(() => expect(screen.getByText(/may have ended/)).toBeTruthy());
+
+  screen.getByText('Try again').click();
+  expect(
+    onseek,
+    'the re-ask lands at the playhead the picture died at, not the mint point',
+  ).toHaveBeenCalledWith(at + 42_000);
+});
+
 /** Hide or show the page, as a browser tab switch does. */
 function setHidden(hidden: boolean) {
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
@@ -142,7 +222,10 @@ test('a tab that comes back asks for the session again', async () => {
   setHidden(false);
 
   await vi.waitFor(() => {
-    expect(onseek, 'the same instant is minted again').toHaveBeenCalledWith(at);
+    expect(
+      onseek,
+      'the playhead the picture stood at is minted again, not the clip start',
+    ).toHaveBeenCalledWith(at + 4000);
   });
 });
 

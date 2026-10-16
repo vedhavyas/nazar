@@ -47,16 +47,20 @@
 
   let stalled = $state<null | 'start' | 'frozen'>(null);
   let attempt = $state(0);
+  /** Where the clock stood when the picture gave out, in seconds. */
+  let playhead = $state<number | null>(null);
 
   /** The scrubber's thumb, from the current instant. */
   const fraction = $derived(Math.min(1, Math.max(0, (at - dayStart) / DAY_MS)));
 
-  /** Recover by asking the server for the same instant again: the session
-   * underneath may have died while nobody consumed it. */
+  /** Recover by asking the server for the instant the person is actually
+   * at: the session underneath may have died while nobody consumed it, and
+   * a re-ask belongs at the playhead, not at the clip's beginning. */
   function retry() {
     stalled = null;
     attempt += 1;
-    onseek(at);
+    onseek(at + Math.round((playhead ?? 0) * 1000));
+    playhead = null;
   }
 </script>
 
@@ -65,7 +69,8 @@
     {stream}
     {attempt}
     muted
-    onsettled={(state) => {
+    onsettled={(state, clock) => {
+      if (clock !== undefined) playhead = clock;
       if (state === 'hls' || state === 'recovered') {
         stalled = null;
         if (state === 'recovered') retry();
@@ -91,6 +96,7 @@
     aria-label="Seek within the day"
     onchange={(event) => {
       stalled = null;
+      playhead = null;
       onseek(timestampAt(dayStart, Number(event.currentTarget.value) / 1000));
     }}
   />
