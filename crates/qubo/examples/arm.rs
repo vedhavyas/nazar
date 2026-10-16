@@ -45,6 +45,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         P2pConfig {
             device_name: "nazar-arm".to_owned(),
             aes_mode: args.aes_mode,
+            switches: qubo::p2p::ArmSwitches {
+                hold_beat: args.hold_beat,
+                ..qubo::p2p::ArmSwitches::default()
+            },
             ..P2pConfig::default()
         },
     );
@@ -139,6 +143,7 @@ struct Args {
     camera_controller: String,
     seconds: u64,
     aes_mode: AesMode,
+    hold_beat: bool,
 }
 
 impl Args {
@@ -152,9 +157,14 @@ impl Args {
             camera_controller: "d0000000-0000-4000-8000-000000000001".to_owned(),
             seconds: 60,
             aes_mode: AesMode::CtrCont,
+            hold_beat: false,
         };
         let mut items = std::env::args().skip(1);
         while let Some(flag) = items.next() {
+            if flag == "--hold-beat" {
+                args.hold_beat = true;
+                continue;
+            }
             let value = items
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value"))?;

@@ -16,6 +16,7 @@ pub mod relay;
 pub mod signaling;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng as _;
@@ -73,6 +74,33 @@ pub enum P2pError {
     Io(#[from] std::io::Error),
 }
 
+/// The arm's optional steps, each on or off.
+#[derive(Debug, Clone)]
+pub struct ArmSwitches {
+    /// Fetch the device-access token before the start call, as the app does.
+    pub device_token: bool,
+    /// Wait for the relay's first packet before syncing the direct
+    /// candidates - the app's invariant across all three captures.
+    pub relay_gate: bool,
+    /// Hold the SDK's keepalive beat on the relay socket once armed: a
+    /// 52-byte SYN every ~300ms with a fresh txid every 2s - the cadence
+    /// the 09:27 capture shows (83 same-flow SYNs over 57s, the SDK's ka
+    /// timer). The reference stops SYN traffic once settled; the M6 Task 2
+    /// run turns this on so a silent relay window cannot be dismissed as a
+    /// cold-flow artifact.
+    pub hold_beat: bool,
+}
+
+impl Default for ArmSwitches {
+    fn default() -> Self {
+        Self {
+            device_token: true,
+            relay_gate: true,
+            hold_beat: false,
+        }
+    }
+}
+
 /// How the engine reaches the camera; the reference client's knobs, minus
 /// its CLI-only experiments.
 #[derive(Debug, Clone)]
@@ -82,16 +110,13 @@ pub struct P2pConfig {
     pub ptt: bool,
     /// The STUN server for the srflx candidate; `None` skips the lookup.
     pub stun_server: Option<String>,
-    /// Fetch the device-access token before the start call, as the app does.
-    pub device_token: bool,
+    /// The optional arm steps.
+    pub switches: ArmSwitches,
     /// The local address the media socket binds to.
     pub bind: Option<IpAddr>,
     /// The advertised host ip; defaults to the bind address, else the
     /// default-route address.
     pub host_ip: Option<String>,
-    /// Wait for the relay's first packet before syncing the direct
-    /// candidates - the app's invariant across all three captures.
-    pub relay_gate: bool,
     /// Bound on waiting for the camera's answer after the start call.
     pub answer_timeout: Duration,
     /// Bound on the UDP handshake.
@@ -112,10 +137,9 @@ impl Default for P2pConfig {
             media: signaling::MediaStreams::Both,
             ptt: false,
             stun_server: Some("3.6.42.244:5349".to_owned()),
-            device_token: true,
+            switches: ArmSwitches::default(),
             bind: None,
             host_ip: None,
-            relay_gate: true,
             answer_timeout: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(10),
             aes_mode: media::AesMode::CtrCont,
@@ -158,7 +182,7 @@ impl P2pEngine {
         identity: &P2pIdentity,
     ) -> Result<ArmedSession, P2pError> {
         let allocation = self.allocate(session, device, identity).await?;
-        if self.config.device_token {
+        if self.config.switches.device_token {
             self.device_token_preflight(session, device, identity).await;
         }
         let (socket, offer) = self.open_media_socket(&allocation).await?;
@@ -221,7 +245,7 @@ impl P2pEngine {
             &targets,
             &HandshakeConfig {
                 relay: relay_endpoint,
-                relay_gate: self.config.relay_gate,
+                relay_gate: self.config.switches.relay_gate,
                 timeout: self.config.handshake_timeout,
             },
         )
@@ -231,6 +255,11 @@ impl P2pEngine {
             &allocation.aes_key,
             &allocation.aes_iv,
         )?;
+        let socket = Arc::new(socket);
+        let beat = match (self.config.switches.hold_beat, relay_endpoint) {
+            (true, Some(relay)) => Some(spawn_beat(Arc::clone(&socket), relay)),
+            _ => None,
+        };
         tracing::debug!(peer = %established.addr, "fast lane armed");
 
         // The session is real from here: the guard stands down and the
@@ -247,6 +276,7 @@ impl P2pEngine {
             camera: device.device_id.clone(),
             src_device_id: identity.src_device_id.clone(),
             disarmed: false,
+            beat,
         })
     }
 
@@ -451,6 +481,31 @@ impl P2pEngine {
         tracing::debug!(topic = %control_topic, "startP2pCall published");
         Ok(())
     }
+}
+
+/// Hold the SDK's keepalive beat on the relay socket: a simple SYN every
+/// ~300ms with a fresh txid every 2s - the cadence the 09:27 capture shows
+/// (83 same-flow SYNs over 57s, the SDK's ka timer). Never sent to the
+/// camera, matching the captures.
+fn spawn_beat(socket: Arc<UdpSocket>, relay: SocketAddr) -> tokio::task::AbortHandle {
+    const TICK: Duration = Duration::from_millis(300);
+    const REFRESH: Duration = Duration::from_secs(2);
+    let handle = tokio::spawn(async move {
+        let mut names = relay::NameGen::new();
+        let mut syn = relay::simple_syn(&names.generate(), &random_nonce());
+        let mut refreshed = std::time::Instant::now();
+        let mut ticker = tokio::time::interval(TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if refreshed.elapsed() >= REFRESH {
+                syn = relay::simple_syn(&names.generate(), &random_nonce());
+                refreshed = std::time::Instant::now();
+            }
+            let _ = socket.send_to(&syn, relay).await;
+        }
+    });
+    handle.abort_handle()
 }
 
 /// The handshake's targets: the camera's candidates, and the relay when the
@@ -680,7 +735,7 @@ fn udp_connect_ip() -> IpAddr {
 /// controls ride [`ArmedSession::send_control`], and [`ArmedSession::disarm`]
 /// (or dropping) closes the broker side.
 pub struct ArmedSession {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     peer: SocketAddr,
     decryptor: media::MediaDecryptor,
     names: relay::NameGen,
@@ -692,6 +747,8 @@ pub struct ArmedSession {
     /// Whether `disarm` ended the call; a drop that finds this false ends
     /// it, so abandoning a session never leaves the camera in a call.
     disarmed: bool,
+    /// The relay keepalive beat, when `P2pConfig::hold_beat` asked for one.
+    beat: Option<tokio::task::AbortHandle>,
 }
 
 impl ArmedSession {
@@ -775,12 +832,18 @@ impl ArmedSession {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         self.disarmed = true;
+        if let Some(beat) = self.beat.take() {
+            beat.abort();
+        }
         self.broker.pump.abort();
     }
 }
 
 impl Drop for ArmedSession {
     fn drop(&mut self) {
+        if let Some(beat) = self.beat.take() {
+            beat.abort();
+        }
         if self.disarmed {
             self.broker.pump.abort();
             return;
@@ -925,9 +988,11 @@ mod tests {
         // its beat, then stops the pump.
         let (broker, halted) = stoppable_broker();
         let session = ArmedSession {
-            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .expect("a socket"),
+            socket: Arc::new(
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .expect("a socket"),
+            ),
             peer: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1),
             decryptor: MediaDecryptor::new(
                 media::AesMode::Plain,
@@ -942,6 +1007,7 @@ mod tests {
             camera: "cam".to_owned(),
             src_device_id: "src".to_owned(),
             disarmed: false,
+            beat: None,
         };
         drop(session);
         // The teardown publishes first and stops the pump only after its
@@ -974,7 +1040,7 @@ mod tests {
             .await
             .expect("a sender");
         let session = ArmedSession {
-            socket,
+            socket: Arc::new(socket),
             peer: target,
             decryptor: MediaDecryptor::new(media::AesMode::CtrCont, key, iv).expect("a decryptor"),
             names: relay::NameGen::new(),
@@ -984,8 +1050,51 @@ mod tests {
             camera: "cam".to_owned(),
             src_device_id: "src".to_owned(),
             disarmed: false,
+            beat: None,
         };
         (session, target, sender)
+    }
+
+    #[tokio::test]
+    async fn the_beat_holds_the_relay_cadence_and_refreshes_its_txid() {
+        // The SDK keeps a 52-byte SYN running at ~300ms with a fresh txid
+        // every 2s; the Task 2 run's beat variant must reproduce it.
+        let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a relay socket");
+        let relay_addr = relay.local_addr().expect("bound address");
+        let media = Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("a media socket"),
+        );
+        let beat = spawn_beat(Arc::clone(&media), relay_addr);
+
+        let mut buf = [0_u8; 64];
+        let mut seen = 0_u32;
+        let mut txids = std::collections::BTreeSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_millis(2700);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(500), relay.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            seen += 1;
+            assert_eq!(len, 52, "the beat is the 52-byte simple SYN");
+            assert_eq!(&buf[4..8], &relay::COOKIE, "the beat is cookie-tagged");
+            txids.insert(buf[8..20].to_vec());
+        }
+        beat.abort();
+        assert!(
+            seen >= 5,
+            "the ~300ms cadence ran through the window (saw {seen})"
+        );
+        assert!(
+            txids.len() >= 2,
+            "the txid refreshed inside 2.7s (saw {} distinct)",
+            txids.len()
+        );
     }
 
     /// A 44-byte cookie-tagged probe, the shape the camera sends mid-media.
