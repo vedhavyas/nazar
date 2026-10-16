@@ -754,6 +754,35 @@ async fn websocket_frames_are_piped_through_the_proxy() {
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
+/// An unknown /api path is the API's 404 envelope, never a 200 page: a
+/// client asking for data must not read the SPA instead (an id-less
+/// `/api/snaps/`, say).
+#[tokio::test]
+async fn an_unknown_api_path_answers_json_404() {
+    let h = harness().await;
+    for path in ["/api/nonsense", "/api/snaps/", "/api"] {
+        let unknown = client()
+            .get(format!("{}{path}", h.base))
+            .send()
+            .await
+            .expect("unknown api path");
+        assert_eq!(
+            unknown.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is a 404"
+        );
+        assert_eq!(
+            unknown
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "{path} answers the API's own envelope"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
 #[tokio::test]
 async fn the_spa_serves_index_and_revalidates_with_etags() {
     let h = harness().await;
@@ -817,29 +846,6 @@ async fn the_spa_serves_index_and_revalidates_with_etags() {
         index,
         "client routes fall back to index.html"
     );
-
-    // An unknown /api path is the API's 404 envelope, never a 200 page: a
-    // client asking for data must not read the SPA instead.
-    for path in ["/api/nonsense", "/api/snaps/", "/api"] {
-        let unknown = client
-            .get(format!("{}{path}", h.base))
-            .send()
-            .await
-            .expect("unknown api path");
-        assert_eq!(
-            unknown.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{path} is a 404"
-        );
-        assert_eq!(
-            unknown
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("application/json"),
-            "{path} answers the API's own envelope"
-        );
-    }
 
     let revalidated = client
         .get(format!("{}/", h.base))
