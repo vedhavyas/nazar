@@ -975,6 +975,39 @@ async fn a_refresh_without_a_rotation_keeps_the_stored_token() {
 }
 
 #[tokio::test]
+async fn an_empty_rotation_keeps_the_stored_refresh_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "accessToken": "gm-access-token-2", "refreshToken": "" }).to_string(),
+        ))
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some("gm-refresh-token".to_owned()),
+    };
+
+    let refreshed = refresh_session(&client, &stored)
+        .await
+        .expect("the refresh");
+
+    assert_eq!(
+        refreshed.access_token, "gm-access-token-2",
+        "the fresh access token lands"
+    );
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("gm-refresh-token"),
+        "an empty rotation keeps the stored token, never poisons it"
+    );
+}
+
+#[tokio::test]
 async fn a_refresh_without_a_token_is_refused_locally() {
     let server = MockServer::start().await;
     let client = client_for(&server);

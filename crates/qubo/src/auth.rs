@@ -275,10 +275,13 @@ pub async fn refresh_session(client: &QuboClient, session: &Session) -> Result<S
     });
     let response = client.post_json(&path, &body, Some(session)).await?;
     let refreshed: Refreshed = serde_json::from_value(response)?;
+    // An empty token is no token: a rotation that answers "" keeps the
+    // stored one rather than poisoning it.
+    let rotated = refreshed.refresh_token.filter(|token| !token.is_empty());
     Ok(Session {
         access_token: refreshed.access_token,
         uuid: session.uuid.clone(),
         email: session.email.clone(),
-        refresh_token: refreshed.refresh_token.or(Some(refresh_token)),
+        refresh_token: rotated.or(Some(refresh_token)),
     })
 }
