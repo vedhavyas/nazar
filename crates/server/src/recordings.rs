@@ -1,5 +1,5 @@
 //! Recordings browsing: the cloud's calendar, and a day's segments from
-//! the house's own memory.
+//! the house's own motion memory.
 //!
 //! The cloud has no clip-list endpoint (measured 2026-10-16,
 //! docs/qubo-vod-verification.md): the app's own timeline is built from
@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use crate::notify::{Kind, NotificationStore};
+use crate::episodes::EpisodeStore;
 
 /// One segment of a day: when a motion episode began, and the still kept
 /// for it when one was. Playback re-mints the cloud session at
@@ -21,21 +21,18 @@ pub struct Clip {
 
 /// The clips for `device_id` on `day` (`DD-MM-YYYY`, the household's own
 /// day), newest first. `None` when the day is not a day.
-pub fn clips_for(store: &NotificationStore, device_id: &str, day: &str) -> Option<Vec<Clip>> {
+pub fn clips_for(store: &EpisodeStore, device_id: &str, day: &str) -> Option<Vec<Clip>> {
     let (start, end) = ist_day_bounds(day)?;
     let mut clips: Vec<Clip> = store
         .list()
         .into_iter()
-        .filter(|notification| {
-            notification.device_id == device_id
-                && matches!(notification.kind, Kind::Motion)
-                && notification.at >= start
-                && notification.at < end
+        .filter(|episode| {
+            episode.device_id == device_id && episode.start_ms >= start && episode.start_ms < end
         })
-        .map(|notification| Clip {
-            id: notification.id,
-            start_ms: notification.at,
-            snapshot_url: notification.snapshot_url,
+        .map(|episode| Clip {
+            id: episode.id,
+            start_ms: episode.start_ms,
+            snapshot_url: episode.snapshot_url,
         })
         .collect();
     // The store's own order is its ledger's, not a promise: sort here so
@@ -45,6 +42,8 @@ pub fn clips_for(store: &NotificationStore, device_id: &str, day: &str) -> Optio
 }
 
 /// IST is a fixed +05:30, so a day is a constant offset from UTC midnight.
+/// This and the calendar's `timezone=Asia/Kolkata` are the same claim about
+/// the account's own day: if the account ever moves, they move together.
 const IST_OFFSET_MS: i64 = 5 * 3_600_000 + 30 * 60_000;
 const DAY_MS: i64 = 86_400_000;
 

@@ -24,6 +24,7 @@ use qubo::{
     verify_otp, write_service,
 };
 
+use crate::episodes::EpisodeStore;
 use crate::events::EventBus;
 use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
@@ -99,6 +100,8 @@ pub struct AppState {
     pub motion: Arc<Mutex<MotionOrder>>,
     /// What the house has told, and the stills it kept.
     pub notifications: Arc<NotificationStore>,
+    /// The motion memory a recording timeline is browsed from.
+    pub episodes: Arc<EpisodeStore>,
     pub snapshots: Snapshots,
     /// One lock per camera: a step is a read-modify-write, and two of them
     /// racing read the same base and lose one another's move.
@@ -115,6 +118,7 @@ pub struct Wiring {
     pub events: EventBus,
     pub motion: Arc<Mutex<MotionOrder>>,
     pub notifications: Arc<NotificationStore>,
+    pub episodes: Arc<EpisodeStore>,
     pub snapshots: Snapshots,
 }
 
@@ -130,6 +134,7 @@ impl AppState {
             events: wiring.events,
             motion: wiring.motion,
             notifications: wiring.notifications,
+            episodes: wiring.episodes,
             snapshots: wiring.snapshots,
             ptz_locks: Arc::new(Mutex::new(HashMap::new())),
             // No redirects on the proxy: a 3xx from go2rtc must reach the
@@ -379,7 +384,7 @@ async fn camera_recordings(
     if !known {
         return Err(SupervisorError::UnknownDevice(id).into());
     }
-    let clips = clips_for(&state.notifications, &id, &day).ok_or_else(|| {
+    let clips = clips_for(&state.episodes, &id, &day).ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("day {day} is not DD-MM-YYYY"),

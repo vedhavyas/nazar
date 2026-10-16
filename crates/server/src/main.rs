@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
+use server::episodes::EpisodeStore;
 use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
@@ -45,7 +46,17 @@ async fn main() -> anyhow::Result<()> {
         Go2rtc::connect(server::go2rtc::API_BASE.parse().context("the go2rtc URL")?),
         config.data_dir.join("snaps"),
     );
-    let _notify = server::notify::start(&events, Arc::clone(&notifications), snapshots.clone());
+    let episodes = Arc::new(EpisodeStore::open(
+        config.data_dir.join("episodes.json"),
+        COALESCE,
+        config.episodes_retention(),
+    ));
+    let _notify = server::notify::start(
+        &events,
+        Arc::clone(&notifications),
+        Arc::clone(&episodes),
+        snapshots.clone(),
+    );
     let _mqtt = MqttService::start(
         qubo.clone(),
         sessions.clone(),
@@ -77,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
             events,
             motion,
             notifications,
+            episodes,
             snapshots,
         },
     );

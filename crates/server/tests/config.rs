@@ -14,6 +14,7 @@ fn config_in(dir: &std::path::Path) -> Config {
         service_provider: qubo::ServiceProvider::default(),
         webrtc_candidates: None,
         aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
     }
 }
 

@@ -18,6 +18,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
+use server::episodes::EpisodeStore;
 use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
@@ -224,6 +225,7 @@ struct Harness {
     qubo: MockServer,
     go2rtc: common::FakeApi,
     store: Arc<NotificationStore>,
+    episodes: Arc<EpisodeStore>,
     supervisor: Supervisor,
     /// The bus the service follows: events go in here, not into the store.
     events: EventBus,
@@ -257,7 +259,13 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             stream_idle: Duration::from_secs(120),
         },
     );
-    server::notify::start(&events, Arc::clone(&store), snapshots.clone());
+    let episodes = common::episodes_in(&data_dir);
+    server::notify::start(
+        &events,
+        Arc::clone(&store),
+        Arc::clone(&episodes),
+        snapshots.clone(),
+    );
 
     let state = AppState::new(
         "test",
@@ -269,6 +277,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             events: events.clone(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::clone(&store),
+            episodes: Arc::clone(&episodes),
             snapshots: snapshots.clone(),
         },
     );
@@ -282,6 +291,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
         qubo,
         go2rtc,
         store,
+        episodes,
         supervisor,
         events,
     }
@@ -409,6 +419,42 @@ async fn a_still_comes_from_a_pipeline_already_running() {
         still.bytes().await.expect("bytes").len(),
         4,
         "and it is the frame go2rtc gave"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_motion_is_also_an_episode_for_the_timeline() {
+    let dir = temp_dir("notify-episodes");
+    let store = store_in(&dir);
+    let h = harness(Arc::clone(&store)).await;
+
+    h.events.publish(motion(CAMERA));
+    let marked = common::eventually(|| async {
+        h.episodes
+            .list()
+            .iter()
+            .any(|episode| episode.device_id == CAMERA)
+    })
+    .await;
+    assert!(marked, "the motion reached the timeline's own memory");
+
+    let episodes = h.episodes.list();
+    assert_eq!(episodes.len(), 1, "one episode, not one per sighting");
+    assert_eq!(
+        episodes[0].snapshot_url, None,
+        "no pipeline was running, so the marker carries no still"
+    );
+
+    // The timeline is not the bell: a liveness event is told but is no
+    // episode, however the ring is aged.
+    h.events.publish(liveness(CAMERA, false));
+    let told = common::eventually(|| async { h.store.list().len() == 2 }).await;
+    assert!(told, "the bell heard the camera go");
+    assert_eq!(
+        h.episodes.list().len(),
+        1,
+        "and the timeline kept only the motion"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

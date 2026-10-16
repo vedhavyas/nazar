@@ -4,6 +4,16 @@
 
 pub mod mqtt;
 
+/// A motion-episode store on a scratch path: tests that never read the
+/// timeline still need one wired.
+pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::EpisodeStore> {
+    std::sync::Arc::new(server::episodes::EpisodeStore::open(
+        dir.join("episodes.json"),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_hours(30 * 24),
+    ))
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,7 +56,7 @@ impl FakeApi {
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
-            Knobs {
+            &Knobs {
                 put_status: &put_status,
                 streams_visible: &streams_visible,
                 streams_error: &streams_error,
@@ -138,7 +148,7 @@ struct Knobs<'a> {
 fn streams_routes(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
-    knobs: Knobs<'_>,
+    knobs: &Knobs<'_>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
 ) -> Router {
     Router::new()
@@ -161,14 +171,17 @@ fn streams_routes(
             }),
         )
         .route("/api/ws", get(echo))
-        .route("/api/streams", streams_methods(puts, deletes, knobs, viewers))
+        .route(
+            "/api/streams",
+            streams_methods(puts, deletes, knobs, viewers),
+        )
 }
 
 /// The streams endpoint's three methods, as go2rtc 1.9.14 answers them.
 fn streams_methods(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
-    knobs: Knobs<'_>,
+    knobs: &Knobs<'_>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
 ) -> axum::routing::MethodRouter {
     let recorded = Arc::clone(puts);

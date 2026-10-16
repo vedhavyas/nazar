@@ -150,6 +150,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         service_provider: ServiceProvider::default(),
         webrtc_candidates: Some("198.51.100.1:8555".to_owned()),
         aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -214,6 +215,7 @@ async fn no_webrtc_section_without_a_configured_candidate() {
         service_provider: ServiceProvider::default(),
         webrtc_candidates: None,
         aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
