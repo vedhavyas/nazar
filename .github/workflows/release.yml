@@ -130,16 +130,23 @@ jobs:
         run: |
           set -euo pipefail
           built=web/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
-          tools=$(dirname "$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -1)")
-          got=$("$tools/aapt2" dump badging "$built" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p")
+          aapt2=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name aapt2 -type f | sort -V | tail -1)
+          apksigner=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -1)
+          [ -n "$aapt2" ] && [ -n "$apksigner" ] || {
+            echo "[ERROR] no aapt2/apksigner under $ANDROID_HOME/build-tools"; exit 1; }
+          got=$("$aapt2" dump badging "$built" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p")
           [ "$got" = "${{ steps.version.outputs.version }}" ] || {
             echo "[ERROR] the built APK is version $got, expected ${{ steps.version.outputs.version }}"; exit 1; }
-          abi=$("$tools/aapt2" dump badging "$built" | sed -n 's/^native-code: //p' | tr -d "'")
+          abi=$("$aapt2" dump badging "$built" | sed -n 's/^native-code: //p' | tr -d "'")
           [ "$abi" = "arm64-v8a" ] || { echo "[ERROR] native code '$abi', expected arm64-v8a"; exit 1; }
-          signed=$("$tools/apksigner" verify --print-certs "$built" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z')
+          # Not piped into the read: an apksigner that fails must show its own
+          # reason in the log rather than vanish behind a successful `tr`.
+          "$apksigner" verify --print-certs "$built" > certs.txt
+          cat certs.txt
+          signed=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' certs.txt | head -1 | tr -d ':' | tr 'A-Z' 'a-z')
           want=$(tr -d '[:space:]' < web/src-tauri/gen/android/release-keystore.sha256)
           [ "$signed" = "$want" ] || {
-            echo "[ERROR] the APK signer $signed is not the recorded release key $want"; exit 1; }
+            echo "[ERROR] the APK signer '$signed' is not the recorded release key $want"; exit 1; }
           echo "[OK] the APK is ${got}, arm64-v8a, signed by the recorded key"
       - name: Stage it with the other artifacts' names
         run: |
