@@ -227,6 +227,30 @@ async fn a_second_seek_releases_the_old_session_first() {
 }
 
 #[tokio::test]
+async fn a_seek_releases_the_old_session_before_it_sets_the_new_one() {
+    let h = harness(Duration::from_secs(120)).await;
+    mount_vod(&h.qubo).await;
+
+    assert_eq!(play(&h, CLIP_MS).await.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        play(&h, CLIP_MS + 60_000).await.status(),
+        reqwest::StatusCode::OK
+    );
+
+    let name = format!("vod-{CAMERA}");
+    assert_eq!(
+        h.go2rtc.ops(),
+        vec![
+            format!("put:{name}"),
+            format!("delete:{name}"),
+            format!("put:{name}")
+        ],
+        "the seek releases the old session before the new source is set: a \
+         put before the release would be deleted again under the player's name"
+    );
+}
+
+#[tokio::test]
 async fn the_player_leaving_releases_the_session() {
     let h = harness(Duration::from_secs(120)).await;
     mount_vod(&h.qubo).await;
