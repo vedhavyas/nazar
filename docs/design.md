@@ -16,7 +16,7 @@ Success: open `nazar.hub` (or the desktop/Android app) from anywhere on the mesh
   - The one family Qubo account session (durable login; section 4).
   - MQTT subscription to the unit (`/monitor`, `/control`, `/config`) - the live event source.
   - Stream machinery per camera: the proven pipeline - per-session mint (5-minute sessions, automatic re-mint) feeding go2rtc, which transcodes HEVC (browsers cannot play it) to H.264 and passes audio (AAC 16 kHz mono) through.
-  - Delivery to clients: **WebRTC primary** (go2rtc's WebRTC output, using the coturn server already running on the hub), HLS as the compatibility fallback.
+  - Delivery to clients: **WebRTC primary**, carried over direct candidates - the hub deployment advertises the container's pinned static-network address (`NAZAR_WEBRTC_CANDIDATES`, verified peer-reachable over WG; host-port binds are not, measured 2026-10-15). The hub's coturn (`webrtc.ice_servers`) stands as the documented fallback if a client cannot reach the direct candidate. HLS remains the compatibility fallback, owned by M2's player task.
   - Recording playback: cloud-allocated VOD sessions (section 6).
   - Notification fan-out to connected clients over the client protocol.
   - The P2P engine (the extracted reference client), running in parallel and flag-gated; it becomes the fast lane and carries talkback the moment it proves itself in our own app (section 7).
@@ -29,20 +29,21 @@ Interfaces are deliberately transport-thin: any client that can speak the protoc
 
 - One image, published to GHCR from nazar's CI (public visibility - the hub pulls it without credentials; the WireGuard perimeter is the access control, and the image contains no secrets).
 - Hosting: one compose file in `hub-modules` (`static/system/docker/docker-compose-nazar.yml`), following the forge-web precedent: image ref, `EXPOSE`ed port, caddy label giving it `nazar.hub` with the hub's internal TLS, a bind-mount volume `$DATA_DIR/nazar` (Qubo session, metadata cache, settings), env declared in `config.toml` `[envs]`, labels `hub.type`/`hub.group` and Watchtower disabled for our own image, network `docker-direct` (needs public egress to Qubo's cloud and Wowza).
-- Access model: **WireGuard is the perimeter** (the hub's existing posture); each household device gets a WG profile. Nazar additionally carries its own PIN gate as defense-in-depth, because the streams are family-private.
+- Access model: **WireGuard is the perimeter** (the hub's existing posture); each household device gets a WG profile. No app-level gate (see section 4).
 - The same image can also run on the Studio later, unchanged, for home-LAN speed - the interface makes it a deployment choice, not an architecture change.
 
 ## 4. Sessions and login
 
 - The server holds ONE Qubo account session for the family.
 - **Durable login is the target**: the Google path returns a refresh token (unlike the phone-OTP path, which expires hourly with no refresh). The server mints the Google ID token using the app's own OAuth client id, extracted from the APK - this is the standard private-client approach and is the one experiment that must succeed early (section 9). Until it does, the server's login screen takes a phone OTP code (typed once; works today).
-- Client access: connect over the mesh, unlock with a family PIN (set on first run). Devices are identified for presence and per-device preferences.
+- Client access: the WireGuard mesh IS the perimeter (the hub's model) - no app-level gate. Ved's ruling, 2026-10-15: the PIN was my defense-in-depth addition and he removed it; the perimeter, not an app lock, is the access control. Devices are identified for presence and per-device preferences.
+- Login-route abuse is bounded by the perimeter, not a server throttle (decision 2026-10-16, after the gate removal took the rate limiter with it): anything that reaches the port is a mesh peer, so the OTP routes stay unthrottled by design, and that decision is recorded rather than silently inherited.
 
 ## 5. Live viewing
 
 - Home screen: **adaptive hero** - the camera that most recently saw motion takes the large tile (full quality); the other cameras sit below it, live at low quality. Away from home the small tiles may drop to stills.
 - Camera screen: live video; **drag on the video to pan/tilt** (direction overlay while dragging); privacy quick-toggle; quality selector; audio-listen toggle; client-side snapshot capture.
-- Latency: WebRTC through the hub's coturn - sub-second. HLS fallback where WebRTC cannot negotiate.
+- Latency: WebRTC (direct WG candidates; coturn as the documented fallback) - sub-second. HLS fallback where WebRTC cannot negotiate, owned by M2's player task.
 - Audio: listen works on the cloud path (AAC 16 kHz confirmed live). Talkback is in scope but gated on the fast lane (section 7).
 
 ## 6. Recordings

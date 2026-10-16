@@ -13,20 +13,15 @@ services:
     restart: unless-stopped
     # The entrypoint chowns /data and drops to uid 101 itself; do NOT pin user:.
     pull_policy: always
-    ports:
-      # WebRTC media only, bound to the WireGuard address so it never lands on
-      # the public interface; every viewer is a WG peer.
-      - "198.51.100.1:8555:8555/tcp"
-      - "198.51.100.1:8555:8555/udp"
     environment:
       DATA_DIR: /data
       RUST_LOG: info
       QUBO_SP: d10e4bfb0153496e8e8bb955f7ebe413
-      NAZAR_WEBRTC_CANDIDATES: 198.51.100.1:8555
+      NAZAR_WEBRTC_CANDIDATES: 198.51.100.9:8555
     volumes:
       - $DATA_DIR/nazar:/data
     networks:
-      - docker-direct
+      - docker-direct-static
     healthcheck:
       test: curl -fsS http://127.0.0.1:8080/api/health || exit 1
       interval: 30s
@@ -43,12 +38,13 @@ services:
       com.centurylinklabs.watchtower.enable: false
 
 networks:
-  docker-direct:
+  docker-direct-static:
     external: true
 ```
 
-Notes:
-- WebRTC media does not flow through caddy: browsers connect directly to `198.51.100.1:8555` (the hub's WG address), which is why go2rtc's `webrtc.candidates` is templated from `NAZAR_WEBRTC_CANDIDATES`. The coturn route (`webrtc.ice_servers` -> the hub's coturn) stays documented as the fallback if a future client cannot reach the direct candidate.
+Notes (deploy deviations measured on the hub, 2026-10-15 - the compose above already reflects them):
+- **Network is `docker-direct-static`, not `docker-direct`**: caddy's address is dynamic on the plain network and the container needs a pinned address, so nazar sits on the static network with its own pinned IP (coturn's own pattern) - the go2rtc media candidate is that container IP:8555.
+- **No host-port publishes**: `198.51.100.1:8555` host binds are unreachable from WireGuard peers on this box (INPUT is policy-drop with no WG->host-port accept; peer-tested). Media flows container-to-container/peer directly on the static network; the candidate is advertised through signaling, so no client-side change. Peer-verified from a Mac over WG (198.51.100.9:8555 connects). The coturn route (`webrtc.ice_servers`) stays documented as the fallback if a future client cannot reach the direct candidate.
 - Bind mount only (hub convention); the directory is auto-provisioned, and the image's entrypoint fixes ownership itself (hence no `user:` pin, unlike forge-web).
 - `docker-direct` for public egress (Qubo cloud + Wowza).
 - `pull_policy: always` + watchtower off: the restart is the upgrade gate; image floats on `:latest`.
@@ -61,7 +57,7 @@ Only inside the container's volume: the Qubo session file that the server writes
 ## Access
 
 - Browser/extensions on the mesh: `https://nazar.hub` (caddy internal CA; root CA install recipe is in the hub README).
-- WireGuard is the perimeter; nazar adds its own PIN gate (first-run setup in the app).
+- WireGuard is the perimeter; nazar carries no app-level gate (the PIN was removed by Ved's ruling, 2026-10-15 - the mesh, not an app lock, is the access control).
 
 ## Deploy sequence (hub-modules owns it)
 
