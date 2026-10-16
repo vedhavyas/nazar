@@ -11,7 +11,7 @@ use qubo::ServiceProvider;
 use crate::notify::AQI_ALERT_AT;
 
 /// How many days of motion episodes the timeline keeps by default.
-const EPISODE_RETENTION_DAYS: u32 = 30;
+pub const EPISODE_RETENTION_DAYS: u32 = 30;
 
 /// Everything the server needs from its environment.
 #[derive(Debug, Clone)]
@@ -50,27 +50,8 @@ impl Config {
             service_provider: var("QUBO_SP")
                 .map_or_else(ServiceProvider::default, ServiceProvider::new),
             webrtc_candidates: var("NAZAR_WEBRTC_CANDIDATES"),
-            aqi_alert_at: var("NAZAR_AQI_ALERT_AT").map_or(AQI_ALERT_AT, |raw| {
-                raw.parse().unwrap_or_else(|_| {
-                    tracing::warn!(
-                        value = %raw,
-                        "NAZAR_AQI_ALERT_AT is not a number; keeping the default line"
-                    );
-                    AQI_ALERT_AT
-                })
-            }),
-            episodes_retention_days: var("NAZAR_EPISODE_RETENTION_DAYS").map_or(
-                EPISODE_RETENTION_DAYS,
-                |raw| {
-                    raw.parse().unwrap_or_else(|_| {
-                        tracing::warn!(
-                            value = %raw,
-                            "NAZAR_EPISODE_RETENTION_DAYS is not a number; keeping the default"
-                        );
-                        EPISODE_RETENTION_DAYS
-                    })
-                },
-            ),
+            aqi_alert_at: aqi_line(var("NAZAR_AQI_ALERT_AT").as_deref()),
+            episodes_retention_days: retention_days(var("NAZAR_EPISODE_RETENTION_DAYS").as_deref()),
         }
     }
 
@@ -107,4 +88,34 @@ impl Config {
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The alert line from its environment value: anything that is not a number
+/// keeps the default. Pure, so the branch is testable without the
+/// environment (which the workspace's `unsafe_code = "forbid"` bars tests
+/// from touching).
+pub fn aqi_line(raw: Option<&str>) -> u32 {
+    raw.map_or(AQI_ALERT_AT, |raw| {
+        raw.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %raw,
+                "NAZAR_AQI_ALERT_AT is not a number; keeping the default line"
+            );
+            AQI_ALERT_AT
+        })
+    })
+}
+
+/// The timeline's retention from its environment value: anything that is
+/// not a number keeps the default.
+pub fn retention_days(raw: Option<&str>) -> u32 {
+    raw.map_or(EPISODE_RETENTION_DAYS, |raw| {
+        raw.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %raw,
+                "NAZAR_EPISODE_RETENTION_DAYS is not a number; keeping the default"
+            );
+            EPISODE_RETENTION_DAYS
+        })
+    })
 }
