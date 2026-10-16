@@ -63,10 +63,17 @@ impl Default for FeedConfig {
 /// What the monitor feed tells the house.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitEvent {
-    /// A camera saw something move.
-    Motion { device_id: String },
+    /// A camera saw something move. `image` is the feed's own still, when
+    /// the payload carries one we could fetch (it usually carries a
+    /// device-local path instead).
+    Motion {
+        device_id: String,
+        image: Option<String>,
+    },
     /// A device reported itself present or absent.
     Liveness { device_id: String, online: bool },
+    /// A purifier's air quality reading, in PM2.5.
+    Aqi { device_id: String, value: u32 },
 }
 
 /// How a feed cycle ended, which is what the backoff reads.
@@ -125,16 +132,35 @@ pub fn parse_monitor_message(topic: &str, payload: &str) -> Option<UnitEvent> {
     let devices = value.get("devices")?;
     match *service {
         "recordingControl" => {
-            let cause = devices
-                .pointer("/services/recordingControl/events/stateChanged/cause")?
-                .as_str()?;
+            let state = devices.pointer("/services/recordingControl/events/stateChanged")?;
+            let cause = state.get("cause")?.as_str()?;
             if matches!(cause, "MOTION_DETECTED" | "PERSON_DETECTED") {
+                // The captured images ride as device-local paths
+                // (`/tmp/images/...`); only a fetchable URL is kept.
+                let image = state
+                    .get("imageFileName")
+                    .and_then(Value::as_str)
+                    .filter(|name| name.starts_with("http"))
+                    .map(str::to_owned);
                 Some(UnitEvent::Motion {
                     device_id: (*device).to_owned(),
+                    image,
                 })
             } else {
                 None
             }
+        }
+        "aqiStatus" => {
+            let pm25 = devices.pointer("/services/aqiStatus/events/stateChanged/PM25")?;
+            let value = match pm25 {
+                Value::String(text) => text.parse().ok()?,
+                Value::Number(number) => u32::try_from(number.as_u64()?).ok()?,
+                _ => return None,
+            };
+            Some(UnitEvent::Aqi {
+                device_id: (*device).to_owned(),
+                value,
+            })
         }
         "heartbeat" => {
             let online = match devices.get("operationState")?.as_str()? {

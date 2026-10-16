@@ -27,6 +27,7 @@ use qubo::{
 use crate::events::EventBus;
 use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
+use crate::notify::{Notification, NotificationStore, Snapshots};
 use crate::supervisor::{StreamState, Supervisor, SupervisorError, stream_name};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
@@ -95,6 +96,9 @@ pub struct AppState {
     pub events: EventBus,
     /// The hero decision, fed by the event bus.
     pub motion: Arc<Mutex<MotionOrder>>,
+    /// What the house has told, and the stills it kept.
+    pub notifications: Arc<NotificationStore>,
+    pub snapshots: Snapshots,
     /// One lock per camera: a step is a read-modify-write, and two of them
     /// racing read the same base and lose one another's move.
     ptz_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -109,6 +113,8 @@ pub struct Wiring {
     pub go2rtc_api: String,
     pub events: EventBus,
     pub motion: Arc<Mutex<MotionOrder>>,
+    pub notifications: Arc<NotificationStore>,
+    pub snapshots: Snapshots,
 }
 
 impl AppState {
@@ -122,6 +128,8 @@ impl AppState {
             control: ControlTiming::default(),
             events: wiring.events,
             motion: wiring.motion,
+            notifications: wiring.notifications,
+            snapshots: wiring.snapshots,
             ptz_locks: Arc::new(Mutex::new(HashMap::new())),
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
@@ -208,6 +216,8 @@ pub fn app(state: AppState) -> Router {
             get(camera_privacy_state).post(camera_privacy),
         )
         .route("/api/motion/hero", get(motion_hero))
+        .route("/api/notifications", get(notifications))
+        .route("/api/snaps/{id}", get(snap))
         .route("/api/events", get(events_socket))
         .route("/go2rtc/{*rest}", any(proxy))
         .fallback(spa)
@@ -325,23 +335,43 @@ async fn motion_hero(State(state): State<AppState>) -> Json<Value> {
 
 /// Every broker event, as it happens, for the home to follow.
 async fn events_socket(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| pump_events(socket, state.events.subscribe()))
+    upgrade.on_upgrade(move |socket| {
+        pump_events(
+            socket,
+            state.events.subscribe(),
+            state.notifications.subscribe(),
+        )
+    })
 }
 
-async fn pump_events(socket: WebSocket, mut events: tokio::sync::broadcast::Receiver<UnitEvent>) {
+async fn pump_events(
+    socket: WebSocket,
+    mut events: tokio::sync::broadcast::Receiver<UnitEvent>,
+    mut told: tokio::sync::broadcast::Receiver<Notification>,
+) {
     let mut socket = socket;
     loop {
-        let frame = match events.recv().await {
-            Ok(UnitEvent::Motion { device_id }) => {
-                json!({ "type": "motion", "device_id": device_id })
-            }
-            Ok(UnitEvent::Liveness { device_id, online }) => {
-                json!({ "type": "liveness", "device_id": device_id, "online": online })
-            }
-            // A viewer that fell behind misses events rather than the
-            // connection.
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        let frame = tokio::select! {
+            event = events.recv() => match event {
+                Ok(UnitEvent::Motion { device_id, image }) => {
+                    json!({ "type": "motion", "device_id": device_id, "image": image })
+                }
+                Ok(UnitEvent::Liveness { device_id, online }) => {
+                    json!({ "type": "liveness", "device_id": device_id, "online": online })
+                }
+                Ok(UnitEvent::Aqi { device_id, value }) => {
+                    json!({ "type": "aqi", "device_id": device_id, "value": value })
+                }
+                // A viewer that fell behind misses events rather than the
+                // connection.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            notification = told.recv() => match notification {
+                Ok(notification) => json!({ "type": "notification", "notification": notification }),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
         };
         if socket
             .send(Message::Text(frame.to_string().into()))
@@ -351,6 +381,27 @@ async fn pump_events(socket: WebSocket, mut events: tokio::sync::broadcast::Rece
             return;
         }
     }
+}
+
+/// What the house has told, newest first.
+async fn notifications(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "notifications": state.notifications.list() }))
+}
+
+/// A notification's still. The id is ours, so anything not shaped like one
+/// is a 404 before the filesystem hears about it.
+async fn snap(State(state): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+    let safe = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !safe {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
+    }
+    let Some(bytes) = state.snapshots.read(&id).await else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "not found"));
+    };
+    Ok(([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response())
 }
 
 #[derive(Deserialize)]

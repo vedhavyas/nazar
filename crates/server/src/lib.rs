@@ -10,4 +10,5 @@ pub mod go2rtc;
 pub mod http;
 pub mod motion;
 pub mod mqtt;
+pub mod notify;
 pub mod supervisor;

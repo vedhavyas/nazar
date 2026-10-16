@@ -22,6 +22,7 @@ use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
 use server::motion::{Hysteresis, MotionOrder};
 use server::mqtt::UnitEvent;
+use server::notify::{NotificationStore, Snapshots};
 use server::supervisor::{Pacing, Supervisor};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
@@ -127,6 +128,11 @@ async fn harness() -> Harness {
             go2rtc_api: go2rtc.base.to_string(),
             events: events.clone(),
             motion,
+            notifications: Arc::new(NotificationStore::open(
+                data_dir.join("notifications.json"),
+                Duration::from_secs(30),
+            )),
+            snapshots: Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps")),
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
@@ -180,6 +186,7 @@ async fn the_hero_is_the_camera_that_moved() {
 
     h.events.publish(UnitEvent::Motion {
         device_id: GATE.to_owned(),
+        image: None,
     });
 
     let mut hero = None;
@@ -227,6 +234,7 @@ async fn the_hero_follows_motion_after_a_burst_past_the_bus() {
     for device in ["not-a-camera", "d0000000-0000-4000-8000-000000000003"] {
         h.events.publish(UnitEvent::Motion {
             device_id: device.to_owned(),
+            image: None,
         });
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -246,6 +254,7 @@ async fn the_hero_follows_motion_after_a_burst_past_the_bus() {
 
     h.events.publish(UnitEvent::Motion {
         device_id: GATE.to_owned(),
+        image: None,
     });
 
     let mut hero = None;
@@ -283,6 +292,7 @@ async fn a_motion_published_before_the_follower_is_polled_is_not_lost() {
     // so a subscription taken up inside that task would miss it.
     h.events.publish(UnitEvent::Motion {
         device_id: HALL.to_owned(),
+        image: None,
     });
 
     let heard = common::eventually(|| async {
@@ -469,6 +479,7 @@ async fn the_event_socket_carries_the_house() {
 
     h.events.publish(UnitEvent::Motion {
         device_id: HALL.to_owned(),
+        image: None,
     });
     h.events.publish(UnitEvent::Liveness {
         device_id: GATE.to_owned(),
@@ -490,7 +501,7 @@ async fn the_event_socket_carries_the_house() {
     assert_eq!(
         seen,
         vec![
-            json!({ "type": "motion", "device_id": HALL }),
+            json!({ "type": "motion", "device_id": HALL, "image": null }),
             json!({ "type": "liveness", "device_id": GATE, "online": false }),
         ],
         "the socket carries every event as it happens"
