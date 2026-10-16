@@ -85,6 +85,8 @@ pub enum P2pError {
     Broker(String),
     #[error("the broker event loop ended")]
     BrokerClosed,
+    #[error("no media within {0:?} - the session is silent")]
+    MediaSilence(Duration),
     #[error("talkback has not started")]
     NotTalking,
     #[error("io error: {0}")]
@@ -138,6 +140,11 @@ pub struct P2pConfig {
     pub answer_timeout: Duration,
     /// Bound on the UDP handshake.
     pub handshake_timeout: Duration,
+    /// Bound on media silence: an armed session that delivers no media
+    /// within this of arming - or stalls this long mid-session - is dead,
+    /// so the pass behind it falls back to the cloud path instead of
+    /// pinning a viewer to a silent source.
+    pub media_timeout: Duration,
     /// The media AES mode (unproven in the captures; CTR continued by
     /// default).
     pub aes_mode: media::AesMode,
@@ -166,6 +173,7 @@ impl Default for P2pConfig {
             host_ip: None,
             answer_timeout: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(10),
+            media_timeout: Duration::from_secs(15),
             aes_mode: media::AesMode::CtrCont,
             quality: signaling::StreamQuality::High,
             broker_host: BROKER_HOST.to_owned(),
@@ -311,6 +319,8 @@ impl P2pEngine {
                 quality: self.config.quality,
             },
             talk: None,
+            media_timeout: self.config.media_timeout,
+            last_media: std::time::Instant::now(),
         })
     }
 
@@ -826,6 +836,10 @@ pub struct ArmedSession {
     talk_context: ptt::TalkContext,
     /// The running talk burst, one per session.
     talk: Option<ptt::Talk>,
+    /// The media-silence bound, and when media last arrived (arming counts
+    /// as arrival time zero).
+    media_timeout: Duration,
+    last_media: std::time::Instant,
 }
 
 impl ArmedSession {
@@ -845,7 +859,11 @@ impl ArmedSession {
     }
 
     /// The next decrypted media packet. `Ok(None)` means the socket was idle
-    /// for the read window - a liveness tick, not an end.
+    /// for the read window - a liveness tick, not an end - unless no media
+    /// has arrived within `media_timeout` of arming or the last packet, in
+    /// which case the session is silent: `Err(MediaSilence)`, so the
+    /// caller's pipeline falls back instead of pinning a viewer to a dead
+    /// source.
     ///
     /// The accounting is the reference's receive loop exactly: control
     /// packets (small and cookie-tagged) are answered or skipped without
@@ -857,7 +875,12 @@ impl ArmedSession {
         loop {
             let received = tokio::time::timeout(MEDIA_IDLE, self.socket.recv_from(&mut buf)).await;
             let (len, from) = match received {
-                Err(_elapsed) => return Ok(None),
+                Err(_elapsed) => {
+                    if self.last_media.elapsed() >= self.media_timeout {
+                        return Err(P2pError::MediaSilence(self.media_timeout));
+                    }
+                    return Ok(None);
+                }
                 Ok(Err(err)) => return Err(P2pError::Io(err)),
                 Ok(Ok(pair)) => pair,
             };
@@ -887,6 +910,7 @@ impl ArmedSession {
             let mut packet = data.to_vec();
             self.decryptor.decrypt(&mut packet[header_len..]);
             let header = media::parse_header(&packet, header_len);
+            self.last_media = std::time::Instant::now();
             return Ok(Some(MediaPacket {
                 packet,
                 header_len,
@@ -1181,6 +1205,8 @@ mod tests {
                 quality: signaling::StreamQuality::High,
             },
             talk: None,
+            media_timeout: Duration::from_secs(60),
+            last_media: std::time::Instant::now(),
         };
         drop(session);
         // The teardown publishes first and stops the pump only after its
@@ -1218,6 +1244,7 @@ mod tests {
         key: &str,
         iv: &str,
         client: QuboClient,
+        media_timeout: Duration,
     ) -> (ArmedSession, SocketAddr, UdpSocket) {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1251,6 +1278,8 @@ mod tests {
                 quality: signaling::StreamQuality::High,
             },
             talk: None,
+            media_timeout,
+            last_media: std::time::Instant::now(),
         };
         (session, target, sender)
     }
@@ -1333,7 +1362,8 @@ mod tests {
 
         // A control probe between the two captured packets must not
         // advance the keystream.
-        let (mut session, target, sender) = media_session(key, iv, idle_client()).await;
+        let (mut session, target, sender) =
+            media_session(key, iv, idle_client(), Duration::from_secs(60)).await;
         sender.send_to(&p1, target).await.expect("send p1");
         sender
             .send_to(&media_probe(), target)
@@ -1355,7 +1385,8 @@ mod tests {
 
         // A non-control datagram with a valid header length does advance
         // it, exactly as the reference's loop would.
-        let (mut session, target, sender) = media_session(key, iv, idle_client()).await;
+        let (mut session, target, sender) =
+            media_session(key, iv, idle_client(), Duration::from_secs(60)).await;
         let garbage = vec![0x40_u8; 20];
         sender.send_to(&p1, target).await.expect("send p1");
         sender
@@ -1416,6 +1447,7 @@ mod tests {
             "82458EA37F4740361F47B4E68946546F",
             "A3B6C1B75EEB65ACF59802CE5A6995B3",
             client,
+            Duration::from_secs(60),
         )
         .await;
         let mut buf = [0_u8; 4096];
@@ -1475,6 +1507,63 @@ mod tests {
             matches!(session.push_audio(&[0xBB]).await, Err(P2pError::NotTalking)),
             "audio after the stop is refused, never swallowed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_silent_session_ends_at_the_media_bound() {
+        // Armed but never delivers media: the session reports silence, so
+        // the pipeline behind it falls back to the cloud path rather than
+        // pinning a viewer to a dead source.
+        let (mut session, _target, _sender) = media_session(
+            "82458EA37F4740361F47B4E68946546F",
+            "A3B6C1B75EEB65ACF59802CE5A6995B3",
+            idle_client(),
+            Duration::from_millis(200),
+        )
+        .await;
+        let outcome = session.recv_media().await;
+        assert!(
+            matches!(outcome, Err(P2pError::MediaSilence(_))),
+            "a session that never delivered media reports silence, got {outcome:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn arriving_media_resets_the_silence_clock() {
+        let (mut session, target, sender) = media_session(
+            "82458EA37F4740361F47B4E68946546F",
+            "A3B6C1B75EEB65ACF59802CE5A6995B3",
+            idle_client(),
+            Duration::from_millis(600),
+        )
+        .await;
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = sender
+                .send_to(
+                    &[0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
+                    target,
+                )
+                .await;
+            sender
+        });
+
+        let first = session
+            .recv_media()
+            .await
+            .expect("arrives inside the bound");
+        assert!(first.is_some(), "a packet inside the bound is not silence");
+        let idle = session.recv_media().await.expect("still inside the bound");
+        assert!(
+            idle.is_none(),
+            "an idle tick inside the bound is not silence"
+        );
+        let outcome = session.recv_media().await;
+        assert!(
+            matches!(outcome, Err(P2pError::MediaSilence(_))),
+            "past the bound the session is silent again, got {outcome:?}",
+        );
+        drop(feeder);
     }
 
     #[test]
