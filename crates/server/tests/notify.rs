@@ -110,14 +110,20 @@ fn the_exact_window_edge_is_a_new_episode() {
     let store = store_in(&dir);
     let start = Instant::now();
 
-    assert!(store.push(&motion("hall"), start).is_some(), "the first sighting is told");
+    assert!(
+        store.push(&motion("hall"), start).is_some(),
+        "the first sighting is told"
+    );
     assert!(
         store.push(&motion("hall"), start + COALESCE).is_some(),
         "at exactly the window edge the episode is over"
     );
     assert!(
         store
-            .push(&motion("hall"), start + COALESCE + COALESCE - Duration::from_millis(1))
+            .push(
+                &motion("hall"),
+                start + COALESCE + COALESCE.saturating_sub(Duration::from_millis(1))
+            )
             .is_none(),
         "and a sighting just inside the next window is that episode"
     );
@@ -131,7 +137,10 @@ fn a_coalesced_sighting_does_not_rewrite_the_log() {
     let path = dir.join("notifications.json");
     let start = Instant::now();
 
-    assert!(store.push(&motion("hall"), start).is_some(), "the episode is told");
+    assert!(
+        store.push(&motion("hall"), start).is_some(),
+        "the episode is told"
+    );
     let before = std::fs::read_to_string(&path).expect("the log was written");
 
     // Long enough for the clock to tick, so a save would change the bytes.
@@ -538,13 +547,15 @@ async fn the_bell_rings_before_the_still_is_resolved() {
         .and(path(format!(
             "/stream-manager/api/v1/sp/{SP}/stream/unit/{UNIT}/device/{CAMERA}"
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            json!({
-                "streamURL": "rtsps://wowza2.platform.quboworld.com:443/x/cam?token=t",
-                "sessionId": "s1",
-            })
-            .to_string(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "streamURL": "rtsps://wowza2.platform.quboworld.com:443/x/cam?token=t",
+                    "sessionId": "s1",
+                })
+                .to_string(),
+            ),
+        )
         .mount(&h.qubo)
         .await;
     let browser = client();
