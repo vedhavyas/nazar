@@ -583,6 +583,59 @@ async fn the_proxy_only_reaches_the_ws_path() {
 }
 
 #[tokio::test]
+async fn the_proxy_admits_playback_streams_for_known_cameras_only() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    let client = client();
+
+    // Fill the device list, so the admissions below are about the source
+    // and not about an empty list.
+    let listed = client
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+
+    // A known camera's playback stream is one this server minted: admitted
+    // like the live ones.
+    let admitted = client
+        .get(format!(
+            "{}/go2rtc/api/stream.m3u8?src=vod-{DEVICE_ID}",
+            h.base
+        ))
+        .send()
+        .await
+        .expect("the playback stream");
+    assert_eq!(
+        admitted.status(),
+        reqwest::StatusCode::OK,
+        "a known camera's playback stream is proxied"
+    );
+
+    // Anything else under the vod- prefix is not: an unknown camera, an
+    // empty one, or a quality suffix smuggled past the live guard.
+    for source in [
+        "vod-00000000-0000-0000-0000-000000000000",
+        "vod-",
+        "vod--",
+        "vod-3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01-high",
+    ] {
+        let refused = client
+            .get(format!("{}/go2rtc/api/stream.m3u8?src={source}", h.base))
+            .send()
+            .await
+            .expect("bad src");
+        assert_eq!(
+            refused.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "src={source} is refused"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn the_proxy_serves_the_hls_fallback() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;
