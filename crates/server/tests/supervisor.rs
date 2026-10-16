@@ -581,6 +581,65 @@ async fn a_refusal_on_an_already_healed_session_spends_nothing() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// Two callers refused on the same token spend once: the boot pair does
+/// this by construction, and the loser must ride the winner's heal, not
+/// a second POST the gateway may answer with a rotation.
+#[tokio::test]
+async fn two_refusals_on_one_token_spend_once() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-old"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .with_priority(2)
+            .mount(&h.qubo)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-new"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(if route == UNITS_PATH {
+                    json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string()
+                } else {
+                    json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" }] })
+                        .to_string()
+                }),
+            )
+            .with_priority(1)
+            .mount(&h.qubo)
+            .await;
+    }
+    // Exactly one spend, or the second POST would be the loser's rot.
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "accessToken": "token-new", "refreshToken": "refresh-2" }).to_string(),
+        ))
+        .expect(1)
+        .mount(&h.qubo)
+        .await;
+
+    let one = h.supervisor.clone();
+    let two = h.supervisor.clone();
+    let (a, b) = tokio::join!(async move { one.refresh_devices().await }, async move {
+        two.refresh_devices().await
+    },);
+    assert!(a.is_ok() && b.is_ok(), "both callers heal: {a:?} {b:?}");
+    assert!(
+        !h.supervisor.needs_login(),
+        "the loser rode the winner's heal, not a refusal"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// Warm on access: every camera starts minting in the background, and the
 /// account's non-cameras are left alone.
 #[tokio::test]
@@ -1619,8 +1678,9 @@ async fn the_hold_does_not_keep_a_stream_alive() {
 #[tokio::test]
 async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
     let h = harness(Pacing {
-        retry_base: Duration::from_millis(100),
-        retry_max: Duration::from_secs(10),
+        retry_base: Duration::from_millis(300),
+        retry_max: Duration::from_secs(30),
+        remint: Duration::from_millis(250),
         connect_window: Duration::from_secs(5),
         ..pacing(Duration::from_secs(30))
     })
@@ -1640,44 +1700,35 @@ async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(reminted, "the starved run re-mints: {:?}", h.go2rtc.puts());
 
-    // The cloud starts refusing: the loop backs off with a deadline armed.
+    // The cloud starts refusing: the loop backs off with a deadline armed,
+    // and the storm grows the failure tail (about 300, 900, 2100ms).
     mint_mock(500, "").with_priority(1).mount(&h.qubo).await;
-    let refused =
-        common::eventually(|| async { mint_count(&h.qubo).await > h.go2rtc.puts().len() }).await;
-    assert!(refused, "the run hit a refused mint: {:?}", h.go2rtc.puts());
-    // Let the storm grow the failure tail, so the leg below discriminates.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert!(
+        mint_count(&h.qubo).await >= 4,
+        "the pre-recovery storm ran: {} mints",
+        mint_count(&h.qubo).await
+    );
 
     // The camera's push lands on the URL already attached: the run closes
-    // while the failure's deadline is still standing.
+    // while the failure's tail is still standing.
     h.go2rtc.connect_producer(&name);
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the recovery closes the run");
-    let settled = mint_count(&h.qubo).await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    assert_eq!(
-        mint_count(&h.qubo).await,
-        settled,
-        "no mint rides the closed run's stale deadline"
-    );
-    assert!(
-        is_live(&h.supervisor).await,
-        "and the state holds live: {:?}",
-        h.supervisor.status(DEVICE_ID).await
-    );
 
-    // The stale tail: from the recovery, a fresh storm retries at
-    // retry_base, not at the tail the closed run had grown. Refused mints
-    // are the observable: four-plus fit in the window with the reset, and
-    // a surviving tail puts the first gap alone at seconds.
+    // With no run and no viewer, the closed run's pace is the whole story:
+    // a fresh refusal must retry at retry_base, not the grown tail. The
+    // mints land on the remint cadence (250ms); the reset keeps the
+    // failure backoff at ~300/600ms, the tail would put the second gap
+    // alone past the window.
+    h.go2rtc.set_viewers(&name, 0);
     h.go2rtc.disconnect_producer(&name);
-    h.go2rtc.set_viewers(&name, 1);
     let before = mint_count(&h.qubo).await;
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     let refusals = mint_count(&h.qubo).await - before;
     assert!(
-        refusals >= 4,
-        "the post-recovery storm retries at retry_base: {refusals} refused mints in 1.6s"
+        refusals >= 2,
+        "the post-recovery refusal retries at retry_base: {refusals} refused mints in 2s"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

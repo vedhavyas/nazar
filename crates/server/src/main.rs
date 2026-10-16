@@ -69,13 +69,15 @@ async fn main() -> anyhow::Result<()> {
     // A session that cannot be read is not fatal: the UI can serve login.
     match sessions.load() {
         Ok(Some(_)) => {
-            if let Err(err) = supervisor.refresh_devices().await {
-                tracing::warn!(%err, "device discovery at boot failed");
-            }
             // Warm on access: a stored session means the house is wanted,
             // so the first discovery that lands starts every camera - even
             // if the boot's own discovery fails and a later poll's lands.
+            // Armed BEFORE this boot's discovery, or its own landing could
+            // never trigger the warm.
             supervisor.warm_on_discovery();
+            if let Err(err) = supervisor.refresh_devices().await {
+                tracing::warn!(%err, "device discovery at boot failed");
+            }
         }
         Ok(None) => {}
         Err(err) => {

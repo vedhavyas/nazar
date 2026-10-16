@@ -173,6 +173,11 @@ async fn a_vod_go2rtc_did_not_take_is_an_error() {
             .contains("did not take"),
         "the refusal names the reason: {body}"
     );
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![format!("vod-{CAMERA}")],
+        "the untaken source is cleaned up behind the refusal"
+    );
 }
 
 #[tokio::test]

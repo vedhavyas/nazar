@@ -297,6 +297,10 @@ pub struct Supervisor {
     warm_wanted: Arc<AtomicBool>,
     /// Whether `warm_all` has run for that wish.
     warmed: Arc<AtomicBool>,
+    /// Serializes refresh spends: the boot pair races here by
+    /// construction, and two spenders of the same pair get a refusal the
+    /// loser must not read as the session's end.
+    refresh_spend: Arc<tokio::sync::Mutex<()>>,
     /// The leases this server currently runs, by stream: a viewer count
     /// subtracts only the leases that actually attached. Keyed by name
     /// with per-lease identity, so a parked loop's late drop can never
@@ -343,6 +347,7 @@ impl Supervisor {
             holds: Arc::new(Mutex::new(HashMap::new())),
             warm_wanted: Arc::new(AtomicBool::new(false)),
             warmed: Arc::new(AtomicBool::new(false)),
+            refresh_spend: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -517,21 +522,28 @@ impl Supervisor {
         })?;
         match call(session.clone()).await {
             Err(qubo::QuboError::Auth { .. }) if session.refresh_token.is_some() => {
-                // Single flight: the boot pair and the feed race here by
-                // construction (both refuse on the same expired token),
-                // and a second spend of the same pair is a refusal the
-                // gateway may well answer with a rotation - leaving the
-                // login flag raised on a session that was just healed. A
-                // store that no longer holds the refused token is that
-                // heal; retrying with it skips the spend.
-                if let Some(current) = self.sessions.load()?
-                    && current.access_token != session.access_token
-                {
-                    return call(current).await;
-                }
-                let refreshed = qubo::auth::refresh_session(&self.qubo, &session).await?;
-                self.sessions.save(&refreshed)?;
-                call(refreshed).await
+                // The spend is serialized: the boot pair and the feed race
+                // here by construction (both refuse on the same expired
+                // token), and a second spend of the same pair is a refusal
+                // the gateway may answer with a rotation - leaving the
+                // login flag raised on a session that was just healed.
+                // The loser, inside the lock, finds the winner's heal in
+                // the store (a token no longer the refused one) and
+                // retries with it instead of spending.
+                let healed = {
+                    let _turn = self.refresh_spend.lock().await;
+                    let stored = self.sessions.load()?;
+                    match stored {
+                        Some(current) if current.access_token != session.access_token => current,
+                        _ => {
+                            let refreshed =
+                                qubo::auth::refresh_session(&self.qubo, &session).await?;
+                            self.sessions.save(&refreshed)?;
+                            refreshed
+                        }
+                    }
+                };
+                call(healed).await
             }
             other => other,
         }

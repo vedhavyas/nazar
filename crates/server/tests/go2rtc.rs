@@ -373,25 +373,49 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
     assert!(fallen, "and reads unattached once the child is gone");
 
     drop(lease);
-    let mut gone = false;
+
+    // The drop-kill property needs a child that is ALIVE when the lease
+    // drops: the manual kill above already proved the flag falls, so this
+    // runs on a second, fresh lease with its own child.
+    let second = hold.hold("hall-high");
+    let mut next = String::new();
     for _ in 0..300 {
-        let status = std::process::Command::new("kill")
-            .args(["-0", &pid])
-            .status()
-            .expect("kill runs");
-        // A zombie is a killed child awaiting reaping: gone for our purpose.
-        let state = std::process::Command::new("ps")
-            .args(["-o", "state=", "-p", &pid])
-            .output()
-            .expect("ps runs");
-        if !status.success() || String::from_utf8_lossy(&state.stdout).contains('Z') {
-            gone = true;
+        if let Ok(text) = std::fs::read_to_string(&pid_path)
+            && !text.is_empty()
+            && text != pid
+        {
+            next = text;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(gone, "releasing the lease kills the hold's child");
+    assert!(!next.is_empty(), "the fresh lease spawned its own child");
+    drop(second);
+    assert!(
+        gone_within(&next, 300).await,
+        "releasing the lease kills the hold's child"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether `pid` is gone within `tries` polls of 20ms: dead, or a zombie
+/// awaiting reaping.
+async fn gone_within(pid: &str, tries: usize) -> bool {
+    for _ in 0..tries {
+        let status = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .expect("kill runs");
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", pid])
+            .output()
+            .expect("ps runs");
+        if !status.success() || String::from_utf8_lossy(&state.stdout).contains('Z') {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
 }
 
 /// A hold whose child dies comes back: the camera's blip must not leave
@@ -400,9 +424,11 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
 async fn the_ffmpeg_hold_restarts_after_the_child_dies() {
     let dir = temp_dir();
     let bin = dir.join("dead-ffmpeg.sh");
+    // A young life, short of the attach grace but long against the poll:
+    // a child that exits in milliseconds would hide a wrongly-set flag.
     std::fs::write(
         &bin,
-        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nexit 0\n",
+        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nsleep 0.4\nexit 0\n",
     )
     .expect("the stand-in writes");
     #[cfg(unix)]
