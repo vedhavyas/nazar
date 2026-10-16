@@ -63,6 +63,17 @@
     attempt += 1;
   }
 
+  /** The tab came back and the picture did not follow: a long absence can
+   * outlive the stream itself, so ask the server again - the player has
+   * already rebuilt itself, and the retry is the person looking at it. */
+  async function recover() {
+    try {
+      await api.watch(id, quality, true);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   async function setQuality(next: Quality) {
     if (next === quality) return;
     quality = next;
@@ -194,7 +205,14 @@
   <PtzDrag onstep={step}>
     <div class="screen-stage" bind:this={stage}>
       {#if stream}
-        <Player {stream} {attempt} muted={!listening} />
+        <Player
+          {stream}
+          {attempt}
+          muted={!listening}
+          onsettled={(state) => {
+            if (state === 'recovered') void recover();
+          }}
+        />
       {/if}
     </div>
   </PtzDrag>

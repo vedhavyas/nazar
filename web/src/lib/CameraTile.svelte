@@ -81,6 +81,11 @@
           if (state === 'hls' || state === 'recovered') {
             fallingBack = state === 'hls';
             stalled = null;
+            // The local rebuild is the fast step; the server is asked too,
+            // because a long absence can outlive the stream itself (an idle
+            // one is retired) and the rebuilt player would reconnect to
+            // nothing.
+            if (state === 'recovered') onwatch(camera.id);
             return;
           }
           fallingBack = false;

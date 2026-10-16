@@ -358,7 +358,7 @@ test('a picture that did not follow us back is started again', async () => {
   ).toBe(1);
   expect(
     onwatch,
-    'the same stream is asked for again, so the server need not be troubled',
-  ).not.toHaveBeenCalled();
+    'and the server is asked for the stream again: a long absence can outlive it',
+  ).toHaveBeenCalledWith('cam-1');
   expect(screen.queryByText(/stopped/), 'the recovery is not framed as a failure').toBeNull();
 });

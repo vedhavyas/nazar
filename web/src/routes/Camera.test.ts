@@ -33,24 +33,23 @@ function json(body: unknown): Response {
 
 /** The server as this screen uses it: cameras, a stream, a lens state. */
 function stubServer(privacy: boolean | null = false) {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async (url: string, init?: RequestInit) => {
-      if (url === '/api/cameras') {
-        return json({
-          cameras: [{ id: 'cam-1', name: 'Hall', state: 'live', reason: null }],
-          needsLogin: false,
-        });
-      }
-      if (url.startsWith('/api/cameras/cam-1/live')) {
-        return json({ stream: 'cam-1-high' });
-      }
-      if (url === '/api/cameras/cam-1/privacy' && init?.method !== 'POST') {
-        return json({ privacy });
-      }
-      return json({});
-    }),
-  );
+  const mock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/cameras') {
+      return json({
+        cameras: [{ id: 'cam-1', name: 'Hall', state: 'live', reason: null }],
+        needsLogin: false,
+      });
+    }
+    if (url.startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    if (url === '/api/cameras/cam-1/privacy' && init?.method !== 'POST') {
+      return json({ privacy });
+    }
+    return json({});
+  });
+  vi.stubGlobal('fetch', mock);
+  return mock;
 }
 
 function open() {
@@ -159,4 +158,40 @@ test('a lens nobody reports reads as neither on nor off', async () => {
   open();
 
   expect(await screen.findByRole('button', { name: 'Privacy' })).toBeTruthy();
+});
+
+/** Hide or show the page, as a browser tab switch does. */
+function setHidden(hidden: boolean) {
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => (hidden ? 'hidden' : 'visible'),
+  });
+  document.dispatchEvent(new Event('visibilitychange'));
+}
+
+test('a tab that comes back asks the server for the stream again', async () => {
+  const fetchMock = stubServer();
+  open();
+
+  await vi.waitFor(() => expect(document.querySelector('video-rtc video')).toBeTruthy());
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement;
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 4;
+
+  // Away, and the peer drops while we are not looking: the clock is where
+  // it was on return. A hidden camera may outlive its server stream, so
+  // the re-ask must reach the server, not just rebuild the player.
+  setHidden(true);
+  setHidden(false);
+
+  await vi.waitFor(() => {
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).includes('/api/cameras/cam-1/live?quality=high&retry=true'),
+      ),
+      'the stream is asked for again',
+    ).toBe(true);
+  });
+  expect(document.querySelectorAll('video-rtc').length, 'one player, still').toBe(1);
 });
