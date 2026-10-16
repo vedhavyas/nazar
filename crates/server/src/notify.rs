@@ -427,7 +427,11 @@ pub fn start(
                     let attached = match url {
                         Some(url) => {
                             store.attach(&notification.id, url);
-                            store.get(&notification.id).unwrap_or(notification)
+                            let attached = store.get(&notification.id).unwrap_or(notification);
+                            // The telling above went out without the still;
+                            // a screen already open merges this frame by id.
+                            store.announce(&attached);
+                            attached
                         }
                         None => notification,
                     };
