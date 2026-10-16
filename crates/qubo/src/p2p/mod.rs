@@ -526,8 +526,9 @@ impl Drop for TeardownGuard {
             let _ = client
                 .publish(&control_topic, QoS::ExactlyOnce, false, payload)
                 .await;
-            // A beat for the publish to reach the wire, then close.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The reference's own beat between publishing the teardown and
+            // closing the connection.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             pump.abort();
         });
     }
@@ -731,7 +732,7 @@ impl ArmedSession {
                 .client
                 .publish(&self.control_topic, QoS::ExactlyOnce, false, payload)
                 .await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         self.broker.pump.abort();
     }
