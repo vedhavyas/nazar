@@ -154,6 +154,16 @@ fn classify_reads_the_captured_handshake_frames() {
         ),
         "an RTP datagram classifies as media"
     );
+
+    // The relay's session teardown (grammar from the capture, 6.1; no
+    // teardown frame was in a captured window).
+    let mut bye = vec![0x20, 0x03, 0x00, 0x04];
+    bye.extend_from_slice(&[0x24, 0x4A, 0x21, 0x12]);
+    bye.extend_from_slice(b"qWruqY1E1055");
+    assert!(
+        matches!(relay::classify(&bye), Packet::Bye),
+        "the relay's 2003 teardown classifies as a bye"
+    );
 }
 
 #[test]
@@ -215,6 +225,19 @@ fn txid_is_eight_alnum_plus_a_monotonic_counter() {
         counter(&second),
         counter(&first) + 1,
         "the counter is monotonic across generations"
+    );
+
+    // A fresh random prefix per generation: a constant prefix must not
+    // survive (an 8-character collision across two draws is ~1 in 2e14).
+    let mut prefixes = std::collections::BTreeSet::new();
+    let mut names = NameGen::new();
+    for _ in 0..2 {
+        prefixes.insert(names.generate().as_str()[..8].to_owned());
+    }
+    assert_eq!(
+        prefixes.len(),
+        2,
+        "the prefix is freshly generated per txid"
     );
 }
 
