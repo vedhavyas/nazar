@@ -1624,6 +1624,82 @@ mod tests {
         );
     }
 
+    /// A session that only records when its shutdown ran.
+    struct RecordingSession {
+        ended: Arc<AtomicBool>,
+    }
+
+    impl LaneSession for RecordingSession {
+        fn source_for(&self, _name: &str) -> Result<String, String> {
+            Ok("ffmpeg:/tmp/x.sdp#input=nazar".to_owned())
+        }
+
+        fn control(&self, _envelope: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn alive(&self) -> bool {
+            true
+        }
+
+        fn shutdown(&self) {
+            self.ended.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_streams_teardown_ends_the_cameras_session() {
+        let supervisor = quiet_supervisor();
+        let ended = Arc::new(AtomicBool::new(false));
+        supervisor.armed.write().await.insert(
+            "cam".to_owned(),
+            Arc::new(RecordingSession {
+                ended: Arc::clone(&ended),
+            }),
+        );
+        let name = stream_name("cam", Quality::Low);
+        supervisor.state.write().await.insert(
+            name.clone(),
+            Tracked {
+                state: StreamState::Live {
+                    since: Instant::now(),
+                },
+                wake: Arc::new(Notify::new()),
+                last_request: Instant::now(),
+            },
+        );
+
+        supervisor.teardown(&name).await;
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the camera's last stream going ends its fast-lane session"
+        );
+
+        // With another stream left, the session stays.
+        let ended = Arc::new(AtomicBool::new(false));
+        supervisor.armed.write().await.insert(
+            "cam".to_owned(),
+            Arc::new(RecordingSession {
+                ended: Arc::clone(&ended),
+            }),
+        );
+        supervisor.state.write().await.insert(
+            stream_name("cam", Quality::High),
+            Tracked {
+                state: StreamState::Live {
+                    since: Instant::now(),
+                },
+                wake: Arc::new(Notify::new()),
+                last_request: Instant::now(),
+            },
+        );
+        supervisor.teardown(&name).await;
+        assert!(
+            !ended.load(Ordering::SeqCst),
+            "a camera with another stream keeps its session"
+        );
+    }
+
     #[tokio::test]
     async fn a_teardown_stands_down_for_a_request_that_landed_meanwhile() {
         let supervisor = quiet_supervisor();
