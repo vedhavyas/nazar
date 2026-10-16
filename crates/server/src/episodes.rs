@@ -58,7 +58,14 @@ impl EpisodeStore {
                     Ledger::default()
                 }
             },
-            Err(_) => Ledger::default(),
+            // A missing file is a fresh start; any other read error is a
+            // log that exists and would be overwritten by the next save.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "the episode log could not be read; keeping it aside and starting empty");
+                preserve(&path);
+                Ledger::default()
+            }
         };
         trim(&mut ledger, retention, now_ms());
         Self {
@@ -136,10 +143,18 @@ impl EpisodeStore {
     }
 }
 
-/// Move an unreadable log aside, `x.json` to `x.bak`, so the evidence in
-/// it survives the next save.
+/// Move an unreadable log aside, `x.json` to `x.<millis>.bak`, so the
+/// evidence survives the next save and a later corruption cannot overwrite
+/// it.
 pub(crate) fn preserve(path: &std::path::Path) {
-    let backup = path.with_extension("bak");
+    let stamp = now_ms();
+    let mut backup = path.with_extension(format!("{stamp}.bak"));
+    // Two preservations inside one millisecond must not share a name.
+    let mut n = 1u32;
+    while backup.exists() {
+        backup = path.with_extension(format!("{stamp}-{n}.bak"));
+        n += 1;
+    }
     if let Err(err) = std::fs::rename(path, &backup) {
         tracing::warn!(%err, path = %path.display(), "the unreadable log could not be set aside");
     }

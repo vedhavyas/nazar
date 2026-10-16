@@ -29,6 +29,24 @@ fn store_in(dir: &std::path::Path) -> EpisodeStore {
     EpisodeStore::open(dir.join("episodes.json"), COALESCE, KEEP_30_DAYS)
 }
 
+/// The preserved copies of `stem`'s log, under whatever names `preserve`
+/// gave them.
+fn backups(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("the scratch dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(&format!("{stem}.")) && name.ends_with(".bak")
+                })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -145,11 +163,75 @@ fn an_unreadable_log_is_kept_aside_not_overwritten() {
     let store = EpisodeStore::open(path.clone(), COALESCE, KEEP_30_DAYS);
     assert_eq!(store.list().len(), 0, "an unreadable log starts empty");
 
-    let backup = dir.join("episodes.bak");
+    let kept = backups(&dir, "episodes");
+    assert_eq!(kept.len(), 1, "the original is kept aside: {kept:?}");
     assert_eq!(
-        std::fs::read_to_string(&backup).expect("the original is kept aside"),
+        std::fs::read_to_string(&kept[0]).expect("the original is kept aside"),
         "{ not json at all",
         "the unreadable bytes survive: the next save must not erase whatever they were"
+    );
+
+    // And the store writes again, beside the kept original.
+    store.record("hall", now_ms(), None);
+    assert!(
+        path.exists(),
+        "the fresh log lands where the store expects it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_second_corruption_keeps_each_backup() {
+    let dir = temp_dir("episodes-twice-broken");
+    let path = dir.join("episodes.json");
+
+    std::fs::write(&path, "{ broken once").expect("a broken log");
+    let _ = EpisodeStore::open(path.clone(), COALESCE, KEEP_30_DAYS);
+    std::fs::write(&path, "{ broken twice").expect("a broken log again");
+    let _ = EpisodeStore::open(path.clone(), COALESCE, KEEP_30_DAYS);
+
+    let kept = backups(&dir, "episodes");
+    assert_eq!(
+        kept.len(),
+        2,
+        "each corruption keeps its own evidence: {kept:?}"
+    );
+    let mut contents: Vec<String> = kept
+        .iter()
+        .map(|backup| std::fs::read_to_string(backup).expect("the kept bytes"))
+        .collect();
+    contents.sort();
+    assert_eq!(
+        contents,
+        vec!["{ broken once", "{ broken twice"],
+        "both sets of bytes survive"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_log_that_cannot_be_read_is_kept_aside_too() {
+    let dir = temp_dir("episodes-unreadable");
+    let path = dir.join("episodes.json");
+    // A directory where the ledger should be: reading it fails, and the
+    // path is not missing - the next save would overwrite whatever is
+    // there.
+    std::fs::create_dir(&path).expect("a directory in the log's place");
+    std::fs::write(path.join("evidence.txt"), "what was here").expect("evidence inside");
+
+    let store = EpisodeStore::open(path.clone(), COALESCE, KEEP_30_DAYS);
+    assert_eq!(store.list().len(), 0, "an unreadable log starts empty");
+
+    let kept = backups(&dir, "episodes");
+    assert_eq!(
+        kept.len(),
+        1,
+        "the unreadable path is kept aside: {kept:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(kept[0].join("evidence.txt")).expect("the kept evidence"),
+        "what was here",
+        "with what was in it"
     );
 
     // And the store writes again, beside the kept original.

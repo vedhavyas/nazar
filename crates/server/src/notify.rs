@@ -169,7 +169,14 @@ impl NotificationStore {
                     Ledger::default()
                 }
             },
-            Err(_) => Ledger::default(),
+            // A missing file is a fresh start; any other read error is a
+            // log that exists and would be overwritten by the next save.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "the notification log could not be read; keeping it aside and starting empty");
+                crate::episodes::preserve(&path);
+                Ledger::default()
+            }
         };
         let (tx, _) = broadcast::channel(ANNOUNCE_CAPACITY);
         Self {
