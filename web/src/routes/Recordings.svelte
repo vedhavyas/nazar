@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
 
   import { ApiError, api, type Camera, type Clip } from '../lib/api';
   import ClipPlayer, { clockOf, dayStartMs } from '../lib/ClipPlayer.svelte';
@@ -11,7 +11,9 @@
   }: { id: string; onback: () => void; onlocked: () => void } = $props();
 
   let cameras = $state<Camera[]>([]);
-  let camera = $state(id);
+  /** Seeded from the camera that was opened, then the tabs' own; untrack
+   * says the seed is deliberate, not a missed dependency. */
+  let camera = $state(untrack(() => id));
   let error = $state('');
   let days = $state<string[]>([]);
   let day = $state<string | null>(null);
