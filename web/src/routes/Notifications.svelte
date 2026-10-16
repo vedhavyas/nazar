@@ -22,7 +22,15 @@
     aqi: 'Air',
   };
 
-  const now = Date.now();
+  /** The list's relative times tick: a "just now" that never advances is
+   * a lie after an hour on the wall. */
+  let now = $state(Date.now());
+  $effect(() => {
+    const timer = setInterval(() => {
+      now = Date.now();
+    }, 30_000);
+    return () => clearInterval(timer);
+  });
 </script>
 
 {#snippet told(entry: Notification)}
