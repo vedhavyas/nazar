@@ -246,6 +246,7 @@ impl P2pEngine {
             session_id,
             camera: device.device_id.clone(),
             src_device_id: identity.src_device_id.clone(),
+            disarmed: false,
         })
     }
 
@@ -527,26 +528,41 @@ impl Drop for TeardownGuard {
         if !self.armed {
             return;
         }
-        let client = self.client.clone();
-        let pump = self.pump.clone();
-        let control_topic = std::mem::take(&mut self.control_topic);
-        let payload = std::mem::take(&mut self.payload);
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            // No runtime to flush the teardown on (shutdown): stopping the
-            // pump is all that is left.
-            pump.abort();
-            return;
-        };
-        runtime.spawn(async move {
-            let _ = client
-                .publish(&control_topic, QoS::ExactlyOnce, false, payload)
-                .await;
-            // The reference's own beat between publishing the teardown and
-            // closing the connection.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            pump.abort();
-        });
+        spawn_teardown(
+            &self.client,
+            &std::mem::take(&mut self.control_topic),
+            std::mem::take(&mut self.payload),
+            self.pump.clone(),
+        );
     }
+}
+
+/// Publish one `endP2pCall` and then stop the pump - the teardown every
+/// dropped piece of a session runs (the arm guard, or an armed session let
+/// go without `disarm`). The publish is async, so it rides the current
+/// runtime; with no runtime to flush on (shutdown), stopping the pump is
+/// all that is left.
+fn spawn_teardown(
+    client: &rumqttc::AsyncClient,
+    control_topic: &str,
+    payload: Vec<u8>,
+    pump: tokio::task::AbortHandle,
+) {
+    let client = client.clone();
+    let control_topic = control_topic.to_owned();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        pump.abort();
+        return;
+    };
+    runtime.spawn(async move {
+        let _ = client
+            .publish(&control_topic, QoS::ExactlyOnce, false, payload)
+            .await;
+        // The reference's own beat between publishing the teardown and
+        // closing the connection.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        pump.abort();
+    });
 }
 
 fn broker_options(session: &Session, unit: &str, device_name: &str) -> rumqttc::MqttOptions {
@@ -673,6 +689,9 @@ pub struct ArmedSession {
     session_id: String,
     camera: String,
     src_device_id: String,
+    /// Whether `disarm` ended the call; a drop that finds this false ends
+    /// it, so abandoning a session never leaves the camera in a call.
+    disarmed: bool,
 }
 
 impl ArmedSession {
@@ -739,7 +758,7 @@ impl ArmedSession {
 
     /// Tear the call down: `endP2pCall` on the control topic, a moment for
     /// the publish to flush, then close.
-    pub async fn disarm(self) {
+    pub async fn disarm(mut self) {
         let end = build_end_call(&self.camera, &self.src_device_id, &self.session_id);
         if let Ok(payload) = serde_json::to_vec(&end) {
             let _ = self
@@ -749,13 +768,29 @@ impl ArmedSession {
                 .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        self.disarmed = true;
         self.broker.pump.abort();
     }
 }
 
 impl Drop for ArmedSession {
     fn drop(&mut self) {
-        self.broker.pump.abort();
+        if self.disarmed {
+            self.broker.pump.abort();
+            return;
+        }
+        // Dropped without disarm: the call still ends, or the camera holds
+        // it until it expires.
+        let end = build_end_call(&self.camera, &self.src_device_id, &self.session_id);
+        match serde_json::to_vec(&end) {
+            Ok(payload) => spawn_teardown(
+                &self.broker.client,
+                &self.control_topic,
+                payload,
+                self.broker.pump.abort_handle(),
+            ),
+            Err(_) => self.broker.pump.abort(),
+        }
     }
 }
 
@@ -802,6 +837,9 @@ mod tests {
 
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     /// A broker that never connects: the pump stays pending, so only the
@@ -841,6 +879,82 @@ mod tests {
             "a disarmed guard never stops the pump"
         );
         broker.pump.abort();
+    }
+
+    /// A guard that records when the pump task it rides in is dropped or
+    /// aborted - the only way to observe a task's halting from outside.
+    struct Halted(Arc<AtomicBool>);
+
+    impl Drop for Halted {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A broker whose pump is observably halted when it ends.
+    fn stoppable_broker() -> (Broker, Arc<AtomicBool>) {
+        let (client, _eventloop) = rumqttc::AsyncClient::new(
+            rumqttc::MqttOptions::new("stop-test", "192.0.2.1", 1883),
+            BROKER_CAPACITY,
+        );
+        let halted = Arc::new(AtomicBool::new(false));
+        let guard = Halted(Arc::clone(&halted));
+        let pump = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (
+            Broker {
+                client,
+                pump,
+                answers: mpsc::channel(1).1,
+            },
+            halted,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dropped_armed_session_stops_its_pump() {
+        // Dropped without disarm: the teardown publishes endP2pCall, waits
+        // its beat, then stops the pump.
+        let (broker, halted) = stoppable_broker();
+        let session = ArmedSession {
+            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("a socket"),
+            peer: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1),
+            decryptor: MediaDecryptor::new(
+                media::AesMode::Plain,
+                "00000000000000000000000000000000",
+                "11111111111111111111111111111111",
+            )
+            .expect("a plain decryptor"),
+            names: relay::NameGen::new(),
+            broker,
+            control_topic: "/control/unit/cam/p2pStreaming".to_owned(),
+            session_id: "session".to_owned(),
+            camera: "cam".to_owned(),
+            src_device_id: "src".to_owned(),
+            disarmed: false,
+        };
+        drop(session);
+        // The teardown publishes first and stops the pump only after its
+        // beat; a bare abort would stop it immediately.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !halted.load(Ordering::SeqCst),
+            "the pump outlives the teardown's publish beat"
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            while !halted.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "a dropped session's teardown stops the pump"
+        );
     }
 
     #[test]
