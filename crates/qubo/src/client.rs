@@ -65,6 +65,9 @@ pub struct QuboClient {
     base: Url,
     sp: ServiceProvider,
     device_id: String,
+    /// Headers every request carries. The P2P signaling leg mirrors the
+    /// SDK's `Login-Device-Name` and `User-Agent` this way.
+    extra_headers: Vec<(String, String)>,
     /// The login session the OTP flow carries from request to verify.
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
     /// The profiles a login is waiting on a choice between: a number that
@@ -136,10 +139,20 @@ impl QuboClient {
             base,
             sp,
             device_id,
+            extra_headers: Vec::new(),
             pending_login: Arc::new(Mutex::new(None)),
             pending_profiles: Arc::new(Mutex::new(None)),
             pending_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Carry `headers` on every request; the SDK's stream client sends
+    /// `Login-Device-Name` besides the standard auth set, plus
+    /// `User-Agent: libcurl-agent` (protocol 5.2).
+    #[must_use]
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
     }
 
     pub(crate) fn set_pending_login(&self, uuid: &str, phone: &str) {
@@ -383,6 +396,9 @@ impl QuboClient {
             .header("Content-Type", "application/json");
         for (name, value) in headers {
             request = request.header(*name, *value);
+        }
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
         }
         request = match caller {
             Caller::Session(session) => request

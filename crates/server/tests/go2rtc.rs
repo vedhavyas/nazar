@@ -161,6 +161,7 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         p2p_self_device: "self-device".to_owned(),
         p2p_src_device_id: "src-device".to_owned(),
         p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
@@ -230,6 +231,7 @@ async fn no_webrtc_section_without_a_configured_candidate() {
         p2p_self_device: "self-device".to_owned(),
         p2p_src_device_id: "src-device".to_owned(),
         p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
     };
 
     let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");

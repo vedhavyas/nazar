@@ -41,8 +41,17 @@ async fn main() -> anyhow::Result<()> {
     let supervisor = if config.prefer_p2p.is_empty() {
         supervisor
     } else {
+        // The signaling leg speaks with the SDK's own identity headers
+        // (protocol 5.2); the server's other calls keep the plain set.
+        let lane_client = qubo.clone().with_headers(vec![
+            (
+                "Login-Device-Name".to_owned(),
+                config.p2p_login_device_name.clone(),
+            ),
+            ("User-Agent".to_owned(), "libcurl-agent".to_owned()),
+        ]);
         let lane = server::fast_lane::EngineLane::new(
-            qubo.clone(),
+            lane_client,
             sessions.clone(),
             qubo::p2p::P2pIdentity {
                 self_device: config.p2p_self_device.clone(),
