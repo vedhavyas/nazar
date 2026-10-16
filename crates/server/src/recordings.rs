@@ -112,6 +112,37 @@ mod tests {
     }
 
     #[test]
+    fn the_leap_rule_holds_at_the_centuries() {
+        // 2000 (divisible by 400) is a leap year; 1900 and 2100 (divisible
+        // by 100, not 400) are not - the arithmetic is `days_from_civil`'s,
+        // and nothing pinned it.
+        assert_eq!(
+            days_from_civil(2001, 1, 1) - days_from_civil(2000, 1, 1),
+            366,
+            "2000 is a leap year"
+        );
+        assert_eq!(
+            days_from_civil(1901, 1, 1) - days_from_civil(1900, 1, 1),
+            365,
+            "1900 is not"
+        );
+        assert_eq!(
+            days_from_civil(2101, 1, 1) - days_from_civil(2100, 1, 1),
+            365,
+            "2100 is not"
+        );
+
+        let (start, end) = ist_day_bounds("29-02-2028").expect("2028 has a 29 February");
+        assert_eq!(end - start, DAY_MS, "a leap day is a day");
+        assert_eq!(
+            ist_day_bounds("01-03-2028"),
+            Some((end, end + DAY_MS)),
+            "and the next day begins where it ends"
+        );
+        assert_eq!(ist_day_bounds("29-02-2100"), None, "2100 has no leap day");
+    }
+
+    #[test]
     fn a_string_that_is_not_a_day_is_not_a_day() {
         assert_eq!(ist_day_bounds("2026-10-16"), None, "the wire's own order");
         assert_eq!(ist_day_bounds("16/10/2026"), None);
