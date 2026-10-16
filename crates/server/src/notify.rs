@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::episodes::EpisodeStore;
 use crate::events::EventBus;
 use crate::go2rtc::Go2rtc;
 use crate::mqtt::UnitEvent;
@@ -138,7 +139,7 @@ impl Inner {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -321,10 +322,12 @@ impl Snapshots {
     }
 }
 
-/// Follow the house's events into the bell.
+/// Follow the house's events into the bell, and motion into the recording
+/// timeline.
 pub fn start(
     events: &EventBus,
     store: Arc<NotificationStore>,
+    episodes: Arc<EpisodeStore>,
     snapshots: Snapshots,
 ) -> tokio::task::JoinHandle<()> {
     // Subscribed here, not inside the task: a broadcast channel only
@@ -351,6 +354,15 @@ pub fn start(
                         store.attach(&notification.id, url);
                     }
                     let final_shape = store.get(&notification.id).unwrap_or(notification);
+                    // The timeline keeps its own, longer memory of motion -
+                    // the bell's ring is a screen's worth, not a day's.
+                    if matches!(final_shape.kind, Kind::Motion) {
+                        episodes.record(
+                            &final_shape.device_id,
+                            final_shape.at,
+                            final_shape.snapshot_url.clone(),
+                        );
+                    }
                     store.announce(&final_shape);
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {

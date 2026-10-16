@@ -4,10 +4,14 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use qubo::ServiceProvider;
 
 use crate::notify::AQI_ALERT_AT;
+
+/// How many days of motion episodes the timeline keeps by default.
+const EPISODE_RETENTION_DAYS: u32 = 30;
 
 /// Everything the server needs from its environment.
 #[derive(Debug, Clone)]
@@ -25,12 +29,15 @@ pub struct Config {
     pub webrtc_candidates: Option<String>,
     /// The PM2.5 reading worth a notification.
     pub aqi_alert_at: u32,
+    /// How many days of motion episodes the recording timeline keeps.
+    pub episodes_retention_days: u32,
 }
 
 impl Config {
     /// Read the environment: `DATA_DIR` (default `/data`), `GO2RTC_BIN`
     /// and `FFMPEG_BIN` (default to PATH lookups), `QUBO_SP`,
-    /// `NAZAR_WEBRTC_CANDIDATES`, `NAZAR_AQI_ALERT_AT`.
+    /// `NAZAR_WEBRTC_CANDIDATES`, `NAZAR_AQI_ALERT_AT`,
+    /// `NAZAR_EPISODE_RETENTION_DAYS`.
     pub fn from_env() -> Self {
         Self {
             data_dir: var("DATA_DIR").unwrap_or_else(|| "/data".to_owned()).into(),
@@ -52,7 +59,24 @@ impl Config {
                     AQI_ALERT_AT
                 })
             }),
+            episodes_retention_days: var("NAZAR_EPISODE_RETENTION_DAYS").map_or(
+                EPISODE_RETENTION_DAYS,
+                |raw| {
+                    raw.parse().unwrap_or_else(|_| {
+                        tracing::warn!(
+                            value = %raw,
+                            "NAZAR_EPISODE_RETENTION_DAYS is not a number; keeping the default"
+                        );
+                        EPISODE_RETENTION_DAYS
+                    })
+                },
+            ),
         }
+    }
+
+    /// The timeline's retention as a duration.
+    pub fn episodes_retention(&self) -> Duration {
+        Duration::from_secs(u64::from(self.episodes_retention_days) * 86_400)
     }
 
     /// The account's `Source-Device-Id`: created once under the data dir

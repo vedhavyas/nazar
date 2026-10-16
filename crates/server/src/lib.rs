@@ -5,6 +5,7 @@
 // package's binary needs deps its library does not (the tracing
 // subscriber, anyhow).
 pub mod config;
+pub mod episodes;
 pub mod events;
 pub mod go2rtc;
 pub mod http;

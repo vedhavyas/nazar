@@ -83,6 +83,7 @@ async fn harness() -> Harness {
                 data_dir.join("notifications.json"),
                 Duration::from_secs(30),
             )),
+            episodes: common::episodes_in(&data_dir),
             snapshots: Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps")),
         },
     );

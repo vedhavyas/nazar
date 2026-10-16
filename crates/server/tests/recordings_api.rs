@@ -16,6 +16,7 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{QuboClient, SessionStore};
+use server::episodes::EpisodeStore;
 use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, Wiring, app};
@@ -48,27 +49,27 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A store already holding the given ledger, as a restart would find it.
-fn store_with(entries: &Value) -> Arc<NotificationStore> {
+/// A store already holding the given episodes, as a restart would find it.
+fn episodes_with(entries: &Value) -> Arc<EpisodeStore> {
     let dir = temp_dir("recordings-store");
-    let path = dir.join("notifications.json");
-    let ledger = json!({ "entries": entries, "sequence": 9 });
+    let path = dir.join("episodes.json");
+    let ledger = json!({ "episodes": entries, "sequence": 9 });
     std::fs::write(&path, ledger.to_string()).expect("the ledger writes");
-    Arc::new(NotificationStore::open(path, COALESCE))
+    Arc::new(EpisodeStore::open(
+        path,
+        COALESCE,
+        Duration::from_hours(30 * 24),
+    ))
 }
 
-fn entry(id: &str, device: &str, at: i64, kind: &str, snapshot: Option<&str>) -> Value {
-    let mut value = json!({
+/// One episode of the house's motion memory.
+fn entry(id: &str, device: &str, start_ms: i64, snapshot: Option<&str>) -> Value {
+    json!({
         "id": id,
         "device_id": device,
-        "at": at,
+        "start_ms": start_ms,
         "snapshot_url": snapshot,
-        "kind": kind,
-    });
-    if kind == "aqi" {
-        value["value"] = json!(70);
-    }
-    value
+    })
 }
 
 struct Harness {
@@ -76,7 +77,7 @@ struct Harness {
     qubo: MockServer,
 }
 
-async fn harness(store: Arc<NotificationStore>) -> Harness {
+async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = temp_dir("recordings-harness");
@@ -112,7 +113,11 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             go2rtc_api: go2rtc.base.to_string(),
             events,
             motion: Arc::new(Mutex::new(MotionOrder::new())),
-            notifications: store,
+            notifications: Arc::new(NotificationStore::open(
+                data_dir.join("notifications.json"),
+                COALESCE,
+            )),
+            episodes,
             snapshots,
         },
     );
@@ -149,7 +154,7 @@ fn client() -> reqwest::Client {
 
 #[tokio::test]
 async fn the_days_come_from_the_calendar() {
-    let h = harness(store_with(&json!([]))).await;
+    let h = harness(episodes_with(&json!([]))).await;
     mount_discovery(&h.qubo).await;
     // The timezone is part of the ask: without it the day is not the
     // household's day.
@@ -185,22 +190,15 @@ async fn the_days_come_from_the_calendar() {
 
 #[tokio::test]
 async fn the_clips_are_the_houses_own_motions_for_that_day() {
-    let h = harness(store_with(&json!([
-        entry(
-            "m1",
-            CAMERA,
-            DAY_START + 7_200_000,
-            "motion",
-            Some("/api/snaps/m1")
-        ),
-        entry("m2", CAMERA, DAY_END - 60_000, "motion", None),
-        entry("m3", CAMERA, DAY_START - 60_000, "motion", None),
-        entry("m4", OTHER, DAY_START + 3_600_000, "motion", None),
-        entry("m5", CAMERA, DAY_START + 3_600_000, "offline", None),
+    let h = harness(episodes_with(&json!([
+        entry("m1", CAMERA, DAY_START + 7_200_000, Some("/api/snaps/m1")),
+        entry("m2", CAMERA, DAY_END - 60_000, None),
+        entry("m3", CAMERA, DAY_START - 60_000, None),
+        entry("m4", OTHER, DAY_START + 3_600_000, None),
         // The two exact instants: midnight itself belongs to the day, the
         // next midnight does not.
-        entry("m6", CAMERA, DAY_START, "motion", None),
-        entry("m7", CAMERA, DAY_END, "motion", None),
+        entry("m6", CAMERA, DAY_START, None),
+        entry("m7", CAMERA, DAY_END, None),
     ])))
     .await;
     mount_discovery(&h.qubo).await;
@@ -225,13 +223,13 @@ async fn the_clips_are_the_houses_own_motions_for_that_day() {
             { "id": "m6", "start_ms": DAY_START, "snapshot_url": null },
         ]),
         "the day's own motions, newest first: not the neighbours' day, \
-         another camera's, or the coming and going of the camera itself"
+         and not another camera's"
     );
 }
 
 #[tokio::test]
 async fn a_day_that_is_not_a_day_is_refused() {
-    let h = harness(store_with(&json!([]))).await;
+    let h = harness(episodes_with(&json!([]))).await;
     mount_discovery(&h.qubo).await;
 
     let bad = client()
