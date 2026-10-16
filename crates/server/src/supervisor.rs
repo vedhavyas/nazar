@@ -344,12 +344,13 @@ impl Supervisor {
                     .min(idle.saturating_sub(idle_for)),
                 None => next_mint.saturating_duration_since(now).min(idle),
             };
-            tokio::select! {
-                () = tokio::time::sleep(sleep_for) => {}
+            let forced = tokio::select! {
+                () = tokio::time::sleep(sleep_for) => false,
                 () = wake.notified() => {
                     tracing::info!(stream = %name, "remint forced by a retry");
+                    true
                 }
-            }
+            };
             // The decision is made on what is true now, not on what was
             // true before the wait: a stream that reached its idle window
             // during the wait must not mint once more on its way out.
@@ -364,6 +365,14 @@ impl Supervisor {
                 && self.teardown_if_idle(&name, seen_at).await
             {
                 return;
+            }
+            // An early wake - the idle window, not the re-mint cadence - is
+            // only a re-check: the mint waits for its own cadence, or for a
+            // person's retry, while a retired tile is dropped on its own
+            // window rather than on the mint's.
+            if !forced && Instant::now() < next_mint {
+                self.reconcile_low(&name).await;
+                continue;
             }
             next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {

@@ -307,6 +307,32 @@ async fn an_idle_tile_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_watched_stream_waits_out_the_remint_cadence() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    h.go2rtc.set_viewers(&format!("{DEVICE_ID}-high"), 1);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream wakes");
+    // Several idle windows pass, all of them watched: the early wake is
+    // only a re-check of the watch, not a mint.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        1,
+        "a watched stream is re-checked on the idle window but minted on the re-mint cadence"
+    );
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "and it is never retired while watched: {:?}",
+        h.go2rtc.deletes()
+    );
+}
+
+#[tokio::test]
 async fn an_idle_stream_does_not_mint_once_more_before_dying() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
