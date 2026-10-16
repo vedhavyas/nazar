@@ -1,6 +1,7 @@
 //! The HTTP client for the Qubo REST gateway.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ pub use reqwest::Url;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::auth::{AccountProfile, select_profile};
 use crate::error::{QuboError, error_for_status};
 use crate::session::Session;
 
@@ -65,6 +67,12 @@ pub struct QuboClient {
     device_id: String,
     /// The login session the OTP flow carries from request to verify.
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
+    /// The profiles a login is waiting on a choice between: a number that
+    /// maps to several accounts.
+    pending_profiles: Arc<Mutex<Option<PendingProfiles>>>,
+    /// Stamps every pending set so a claim or release from an older set
+    /// can never touch a newer one.
+    pending_generation: Arc<AtomicU64>,
 }
 
 /// The gateway's login session and the number it was issued for; verify
@@ -73,6 +81,45 @@ pub struct QuboClient {
 pub(crate) struct PendingLogin {
     pub(crate) uuid: String,
     pub(crate) phone: String,
+}
+
+/// Who a request speaks as: a stored session's authenticated headers, or
+/// the login family's bare `Source` value with no Authorization.
+enum Caller<'a> {
+    Session(&'a Session),
+    Source(&'a str),
+}
+
+/// The profiles a login is waiting on a choice between, and whether a
+/// pick has already claimed the slot to mint it.
+#[derive(Debug, Clone)]
+struct PendingProfiles {
+    generation: u64,
+    profiles: Vec<AccountProfile>,
+    claimed: bool,
+}
+
+/// The claimed pick, holding its slot while the mint runs. Dropping it
+/// releases the slot for a retry - which also covers a request the server
+/// abandoned mid-mint - and never touches a newer picker's claim.
+#[derive(Debug)]
+pub struct PickedProfile {
+    client: QuboClient,
+    profile: AccountProfile,
+    generation: u64,
+}
+
+impl PickedProfile {
+    /// The account this pick chose.
+    pub fn profile(&self) -> &AccountProfile {
+        &self.profile
+    }
+}
+
+impl Drop for PickedProfile {
+    fn drop(&mut self) {
+        self.client.release_pending_profiles(self.generation);
+    }
 }
 
 impl QuboClient {
@@ -90,6 +137,8 @@ impl QuboClient {
             sp,
             device_id,
             pending_login: Arc::new(Mutex::new(None)),
+            pending_profiles: Arc::new(Mutex::new(None)),
+            pending_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -114,6 +163,65 @@ impl QuboClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Keep the profiles a login is waiting on a choice between. Each set
+    /// carries a fresh generation: a claim or release from an older set
+    /// must never touch this one.
+    pub fn set_pending_profiles(&self, profiles: Vec<AccountProfile>) {
+        let generation = self.pending_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.lock_pending_profiles() = Some(PendingProfiles {
+            generation,
+            profiles,
+            claimed: false,
+        });
+    }
+
+    /// Claim the pick for `uuid`: the first select takes the slot while
+    /// its mint runs, so a racing second one is refused. The claim rides
+    /// the returned guard, which releases the slot on every exit.
+    pub fn claim_pending_profile(&self, uuid: &str) -> Result<PickedProfile, QuboError> {
+        let mut pending = self.lock_pending_profiles();
+        let state = pending.as_mut().ok_or(QuboError::Auth {
+            code: None,
+            message: "no login is waiting for a profile choice".to_owned(),
+        })?;
+        if state.claimed {
+            return Err(QuboError::Auth {
+                code: None,
+                message: "a pick for this login is already in flight; wait or request a new code"
+                    .to_owned(),
+            });
+        }
+        let profile = select_profile(&state.profiles, uuid)?;
+        state.claimed = true;
+        Ok(PickedProfile {
+            client: self.clone(),
+            profile,
+            generation: state.generation,
+        })
+    }
+
+    /// The choice was made or abandoned; nothing is pending any more.
+    pub fn clear_pending_profiles(&self) {
+        *self.lock_pending_profiles() = None;
+    }
+
+    /// Nothing was persisted: release the claim `generation` took, if the
+    /// slot still holds it.
+    fn release_pending_profiles(&self, generation: u64) {
+        let mut pending = self.lock_pending_profiles();
+        if let Some(state) = pending.as_mut()
+            && state.generation == generation
+        {
+            state.claimed = false;
+        }
+    }
+
+    fn lock_pending_profiles(&self) -> std::sync::MutexGuard<'_, Option<PendingProfiles>> {
+        self.pending_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The `Source-Device-Id` this client sends. Persist it across
     /// restarts to keep the account's logged-in device list stable.
     pub fn device_id(&self) -> &str {
@@ -128,7 +236,15 @@ impl QuboClient {
     /// GET `path`, relative to the gateway, authenticated when a session
     /// is given.
     pub async fn get_json(&self, path: &str, auth: Option<&Session>) -> Result<Value, QuboError> {
-        self.send(Method::GET, path, &[], None, auth, "USER").await
+        self.send(
+            Method::GET,
+            path,
+            &[],
+            &[],
+            None,
+            auth.map_or(Caller::Source("USER"), Caller::Session),
+        )
+        .await
     }
 
     /// POST a JSON `body` to `path`, authenticated when a session is
@@ -139,8 +255,15 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, &[], Some(body), auth, "USER")
-            .await
+        self.send(
+            Method::POST,
+            path,
+            &[],
+            &[],
+            Some(body),
+            auth.map_or(Caller::Source("USER"), Caller::Session),
+        )
+        .await
     }
 
     /// GET `path` with query parameters, authenticated when a session is
@@ -151,8 +274,15 @@ impl QuboClient {
         query: &[(&str, &str)],
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::GET, path, query, None, auth, "USER")
-            .await
+        self.send(
+            Method::GET,
+            path,
+            query,
+            &[],
+            None,
+            auth.map_or(Caller::Source("USER"), Caller::Session),
+        )
+        .await
     }
 
     /// POST a JSON `body` to `path` with query parameters, authenticated
@@ -164,21 +294,36 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, query, Some(body), auth, "USER")
-            .await
+        self.send(
+            Method::POST,
+            path,
+            query,
+            &[],
+            Some(body),
+            auth.map_or(Caller::Source("USER"), Caller::Session),
+        )
+        .await
     }
 
-    /// POST a JSON `body` to `path` with query parameters, no Authorization
-    /// header, and `Source: ANDROID` - the exact shape the app's own login
-    /// calls carry (docs/qubo-google-login.md §3).
+    /// POST a JSON `body` to `path` with query parameters and `headers`
+    /// added verbatim, no Authorization header, and `Source: ANDROID` -
+    /// the shape the app's own login-family calls carry.
     pub async fn post_login_json(
         &self,
         path: &str,
         query: &[(&str, &str)],
+        headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, query, Some(body), None, "ANDROID")
-            .await
+        self.send(
+            Method::POST,
+            path,
+            query,
+            headers,
+            Some(body),
+            Caller::Source("ANDROID"),
+        )
+        .await
     }
 
     /// PUT a JSON `body` and ignore the body it answers with. Device
@@ -189,9 +334,16 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<(), QuboError> {
-        self.send_raw(Method::PUT, path, &[], Some(body), auth, "USER")
-            .await
-            .map(drop)
+        self.send_raw(
+            Method::PUT,
+            path,
+            &[],
+            &[],
+            Some(body),
+            auth.map_or(Caller::Source("USER"), Caller::Session),
+        )
+        .await
+        .map(drop)
     }
 
     async fn send(
@@ -199,12 +351,12 @@ impl QuboClient {
         method: Method,
         path: &str,
         query: &[(&str, &str)],
+        headers: &[(&str, &str)],
         body: Option<&Value>,
-        auth: Option<&Session>,
-        source: &str,
+        caller: Caller<'_>,
     ) -> Result<Value, QuboError> {
         let text = self
-            .send_raw(method, path, query, body, auth, source)
+            .send_raw(method, path, query, headers, body, caller)
             .await?;
         if text.trim().is_empty() {
             return Ok(Value::Object(serde_json::Map::new()));
@@ -217,9 +369,9 @@ impl QuboClient {
         method: Method,
         path: &str,
         query: &[(&str, &str)],
+        headers: &[(&str, &str)],
         body: Option<&Value>,
-        auth: Option<&Session>,
-        source: &str,
+        caller: Caller<'_>,
     ) -> Result<String, QuboError> {
         let url = self.url_for(path, query)?;
         let mut request = self
@@ -229,14 +381,17 @@ impl QuboClient {
             .header("App-Id", APP_ID)
             .header("Source-Device-Id", &self.device_id)
             .header("Content-Type", "application/json");
-        request = match auth {
-            Some(session) => request
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request = match caller {
+            Caller::Session(session) => request
                 .header("Authorization", format!("Bearer {}", session.access_token))
                 .header("Subscriber-Key", &session.access_token)
                 .header("User-UUID", &session.uuid)
                 .header("Token-Type", "USER")
                 .header("Source", "Android"),
-            None => request.header("Source", source),
+            Caller::Source(source) => request.header("Source", source),
         };
         if let Some(body) = body {
             request = request.json(body);

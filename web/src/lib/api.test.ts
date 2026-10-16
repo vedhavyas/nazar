@@ -66,6 +66,17 @@ test('every call sends the documented shape', async () => {
   );
 });
 
+test('picking a profile posts its uuid to the select route', async () => {
+  const fetchMock = stubFetch(204, '');
+
+  await api.selectProfile('u-2');
+
+  const [path, init] = fetchMock.mock.calls[0];
+  expect(path, 'the route').toBe('/api/login/select');
+  expect(init?.method, 'the method').toBe('POST');
+  expect(init?.body, 'the body').toBe(JSON.stringify({ uuid: 'u-2' }));
+});
+
 test('watching a camera calls its live route', async () => {
   const fetchMock = stubFetch(200, JSON.stringify({ stream: 'cam-1' }));
 

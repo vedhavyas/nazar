@@ -1,0 +1,15 @@
+[
+  {
+    "accessToken": "eyJhbGciOiJIUzI1NiJ9.synthetic.access.token",
+    "refreshToken": null,
+    "uuid": "10000000-0000-4000-8000-000000000001",
+    "name": "Vedhavyas",
+    "email": "vedhavyas@example.com"
+  },
+  {
+    "accessToken": "eyJhbGciOiJIUzI1NiJ9.synthetic.second.token",
+    "uuid": "10000000-0000-4000-8000-000000000003",
+    "name": "Vedhavyas (work)",
+    "email": "work@example.com"
+  }
+]

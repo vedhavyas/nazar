@@ -1,10 +1,11 @@
 //! The stream supervisor: one mint-and-swap loop per live camera.
 //!
-//! Qubo access tokens last about an hour; a stored 180-day refresh token
-//! heals them, spent once per refused call wherever a refusal is visible -
-//! a mint, a discovery, the feed's re-resolve. With no refresh left, a
-//! refusal routes the UI to login. A live stream is re-minted on a cadence
-//! and the session is re-read from the store on every mint. The cloud
+//! Stream sessions last about five minutes, so a live stream is re-minted
+//! on a cadence and the account session is re-read from the store on every
+//! mint. Qubo access tokens last about an hour; a stored 180-day refresh
+//! token heals them, spent once per refused call wherever a refusal is
+//! visible - a mint, a discovery, the feed's re-resolve. With no refresh
+//! left, a refusal routes the UI to login. The cloud
 //! keeps one stream per camera (mints are last-mint-wins), so only the
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.

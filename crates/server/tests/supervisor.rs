@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use qubo::{Quality, QuboClient, Session, SessionStore};
+use qubo::{BASE_URL, Quality, QuboClient, ServiceProvider, Session, SessionStore};
 use server::go2rtc::Go2rtc;
 use server::supervisor::{Pacing, StreamState, Supervisor, stream_name, vod_name};
 
@@ -1883,4 +1883,43 @@ async fn a_never_attaching_hold_does_not_mask_a_starved_viewer() {
         h.go2rtc.puts()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The house against the real gateway from a stored session: the session
+/// file loads, discovery accepts it, and the account's devices come back.
+/// Ignored by default; run deliberately with `QUBO_E2E_SESSION` pointing
+/// at a real session file (the lead's e2e one).
+#[tokio::test]
+#[ignore = "live: reads the real account; run with QUBO_E2E_SESSION set"]
+async fn live_discovery_reads_the_stored_session() {
+    let path = std::env::var("QUBO_E2E_SESSION").expect("set QUBO_E2E_SESSION to a session file");
+    let go2rtc = common::FakeApi::start().await;
+    let client = QuboClient::new(
+        BASE_URL.parse().expect("the gateway URL parses"),
+        ServiceProvider::default(),
+    );
+    let supervisor = Supervisor::new(
+        client,
+        SessionStore::new(path),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+        pacing(Duration::from_secs(30)),
+    );
+
+    let devices = supervisor
+        .refresh_devices()
+        .await
+        .expect("the minted session is accepted");
+    assert!(
+        !supervisor.needs_login(),
+        "a fresh durable session does not ask for a login"
+    );
+    let cameras = devices.iter().filter(|device| device.is_camera()).count();
+    assert!(cameras > 0, "the house has cameras");
+    println!(
+        "live discovery: {} devices, {cameras} cameras",
+        devices.len()
+    );
+    for device in &devices {
+        println!("  {} ({})", device.name, device.device_id);
+    }
 }
