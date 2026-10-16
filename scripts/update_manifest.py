@@ -3,19 +3,21 @@
 
 Usage: update_manifest.py <repo-root> <version>
 
-The one file every installed desktop app reads: Tauri's static manifest,
-where a `platforms` entry carries the `.sig`'s content with its trailing
-newline trimmed, and the asset URL.
+The one file both halves read: the desktop updater (Tauri's static manifest
+- a `platforms` entry carries the `.sig`'s content with its trailing newline
+trimmed, and the asset URL) and the phone (a top-level `android` block).
 
 The trim is load-bearing: the plugin base64-decodes the manifest's value
 whole, so a trailing newline is an InvalidByte and every desktop install
 fails.
 
+The `android` block sits BESIDE `platforms` rather than inside it: every
+`platforms` entry must carry both `url` and `signature` or the whole file
+fails to parse, and the APK has no minisign signature.
+
 Every artifact is required to exist in the staged bundle directory - this
 runs at release time, where a manifest naming an asset that was never built
 is a release no client can update from.
-
-The Android block joins this file when that shell ships (M5).
 """
 
 import json
@@ -40,7 +42,8 @@ def main() -> None:
     bundle = root / "web/src-tauri/target/release/bundle"
     tarball = bundle / "macos/nazar.app.tar.gz"
     signature = bundle / "macos/nazar.app.tar.gz.sig"
-    for path in (tarball, signature):
+    apk = bundle / f"android/nazar-{version}-arm64.apk"
+    for path in (tarball, signature, apk):
         if not path.exists():
             fail(f"the manifest names {path.name}, but nothing staged it at {path}")
 
@@ -58,6 +61,9 @@ def main() -> None:
                 "signature": sig,
                 "url": f"{release}/nazar.app.tar.gz",
             }
+        },
+        "android": {
+            "url": f"{release}/nazar-{version}-arm64.apk",
         },
     }
 
