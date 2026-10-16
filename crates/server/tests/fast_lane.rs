@@ -614,6 +614,40 @@ async fn a_second_stream_reuses_the_camera_session() {
 }
 
 #[tokio::test]
+async fn a_refused_session_source_falls_back_and_ends_the_session() {
+    // source_for refused on a live session (a local reader failure, not a
+    // silent pump): the pass takes cloud, and the session is ended - not
+    // dropped from the map with its pump still running unreferenced.
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_millis(400),
+        Duration::from_secs(600),
+    )
+    .await;
+    h.lane.session().refuse_source();
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the cloud path served the pass");
+    assert!(
+        !h.lane.session().alive(),
+        "the refused session was ended, not left running unreferenced"
+    );
+    assert_eq!(h.lane.arms(), 1, "one arm, one cloud fallback");
+
+    // The next pass arms afresh: the session was retired, not leaked, and
+    // this failure does not bench the lane.
+    h.lane.session().allow_source();
+    let rearmed = common::eventually(|| async { h.lane.arms() == 2 }).await;
+    assert!(rearmed, "the next pass arms a fresh session");
+}
+
+#[tokio::test]
 async fn a_media_silent_session_benches_the_lane_and_the_pass_takes_the_cloud_path() {
     // The session died the way a media-silent one does - alive false while
     // its entry is still mapped - and the next pass must not re-arm into
