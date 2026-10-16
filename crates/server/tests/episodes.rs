@@ -73,6 +73,26 @@ fn a_burst_inside_the_window_is_one_marker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The two stores must agree on the edge: a sighting exactly one window
+/// after the last is a new episode in both.
+#[test]
+fn the_exact_window_edge_is_a_new_marker() {
+    let dir = temp_dir("episodes-edge");
+    let store = store_in(&dir);
+    let start = now_ms();
+
+    assert!(store.record("hall", start, None).is_some());
+    assert!(
+        store.record("hall", start + 30_000, None).is_some(),
+        "at exactly the window edge the episode is over"
+    );
+    assert!(
+        store.record("hall", start + 59_999, None).is_none(),
+        "and a sighting just inside the next window is that episode"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_episode_past_its_retention_is_forgotten() {
     let dir = temp_dir("episodes-retention");

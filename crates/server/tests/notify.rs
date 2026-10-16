@@ -105,6 +105,26 @@ fn a_motion_burst_is_one_notification() {
 }
 
 #[test]
+fn the_exact_window_edge_is_a_new_episode() {
+    let dir = temp_dir("notify-edge");
+    let store = store_in(&dir);
+    let start = Instant::now();
+
+    assert!(store.push(&motion("hall"), start).is_some(), "the first sighting is told");
+    assert!(
+        store.push(&motion("hall"), start + COALESCE).is_some(),
+        "at exactly the window edge the episode is over"
+    );
+    assert!(
+        store
+            .push(&motion("hall"), start + COALESCE + COALESCE - Duration::from_millis(1))
+            .is_none(),
+        "and a sighting just inside the next window is that episode"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn offline_and_online_are_each_told() {
     let dir = temp_dir("notify-liveness");
     let store = store_in(&dir);
