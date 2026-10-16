@@ -78,6 +78,8 @@ async fn harness(stream_idle: Duration) -> Harness {
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle,
+            connect_grace: Duration::from_millis(50),
+            connect_window: Duration::from_millis(300),
         },
     );
     let snapshots = Snapshots::new(

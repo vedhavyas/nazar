@@ -44,6 +44,8 @@ fn pacing(remint: Duration) -> Pacing {
         retry_max: Duration::from_millis(200),
         discovery_retry: Duration::from_millis(50),
         stream_idle: Duration::from_secs(30),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
     }
 }
 
@@ -312,6 +314,8 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         retry_max: Duration::from_secs(30),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -611,6 +615,152 @@ async fn a_refused_refresh_surfaces_needs_login() {
     assert_eq!(
         stored.access_token, "token-old",
         "a refused refresh does not clobber the stored session"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// Mount a mint ladder: each attempt answers a different URL, as a fresh
+/// mint does.
+async fn mount_mint_ladder(server: &MockServer, tokens: &[&str]) {
+    for (index, token) in tokens.iter().enumerate() {
+        mint_mock(200, &mint_body(token))
+            .up_to_n_times(1)
+            .with_priority(u8::try_from(index + 1).expect("a priority"))
+            .mount(server)
+            .await;
+    }
+}
+
+/// A go2rtc entry is not liveness: a producer whose source never connects
+/// is re-minted with a fresh URL, fast. The URL is one-shot, and waiting
+/// for the four-minute remint would leave a viewer staring at a dead
+/// stream the API calls live.
+#[tokio::test]
+async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
+    // A window far past the assertions: this test pins the re-minting, not
+    // the degradation.
+    let h = harness(Pacing {
+        connect_window: Duration::from_secs(5),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two", "three"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    h.go2rtc
+        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
+    assert!(reminted, "the loop keeps minting: {:?}", h.go2rtc.puts());
+
+    let urls: Vec<String> = h.go2rtc.puts().iter().map(|(_, src)| src.clone()).collect();
+    assert_ne!(urls[0], urls[1], "the second attempt carries a fresh URL");
+    assert_ne!(urls[1], urls[2], "and the third never reuses either");
+    assert_eq!(
+        h.supervisor.status(DEVICE_ID).await,
+        StreamState::Waking,
+        "an unconnected producer is not live"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The state stays waking while the producer is away, and flips live when
+/// it connects.
+#[tokio::test]
+async fn the_state_stays_waking_until_the_producer_connects() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(reminted, "the loop re-mints while unconnected");
+    assert_eq!(
+        h.supervisor.status(DEVICE_ID).await,
+        StreamState::Waking,
+        "not live while the producer is away"
+    );
+
+    h.go2rtc.connect_producer(&name);
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "a connected producer flips the state live");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// Every attempt after a failure carries its own URL: a consumed URL never
+/// works again, so reuse is a permanent outage.
+#[tokio::test]
+async fn no_attempt_reuses_a_previously_minted_url() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two", "three", "four", "five"]).await;
+    h.go2rtc
+        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 5 }).await;
+    assert!(reminted, "five attempts ran: {:?}", h.go2rtc.puts());
+
+    let urls: Vec<String> = h.go2rtc.puts().iter().map(|(_, src)| src.clone()).collect();
+    let mut unique = urls.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        urls.len(),
+        "no attempt reused a URL: {urls:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A producer that never connects degrades with the reason once the
+/// window passes - and the loop keeps trying rather than giving up.
+#[tokio::test]
+async fn a_producer_that_never_connects_degrades_after_the_window() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    h.go2rtc
+        .disconnect_producer(&stream_name(DEVICE_ID, Quality::High));
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    let degraded = common::eventually(|| async {
+        h.go2rtc.puts().len() >= 3
+            && matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason } if reason == "the producer has not connected"
+            )
+    })
+    .await;
+    assert!(
+        degraded,
+        "the window passes, the reason surfaces, and the loop keeps minting: {:?}",
+        h.go2rtc.puts()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

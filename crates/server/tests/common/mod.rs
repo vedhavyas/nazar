@@ -14,7 +14,7 @@ pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::Ep
     ))
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,6 +37,13 @@ pub struct FakeApi {
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
     producers: Arc<AtomicBool>,
+    /// Streams whose producer is held but not connected: the entry carries
+    /// a source and reads no `remote_addr`, as a go2rtc whose ffmpeg cannot
+    /// reach the camera. Empty means every held producer is connected.
+    unconnected: Arc<Mutex<HashSet<String>>>,
+    /// Streams whose producer has been started: go2rtc spawns one on the
+    /// first playlist request (a touch or a viewer).
+    touched: Arc<Mutex<HashSet<String>>>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
@@ -54,10 +61,12 @@ impl FakeApi {
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
         let producers = Arc::new(AtomicBool::new(true));
+        let unconnected = Arc::new(Mutex::new(HashSet::new()));
+        let touched = Arc::new(Mutex::new(HashSet::new()));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
         let ops = Arc::new(Mutex::new(Vec::new()));
-        let app = hls_routes().merge(streams_routes(
+        let app = hls_routes(&touched).merge(streams_routes(
             &puts,
             &deletes,
             &Knobs {
@@ -65,6 +74,8 @@ impl FakeApi {
                 streams_visible: &streams_visible,
                 streams_error: &streams_error,
                 producers: &producers,
+                unconnected: &unconnected,
+                touched: &touched,
                 delete_delay: &delete_delay,
                 ops: &ops,
             },
@@ -85,6 +96,8 @@ impl FakeApi {
             streams_visible,
             streams_error,
             producers,
+            unconnected,
+            touched,
             viewers,
             delete_delay,
             ops,
@@ -101,6 +114,18 @@ impl FakeApi {
     /// are configured but not running would.
     pub fn set_producers(&self, running: bool) {
         self.producers.store(running, Ordering::SeqCst);
+    }
+
+    /// The stream's producer holds its entry but never connects: what a
+    /// go2rtc whose ffmpeg the camera keeps turning away reads like.
+    pub fn disconnect_producer(&self, name: &str) {
+        self.unconnected.lock().unwrap().insert(name.to_owned());
+    }
+
+    /// The stream's producer connects, as one whose source finally
+    /// answered does.
+    pub fn connect_producer(&self, name: &str) {
+        self.unconnected.lock().unwrap().remove(name);
     }
 
     /// Make every DELETE take `delay` to answer, as a go2rtc under load
@@ -153,6 +178,8 @@ struct Knobs<'a> {
     streams_visible: &'a Arc<AtomicBool>,
     streams_error: &'a Arc<AtomicBool>,
     producers: &'a Arc<AtomicBool>,
+    unconnected: &'a Arc<Mutex<HashSet<String>>>,
+    touched: &'a Arc<Mutex<HashSet<String>>>,
     delete_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
 }
@@ -246,17 +273,36 @@ fn streams_methods(
                 }
             }
         });
-    let recorded = Arc::clone(puts);
-    let visible = Arc::clone(knobs.streams_visible);
-    let viewers = Arc::clone(viewers);
-    let error = Arc::clone(knobs.streams_error);
-    let running = Arc::clone(knobs.producers);
-    let list_streams = get(move || {
+    let list_streams = list_streams_handler(
+        Arc::clone(puts),
+        Arc::clone(knobs.streams_visible),
+        Arc::clone(viewers),
+        Arc::clone(knobs.streams_error),
+        Arc::clone(knobs.producers),
+        Arc::clone(knobs.unconnected),
+        Arc::clone(knobs.touched),
+    );
+    put_stream.delete(drop_stream).get(list_streams)
+}
+
+/// The `GET /api/streams` answer, as go2rtc 1.9.14 shapes it.
+fn list_streams_handler(
+    recorded: Arc<Mutex<Vec<(String, String)>>>,
+    visible: Arc<AtomicBool>,
+    viewers: Arc<Mutex<HashMap<String, usize>>>,
+    error: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    unconnected: Arc<Mutex<HashSet<String>>>,
+    touched: Arc<Mutex<HashSet<String>>>,
+) -> axum::routing::MethodRouter {
+    get(move || {
         let recorded = Arc::clone(&recorded);
         let visible = Arc::clone(&visible);
         let viewers = Arc::clone(&viewers);
         let error = Arc::clone(&error);
         let running = Arc::clone(&running);
+        let unconnected = Arc::clone(&unconnected);
+        let touched = Arc::clone(&touched);
         async move {
             // An unreadable status: what a go2rtc in trouble answers.
             if error.load(Ordering::SeqCst) {
@@ -270,8 +316,7 @@ fn streams_methods(
                 return "{}".to_owned();
             }
             let viewers = viewers.lock().unwrap().clone();
-            // go2rtc materializes a producer as soon as the source is
-            // set, which is what the fixture's unset case cannot show.
+            // go2rtc materializes a producer as soon as the source is set.
             let mut streams = serde_json::Map::new();
             for (name, source) in recorded {
                 let watching = viewers.get(&name).copied().unwrap_or(0);
@@ -282,11 +327,20 @@ fn streams_methods(
                         .collect::<Vec<_>>()
                 });
                 let held = running.load(Ordering::SeqCst);
+                // Connects once started AND the source answers; the
+                // deny-list is the camera turning the ffmpeg away.
+                let connected = touched.lock().unwrap().contains(&name)
+                    && !unconnected.lock().unwrap().contains(&name);
                 streams.insert(
                     name,
                     serde_json::json!({
                         "producers": if held {
-                            vec![serde_json::json!({ "url": source })]
+                            // Connected carries a peer address; waiting does not.
+                            let mut producer = serde_json::json!({ "url": source });
+                            if connected {
+                                producer["remote_addr"] = serde_json::json!("127.0.0.1:0");
+                            }
+                            vec![producer]
                         } else {
                             Vec::new()
                         },
@@ -296,23 +350,32 @@ fn streams_methods(
             }
             serde_json::Value::Object(streams).to_string()
         }
-    });
-    put_stream.delete(drop_stream).get(list_streams)
+    })
 }
 
 /// The HLS fallback's endpoints, as go2rtc 1.9.14 answers them.
-fn hls_routes() -> Router {
+fn hls_routes(touched: &Arc<Mutex<HashSet<String>>>) -> Router {
+    let touched = Arc::clone(touched);
     Router::new()
         .route(
             "/api/stream.m3u8",
-            get(|Query(params): Query<HashMap<String, String>>| async move {
-                // go2rtc's master playlist: the media playlist is a part.
-                match params.get("src") {
-                    Some(_) => (
-                        StatusCode::OK,
-                        "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
-                    ),
-                    None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let touched = Arc::clone(&touched);
+                async move {
+                    // go2rtc's master playlist: the media playlist is a
+                    // part - and the request is what spawns the stream's
+                    // producer (measured against go2rtc 1.9.14), so the
+                    // fake starts one here too.
+                    match params.get("src") {
+                        Some(src) => {
+                            touched.lock().unwrap().insert(src.clone());
+                            (
+                                StatusCode::OK,
+                                "#EXTM3U\napi/hls/playlist.m3u8?id=hls-1\n".to_owned(),
+                            )
+                        }
+                        None => (StatusCode::NOT_FOUND, "stream not found".to_owned()),
+                    }
                 }
             }),
         )

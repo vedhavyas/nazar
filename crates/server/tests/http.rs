@@ -73,6 +73,8 @@ async fn harness() -> Harness {
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
+            connect_grace: Duration::from_millis(50),
+            connect_window: Duration::from_millis(300),
         },
     );
     let state = AppState::new(

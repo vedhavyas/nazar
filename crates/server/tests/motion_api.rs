@@ -50,15 +50,20 @@ fn attach(go2rtc: &common::FakeApi) -> Go2rtc {
     Go2rtc::connect(go2rtc.base.clone()).expect("a client")
 }
 
-async fn harness() -> Harness {
-    let qubo = MockServer::start().await;
-    let go2rtc = common::FakeApi::start().await;
-    let data_dir = std::env::temp_dir().join(format!(
-        "nazar-motion-{}-{}",
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nazar-{name}-{}-{}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(&data_dir).expect("data dir");
+    std::fs::create_dir_all(&dir).expect("a scratch dir");
+    dir
+}
+
+async fn harness() -> Harness {
+    let qubo = MockServer::start().await;
+    let go2rtc = common::FakeApi::start().await;
+    let data_dir = temp_dir("motion");
     let sessions = SessionStore::new(data_dir.join("session.json"));
     sessions
         .save(&qubo::Session {
@@ -112,14 +117,15 @@ async fn harness() -> Harness {
         client.clone(),
         sessions.clone(),
         attach(&go2rtc),
-        // Long, so a re-mint inside a test's window is the wake's doing and
-        // never the loop's own backoff.
+        // Long: a re-mint inside a window is the wake's doing.
         Pacing {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
+            connect_grace: Duration::from_millis(50),
+            connect_window: Duration::from_millis(300),
         },
     );
     let events = EventBus::new();

@@ -42,6 +42,8 @@ fn pacing(stream_idle: Duration) -> Pacing {
         retry_max: Duration::from_secs(30),
         discovery_retry: Duration::from_secs(30),
         stream_idle,
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
     }
 }
 
@@ -321,6 +323,8 @@ async fn the_chain_is_re_asserted_after_a_mint() {
         retry_max: Duration::from_millis(50),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
     })
     .await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
@@ -429,6 +433,8 @@ async fn a_recovered_camera_starts_its_backoff_over() {
         retry_max: Duration::from_millis(400),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
     })
     .await;
     // Two refusals, then an answer: the loop has backed off to 200ms when

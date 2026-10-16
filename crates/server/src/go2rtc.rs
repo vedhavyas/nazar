@@ -48,10 +48,15 @@ const TEMPLATE_ARGS: &str = "-rtsp_transport tcp -fflags +genpts -i {input} -fps
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamStatus {
     pub name: String,
-    /// Whether go2rtc holds a producer for the stream. Per-producer
-    /// connection state is not exposed, so this is the strongest liveness
-    /// signal the API gives.
+    /// Whether go2rtc holds a producer for the stream. The entry appears as
+    /// soon as the source is set, so this alone cannot tell a connected
+    /// producer from one whose source is failing.
     pub live: bool,
+    /// Whether a producer has actually connected: the entry carries its
+    /// peer address once the source answers, and none while it is still
+    /// failing (measured on the hub 2026-10-16: a producer whose ffmpeg
+    /// the camera was refusing read no `remote_addr`).
+    pub connected: bool,
     /// How many viewers are attached. A watched stream is not idle,
     /// however long it has been since anyone asked this server for it.
     pub consumers: usize,
@@ -228,9 +233,39 @@ impl Go2rtc {
             .map(|(name, entry)| StreamStatus {
                 name,
                 live: !entry.producers.is_empty(),
+                connected: entry.producers.iter().any(|producer| {
+                    producer
+                        .get("remote_addr")
+                        .and_then(Value::as_str)
+                        .is_some_and(|addr| !addr.is_empty())
+                }),
                 consumers: entry.consumers.map_or(0, |consumers| consumers.len()),
             })
             .collect())
+    }
+
+    /// Ask go2rtc to start the stream's producer without a viewer: the HLS
+    /// master playlist request spawns it and registers no consumer
+    /// (measured against go2rtc 1.9.14). Without this the producer starts
+    /// only when the first viewer attaches - and that first attempt is
+    /// exactly the one that can die on a cold camera, with nothing left to
+    /// notice it.
+    pub async fn touch(&self, name: &str) -> Result<(), Go2rtcError> {
+        let response = self
+            .http
+            .get(self.api_for("/api/stream.m3u8")?)
+            .query(&[("src", name)])
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(Go2rtcError::Rejected {
+                status: status.as_u16(),
+                body: snippet(&text),
+            });
+        }
+        Ok(())
     }
 
     /// Kill the spawned process, if this instance owns one.

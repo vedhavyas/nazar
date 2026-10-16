@@ -95,11 +95,15 @@ async fn streams_reports_a_producer_as_live() {
             StreamStatus {
                 name: "gate".to_owned(),
                 live: false,
+                connected: false,
                 consumers: 0,
             },
             StreamStatus {
                 name: "hall".to_owned(),
                 live: true,
+                // The measured fixture's producer carries no `remote_addr`:
+                // held, but not shown connected.
+                connected: false,
                 consumers: 0,
             },
         ],

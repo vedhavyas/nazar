@@ -380,6 +380,8 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             retry_max: Duration::from_secs(30),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
+            connect_grace: Duration::from_millis(50),
+            connect_window: Duration::from_millis(300),
         },
     );
     let episodes = common::episodes_in(&data_dir);
