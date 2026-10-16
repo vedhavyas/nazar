@@ -37,31 +37,76 @@
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
     // dead stream leaves the last one. No first frame inside the window,
     // then no advancing clock, are the two signals a person can act on.
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       stalled = 'start';
     }, 12000);
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
-    const onplaying = () => {
-      clearTimeout(timer);
-      if (watching) return;
-      watching = setInterval(() => {
-        const video = player.querySelector('video');
-        if (!video) return;
-        if (video.currentTime <= lastTime) {
-          stalled = 'frozen';
-          return;
-        }
-        lastTime = video.currentTime;
-      }, 5000);
+    let playing = false;
+    /** Where the clock stood when the tab was hidden, if it had started. */
+    let awayAt = -1;
+
+    const tick = () => {
+      const video = player.querySelector('video');
+      if (!video) return;
+      if (video.currentTime <= lastTime) {
+        stalled = 'frozen';
+        return;
+      }
+      lastTime = video.currentTime;
     };
+    const watch = () => {
+      if (watching) return;
+      watching = setInterval(tick, 5000);
+    };
+    const onplaying = () => {
+      playing = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      watch();
+    };
+
+    // A background tab is not a stalled picture: Chromium throttles it and
+    // may drop the peer behind its back, so the watch stands down while it
+    // cannot see, and the picture is started again on return when the clock
+    // did not follow us back - a dropped peer never re-attaches on its own.
+    const onVisibility = () => {
+      const video = player.querySelector('video');
+      if (document.hidden) {
+        awayAt = playing && video ? video.currentTime : -1;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (watching) clearInterval(watching);
+        watching = null;
+        return;
+      }
+      const here = video ? video.currentTime : -1;
+      if (!playing || (awayAt >= 0 && here <= awayAt)) {
+        stalled = null;
+        attempt += 1;
+        onwatch(camera.id);
+        return;
+      }
+      // Still the same picture: watch it again from where it stands.
+      awayAt = -1;
+      lastTime = -1;
+      if (!playing) {
+        timer = setTimeout(() => {
+          stalled = 'start';
+        }, 12000);
+      }
+      watch();
+    };
+
     const video = player.querySelector('video');
     video?.addEventListener('playing', onplaying);
+    document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (watching) clearInterval(watching);
       video?.removeEventListener('playing', onplaying);
+      document.removeEventListener('visibilitychange', onVisibility);
       player.remove();
     };
   });

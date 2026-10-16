@@ -99,3 +99,66 @@ test('a frozen picture asks for a retry', async () => {
   screen.getByText('Try again').click();
   expect(onwatch, 'the retry asks for a fresh stream').toHaveBeenCalledWith('cam-1');
 });
+
+/** Hide or show the page, as a browser tab switch does. */
+function setHidden(hidden: boolean) {
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => (hidden ? 'hidden' : 'visible'),
+  });
+  document.dispatchEvent(new Event('visibilitychange'));
+}
+
+test('a backgrounded tab is never called a stalled picture', async () => {
+  vi.useFakeTimers();
+  const { onwatch } = liveTile();
+  const video = await videoOf();
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 4;
+
+  // Away: the browser throttles the page, the clock may not move, and
+  // nothing may be concluded from a page that cannot see.
+  setHidden(true);
+  await vi.advanceTimersByTimeAsync(60000);
+  expect(screen.queryByText(/stopped/), 'away is not a freeze').toBeNull();
+  expect(document.querySelectorAll('video-rtc').length, 'and nothing rebuilt').toBe(1);
+
+  // Back, with the picture still moving: the watch resumes where it was.
+  video.currentTime = 64;
+  setHidden(false);
+  for (let step = 65; step <= 66; step += 1) {
+    video.currentTime = step;
+    await vi.advanceTimersByTimeAsync(5000);
+  }
+  expect(screen.queryByText(/stopped/), 'a moving picture raises nothing').toBeNull();
+  expect(onwatch, 'and no restart was asked for').not.toHaveBeenCalled();
+  expect(document.querySelectorAll('video-rtc').length, 'one player, still').toBe(1);
+});
+
+test('a picture that did not follow us back is started again', async () => {
+  vi.useFakeTimers();
+  const { onwatch } = liveTile();
+  const video = await videoOf();
+  const first = document.querySelector('video-rtc');
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 4;
+
+  // Away, and the peer drops while we are not looking: the clock is exactly
+  // where we left it when the tab comes back.
+  setHidden(true);
+  await vi.advanceTimersByTimeAsync(60000);
+  setHidden(false);
+  await vi.advanceTimersByTimeAsync(50);
+
+  expect(onwatch, 'the tile asks for the stream again').toHaveBeenCalledWith('cam-1');
+  expect(
+    document.querySelector('video-rtc'),
+    'and the dead player was replaced rather than left on the screen',
+  ).not.toBe(first);
+  expect(
+    document.querySelectorAll('video-rtc').length,
+    'one player at a time, the new one',
+  ).toBe(1);
+  expect(screen.queryByText(/stopped/), 'the recovery is not framed as a failure').toBeNull();
+});
