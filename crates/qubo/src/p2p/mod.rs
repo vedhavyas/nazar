@@ -548,9 +548,91 @@ fn broker_options(session: &Session, unit: &str, device_name: &str) -> rumqttc::
 }
 
 /// The default-route address: what the OS would source toward the internet.
-/// The reference client reads the route table on macOS; the server has no
-/// such tool, and a UDP connect sends nothing, so it stands in.
+/// The route table comes first, because a split-tunnel VPN (0/1 + 128/1
+/// routes) leaves the default route on the physical interface while a
+/// connect probe would source from the tunnel - the exact failure the
+/// reference client's first live runs hit (`docs/qubo-findings.md`).
 fn default_route_ip() -> IpAddr {
+    route_table_ip().unwrap_or_else(udp_connect_ip)
+}
+
+/// The default route's interface address, via the platform's own tools.
+#[cfg(target_os = "macos")]
+fn route_table_ip() -> Option<IpAddr> {
+    let route = command_output("route", &["-n", "get", "default"])?;
+    let interface = parse_default_interface_macos(&route)?;
+    command_output("ipconfig", &["getifaddr", &interface])?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The default route's interface address, via the platform's own tools.
+#[cfg(target_os = "linux")]
+fn route_table_ip() -> Option<IpAddr> {
+    let route = command_output("ip", &["-4", "route", "show", "default"])?;
+    let interface = parse_default_device_linux(&route)?;
+    let address = command_output("ip", &["-4", "addr", "show", "dev", &interface])?;
+    parse_inet_linux(&address)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn route_table_ip() -> Option<IpAddr> {
+    None
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// macOS `route -n get default`: the `interface: en0` line.
+#[cfg(target_os = "macos")]
+fn parse_default_interface_macos(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Linux `ip route show default`: the device after `dev`.
+#[cfg(target_os = "linux")]
+fn parse_default_device_linux(text: &str) -> Option<String> {
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "dev" {
+            return words
+                .next()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Linux `ip -4 addr show dev <iface>`: the first `inet` line's address.
+#[cfg(target_os = "linux")]
+fn parse_inet_linux(text: &str) -> Option<IpAddr> {
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("inet ") else {
+            continue;
+        };
+        let address = rest.split_whitespace().next()?.split('/').next()?;
+        return address.parse().ok();
+    }
+    None
+}
+
+/// The UDP-connect probe: what the OS would source toward the internet. A
+/// fallback, not the first choice: a full-tunnel VPN makes it return the
+/// tunnel address, and the probe sends nothing.
+fn udp_connect_ip() -> IpAddr {
     let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
         return IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     };
@@ -743,6 +825,49 @@ mod tests {
             "a disarmed guard never stops the pump"
         );
         broker.pump.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_route_parser_reads_the_interface_line() {
+        let route = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.0.2.1\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+        assert_eq!(
+            parse_default_interface_macos(route).as_deref(),
+            Some("en0"),
+            "the interface line is the default route's device"
+        );
+        assert_eq!(
+            parse_default_interface_macos("nothing here"),
+            None,
+            "a route without an interface line is none"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_route_parsers_read_the_device_and_address() {
+        assert_eq!(
+            parse_default_device_linux("default via 192.0.2.1 dev eth0 proto dhcp metric 100\n")
+                .as_deref(),
+            Some("eth0"),
+            "the device after dev is the default route's interface"
+        );
+        assert_eq!(
+            parse_default_device_linux("no default here"),
+            None,
+            "a table without a default route is none"
+        );
+        let show = "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 192.0.2.140/24 brd 192.0.2.255 scope global eth0\n";
+        assert_eq!(
+            parse_inet_linux(show),
+            Some("192.0.2.140".parse().expect("an ip")),
+            "the first inet line is the interface's address"
+        );
+        assert_eq!(
+            parse_inet_linux("no addresses"),
+            None,
+            "a device with no inet line is none"
+        );
     }
 
     #[tokio::test]
