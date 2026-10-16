@@ -125,6 +125,33 @@ fn the_exact_window_edge_is_a_new_episode() {
 }
 
 #[test]
+fn a_coalesced_sighting_does_not_rewrite_the_log() {
+    let dir = temp_dir("notify-coalesce-write");
+    let store = store_in(&dir);
+    let path = dir.join("notifications.json");
+    let start = Instant::now();
+
+    assert!(store.push(&motion("hall"), start).is_some(), "the episode is told");
+    let before = std::fs::read_to_string(&path).expect("the log was written");
+
+    // Long enough for the clock to tick, so a save would change the bytes.
+    std::thread::sleep(Duration::from_millis(3));
+    assert!(
+        store
+            .push(&motion("hall"), start + Duration::from_secs(1))
+            .is_none(),
+        "a sighting inside the window is the same episode"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the log is still there"),
+        before,
+        "the coalesced branch bumped the entry in memory without rewriting the ring: a \
+         crash losing the bump is cosmetic, the entry itself is already persisted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn offline_and_online_are_each_told() {
     let dir = temp_dir("notify-liveness");
     let store = store_in(&dir);
