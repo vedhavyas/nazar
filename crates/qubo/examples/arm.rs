@@ -21,7 +21,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use qubo::p2p::{AesMode, P2pConfig, P2pEngine, P2pIdentity};
+use qubo::p2p::{AesMode, H264Assembler, P2pConfig, P2pEngine, P2pIdentity};
 use qubo::{BASE_URL, Device, SessionStore};
 
 #[tokio::main]
@@ -74,14 +74,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(args.seconds);
     let mut datagrams = 0_u32;
     let mut payload_types = std::collections::BTreeSet::new();
-    let mut saw_start_code = false;
+    let mut first_bytes: std::collections::BTreeMap<u8, u32> = std::collections::BTreeMap::new();
+    let mut assembler = H264Assembler::new();
+    let mut nals = 0_u32;
     while std::time::Instant::now() < deadline {
         match armed.recv_media().await? {
             Some(packet) => {
                 datagrams += 1;
                 payload_types.insert(packet.header().payload_type);
                 let payload = packet.payload();
-                saw_start_code |= payload.windows(4).any(|w| w == [0, 0, 0, 1]);
+                if packet.header().payload_type == 96 {
+                    if let Some(&first) = payload.first() {
+                        *first_bytes.entry(first).or_default() += 1;
+                    }
+                    nals += u32::try_from(assembler.feed(payload).len()).unwrap_or(0);
+                }
                 if datagrams <= 10 {
                     println!(
                         "[rtp] #{datagrams} pt={} seq={} len={} head={}",
@@ -95,8 +102,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None => println!("[arm] idle so far: {datagrams} datagrams"),
         }
     }
+    println!("[arm] received {datagrams} datagrams; payload types {payload_types:?}");
+    // RFC 6184 payloads carry bare NALs (and FU-A fragments), not Annex-B
+    // start codes, so the first byte is the reliable shape signal.
     println!(
-        "[arm] received {datagrams} datagrams; payload types {payload_types:?}; H.264 start code seen: {saw_start_code}"
+        "[arm] PT 96 first bytes {first_bytes:02x?} \
+         (0x7c = FU-A indicator; 0x65 IDR / 0x41 non-IDR / 0x67 SPS / 0x68 PPS = bare NALs)"
+    );
+    println!(
+        "[arm] NAL units {nals}; SPS={} PPS={} IDR={}",
+        assembler.saw_sps(),
+        assembler.saw_pps(),
+        assembler.saw_idr()
     );
     println!("[arm] disarming (endP2pCall)");
     armed.disarm().await;
