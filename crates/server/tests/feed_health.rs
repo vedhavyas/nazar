@@ -104,7 +104,7 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
         Pacing {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),

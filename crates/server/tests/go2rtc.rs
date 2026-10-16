@@ -39,7 +39,7 @@ fn low_source_chains_off_the_high_stream_by_name() {
 #[tokio::test]
 async fn put_stream_sends_the_name_and_source() {
     let api = common::FakeApi::start().await;
-    let go2rtc = Go2rtc::connect(api.base.clone());
+    let go2rtc = Go2rtc::connect(api.base.clone()).expect("a client");
 
     go2rtc
         .put_stream(
@@ -63,7 +63,7 @@ async fn put_stream_sends_the_name_and_source() {
 async fn put_stream_reports_a_rejection() {
     let api = common::FakeApi::start().await;
     api.set_put_status(400);
-    let go2rtc = Go2rtc::connect(api.base.clone());
+    let go2rtc = Go2rtc::connect(api.base.clone()).expect("a client");
 
     let err = go2rtc
         .put_stream("hall", "exec:whatever")
@@ -85,7 +85,7 @@ async fn put_stream_reports_a_rejection() {
 #[tokio::test]
 async fn streams_reports_a_producer_as_live() {
     let api = common::FakeApi::start().await;
-    let go2rtc = Go2rtc::connect(api.base.clone());
+    let go2rtc = Go2rtc::connect(api.base.clone()).expect("a client");
 
     let streams = go2rtc.streams().await.expect("the fake answers");
 
@@ -127,7 +127,8 @@ async fn a_go2rtc_that_never_answers_is_bounded() {
         std::future::pending::<()>().await;
     });
 
-    let go2rtc = Go2rtc::connect(format!("http://{addr}").parse().expect("a url"));
+    let go2rtc =
+        Go2rtc::connect(format!("http://{addr}").parse().expect("a url")).expect("a client");
     let started = std::time::Instant::now();
     let answer = tokio::time::timeout(Duration::from_secs(8), go2rtc.streams())
         .await

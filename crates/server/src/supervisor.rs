@@ -826,7 +826,7 @@ mod tests {
                 qubo::ServiceProvider::default(),
             ),
             SessionStore::new(std::env::temp_dir().join("nazar-guard-test.json")),
-            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")),
+            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")).expect("a client"),
             Pacing::default(),
         )
     }

@@ -94,7 +94,7 @@ async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
         Pacing {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),
@@ -103,7 +103,10 @@ async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
             stream_idle: Duration::from_secs(120),
         },
     );
-    let snapshots = Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps"));
+    let snapshots = Snapshots::new(
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+        data_dir.join("snaps"),
+    );
     let state = AppState::new(
         "test",
         Wiring {

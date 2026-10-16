@@ -45,6 +45,11 @@ struct Harness {
     events: EventBus,
 }
 
+/// A go2rtc handle on the fake API; each piece builds its own client.
+fn attach(go2rtc: &common::FakeApi) -> Go2rtc {
+    Go2rtc::connect(go2rtc.base.clone()).expect("a client")
+}
+
 async fn harness() -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
@@ -105,7 +110,7 @@ async fn harness() -> Harness {
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        attach(&go2rtc),
         // Long, so a re-mint inside a test's window is the wake's doing and
         // never the loop's own backoff.
         Pacing {
@@ -133,7 +138,7 @@ async fn harness() -> Harness {
                 Duration::from_secs(30),
             )),
             episodes: common::episodes_in(&data_dir),
-            snapshots: Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps")),
+            snapshots: Snapshots::new(attach(&go2rtc), data_dir.join("snaps")),
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");

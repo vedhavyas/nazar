@@ -61,7 +61,7 @@ async fn harness() -> Harness {
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
         Pacing {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),
@@ -84,7 +84,10 @@ async fn harness() -> Harness {
                 Duration::from_secs(30),
             )),
             episodes: common::episodes_in(&data_dir),
-            snapshots: Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps")),
+            snapshots: Snapshots::new(
+                Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+                data_dir.join("snaps"),
+            ),
         },
     );
     // The poll window is a knob so a write that never lands does not cost

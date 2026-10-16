@@ -39,7 +39,10 @@ fn backups(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with(&format!("{stem}.")) && name.ends_with(".bak")
+                    name.starts_with(&format!("{stem}."))
+                        && std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
                 })
         })
         .collect();
@@ -223,11 +226,7 @@ fn a_log_that_cannot_be_read_is_kept_aside_too() {
     assert_eq!(store.list().len(), 0, "an unreadable log starts empty");
 
     let kept = backups(&dir, "episodes");
-    assert_eq!(
-        kept.len(),
-        1,
-        "the unreadable path is kept aside: {kept:?}"
-    );
+    assert_eq!(kept.len(), 1, "the unreadable path is kept aside: {kept:?}");
     assert_eq!(
         std::fs::read_to_string(kept[0].join("evidence.txt")).expect("the kept evidence"),
         "what was here",

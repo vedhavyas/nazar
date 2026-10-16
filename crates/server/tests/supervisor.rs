@@ -55,7 +55,12 @@ async fn harness(pacing: Pacing) -> Harness {
         .expect("the session saves");
 
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
-    let supervisor = Supervisor::new(client, store, Go2rtc::connect(go2rtc.base.clone()), pacing);
+    let supervisor = Supervisor::new(
+        client,
+        store,
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+        pacing,
+    );
     Harness {
         supervisor,
         qubo,

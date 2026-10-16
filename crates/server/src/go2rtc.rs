@@ -28,15 +28,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The client every go2rtc call goes through. Both limits are load-bearing:
 /// `a_go2rtc_that_never_answers_is_bounded` pins what removing them costs.
-fn api_client() -> reqwest::Client {
-    reqwest::Client::builder()
+/// A build failure is an error, not a fallback to a client without them.
+fn api_client() -> Result<reqwest::Client, Go2rtcError> {
+    Ok(reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .build()
-        .unwrap_or_else(|err| {
-            tracing::warn!(%err, "the go2rtc client fell back to defaults");
-            reqwest::Client::new()
-        })
+        .build()?)
 }
 
 /// The generated config's ffmpeg template name.
@@ -110,6 +107,9 @@ impl Go2rtc {
     /// loopback API. The process may take a moment to listen; callers retry
     /// their first request.
     pub fn start(cfg: &Config) -> Result<Self, Go2rtcError> {
+        // The client first: a build failure must not leave a spawned child
+        // behind.
+        let http = api_client()?;
         let config_path = cfg.data_dir.join("go2rtc.yaml");
         std::fs::write(
             &config_path,
@@ -128,20 +128,20 @@ impl Go2rtc {
         );
         Ok(Self {
             api: parse_url(API_BASE)?,
-            http: api_client(),
+            http,
             child: Some(child),
             config_path,
         })
     }
 
     /// Attach to a go2rtc API already listening at `api_base`.
-    pub fn connect(api_base: Url) -> Self {
-        Self {
+    pub fn connect(api_base: Url) -> Result<Self, Go2rtcError> {
+        Ok(Self {
             api: api_base,
-            http: api_client(),
+            http: api_client()?,
             child: None,
             config_path: PathBuf::new(),
-        }
+        })
     }
 
     /// The generated config's path, when this instance spawned go2rtc.
