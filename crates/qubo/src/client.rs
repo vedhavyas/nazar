@@ -1,6 +1,7 @@
 //! The HTTP client for the Qubo REST gateway.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,6 +70,9 @@ pub struct QuboClient {
     /// The profiles a login is waiting on a choice between: a number that
     /// maps to several accounts.
     pending_profiles: Arc<Mutex<Option<PendingProfiles>>>,
+    /// Stamps every pending set so a claim or release from an older set
+    /// can never touch a newer one.
+    pending_generation: Arc<AtomicU64>,
 }
 
 /// The gateway's login session and the number it was issued for; verify
@@ -90,8 +94,32 @@ enum Caller<'a> {
 /// pick has already claimed the slot to mint it.
 #[derive(Debug, Clone)]
 struct PendingProfiles {
+    generation: u64,
     profiles: Vec<AccountProfile>,
     claimed: bool,
+}
+
+/// The claimed pick, holding its slot while the mint runs. Dropping it
+/// releases the slot for a retry - which also covers a request the server
+/// abandoned mid-mint - and never touches a newer picker's claim.
+#[derive(Debug)]
+pub struct PickedProfile {
+    client: QuboClient,
+    profile: AccountProfile,
+    generation: u64,
+}
+
+impl PickedProfile {
+    /// The account this pick chose.
+    pub fn profile(&self) -> &AccountProfile {
+        &self.profile
+    }
+}
+
+impl Drop for PickedProfile {
+    fn drop(&mut self) {
+        self.client.release_pending_profiles(self.generation);
+    }
 }
 
 impl QuboClient {
@@ -110,6 +138,7 @@ impl QuboClient {
             device_id,
             pending_login: Arc::new(Mutex::new(None)),
             pending_profiles: Arc::new(Mutex::new(None)),
+            pending_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -134,29 +163,41 @@ impl QuboClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Keep the profiles a login is waiting on a choice between.
+    /// Keep the profiles a login is waiting on a choice between. Each set
+    /// carries a fresh generation: a claim or release from an older set
+    /// must never touch this one.
     pub fn set_pending_profiles(&self, profiles: Vec<AccountProfile>) {
+        let generation = self.pending_generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.lock_pending_profiles() = Some(PendingProfiles {
+            generation,
             profiles,
             claimed: false,
         });
     }
 
-    /// Claim the pick for `uuid`: the first select takes the slot, so a
-    /// racing second one is refused. `release_pending_profiles` hands it
-    /// back when nothing was minted.
-    pub fn claim_pending_profile(&self, uuid: &str) -> Result<AccountProfile, QuboError> {
+    /// Claim the pick for `uuid`: the first select takes the slot while
+    /// its mint runs, so a racing second one is refused. The claim rides
+    /// the returned guard, which releases the slot on every exit.
+    pub fn claim_pending_profile(&self, uuid: &str) -> Result<PickedProfile, QuboError> {
         let mut pending = self.lock_pending_profiles();
-        let waiting = pending
-            .as_mut()
-            .filter(|state| !state.claimed)
-            .ok_or(QuboError::Auth {
+        let state = pending.as_mut().ok_or(QuboError::Auth {
+            code: None,
+            message: "no login is waiting for a profile choice".to_owned(),
+        })?;
+        if state.claimed {
+            return Err(QuboError::Auth {
                 code: None,
-                message: "no login is waiting for a profile choice".to_owned(),
-            })?;
-        let profile = select_profile(&waiting.profiles, uuid)?;
-        waiting.claimed = true;
-        Ok(profile)
+                message: "a pick for this login is already in flight; wait or request a new code"
+                    .to_owned(),
+            });
+        }
+        let profile = select_profile(&state.profiles, uuid)?;
+        state.claimed = true;
+        Ok(PickedProfile {
+            client: self.clone(),
+            profile,
+            generation: state.generation,
+        })
     }
 
     /// The choice was made or abandoned; nothing is pending any more.
@@ -164,9 +205,13 @@ impl QuboClient {
         *self.lock_pending_profiles() = None;
     }
 
-    /// Nothing was persisted: the choice is open again for another pick.
-    pub fn release_pending_profiles(&self) {
-        if let Some(state) = self.lock_pending_profiles().as_mut() {
+    /// Nothing was persisted: release the claim `generation` took, if the
+    /// slot still holds it.
+    fn release_pending_profiles(&self, generation: u64) {
+        let mut pending = self.lock_pending_profiles();
+        if let Some(state) = pending.as_mut()
+            && state.generation == generation
+        {
             state.claimed = false;
         }
     }

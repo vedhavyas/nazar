@@ -441,6 +441,66 @@ async fn phone_login_needs_a_refresh_token_in_the_response() {
     }
 }
 
+/// A GM response without a refresh token is still a login - refusing it
+/// would turn a working hour into a 502 if the shape ever changes - it
+/// only means the session is not durable, which the warn records.
+#[tokio::test]
+async fn verify_google_without_a_refresh_token_still_signs_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(GM_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"accessToken":"a","uuid":"u"}"#),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+
+    let session = verify_google(&client, "the-id-token")
+        .await
+        .expect("a GM login without a refresh token still answers a session");
+
+    assert_eq!(session.access_token, "a", "the access token rides");
+    assert_eq!(
+        session.refresh_token, None,
+        "the absent refresh token stays absent, never a refusal"
+    );
+}
+
+#[tokio::test]
+async fn phone_login_refuses_an_empty_refresh_token() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        EMAILPROFILE_PATH,
+        200,
+        r#"{"accessToken":"a","refreshToken":"","uuid":"user-uuid-1"}"#,
+    )
+    .await;
+
+    let client = client_for(&server);
+    let profile = AccountProfile {
+        access_token: "profile-1h-token".to_owned(),
+        uuid: "picked-uuid-1".to_owned(),
+        name: None,
+        email: Some("vedhavyas@example.com".to_owned()),
+        refresh_token: None,
+    };
+
+    let err = phone_login(&client, &profile)
+        .await
+        .expect_err("an empty refresh token is not a token");
+    match err {
+        QuboError::Parse(inner) => {
+            assert!(
+                inner.to_string().contains("empty"),
+                "the parse says the field carried nothing: {inner}"
+            );
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn phone_login_refuses_empty_minted_fields() {
     let server = MockServer::start().await;

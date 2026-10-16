@@ -184,10 +184,14 @@ pub async fn phone_login(
     client: &QuboClient,
     profile: &AccountProfile,
 ) -> Result<Session, QuboError> {
-    let email = profile.email.as_deref().ok_or(QuboError::Auth {
-        code: None,
-        message: "the account profile carries no email to mint with".to_owned(),
-    })?;
+    let email = profile
+        .email
+        .as_deref()
+        .filter(|email| !email.is_empty())
+        .ok_or(QuboError::Auth {
+            code: None,
+            message: "the account profile carries no email to mint with".to_owned(),
+        })?;
     let path = format!(
         "/sms/api/v1/sp/{}/user/emailprofile/login",
         client.service_provider()
@@ -235,6 +239,12 @@ pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Sessio
         .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &[], &body)
         .await?;
     let profile: AccountProfile = serde_json::from_value(response)?;
+    if profile.refresh_token.as_deref().is_none_or(str::is_empty) {
+        // Warn-only: a hard refusal would turn a working hour into a 502
+        // if the shape ever changes; the session simply will not renew
+        // silently.
+        tracing::warn!("the GM login answered no usable refresh token");
+    }
     Ok(Session {
         access_token: profile.access_token,
         uuid: profile.uuid,
