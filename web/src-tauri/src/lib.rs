@@ -118,6 +118,33 @@ async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
     Ok("install".to_string())
 }
 
+/// Tell the person about something, outside the window: the shell's half of
+/// the web bridge's `notify` command, one shape on every platform.
+#[tauri::command]
+async fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt as _;
+
+    // A phone that has not decided yet is asked on the first telling; a
+    // refusal is Android's to remember, and asking again cannot reprompt.
+    #[cfg(target_os = "android")]
+    if app
+        .notification()
+        .permission_state()
+        .is_ok_and(|state| state != tauri::plugin::PermissionState::Granted)
+    {
+        app.notification()
+            .request_permission()
+            .map_err(|err| err.to_string())?;
+    }
+
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `invoke_handler` REPLACES the handler rather than adding to it, so the
@@ -125,11 +152,12 @@ pub fn run() {
     #[cfg(target_os = "android")]
     let builder = tauri::Builder::default()
         .plugin(android::init())
-        .invoke_handler(tauri::generate_handler![check_update, install_update]);
+        .invoke_handler(tauri::generate_handler![check_update, install_update, notify]);
     #[cfg(not(target_os = "android"))]
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().invoke_handler(tauri::generate_handler![notify]);
 
     builder
+        .plugin(tauri_plugin_notification::init())
         // Info, not the plugin's trace default: the webview stack's trace
         // logging buries the app's own lines.
         .plugin(
