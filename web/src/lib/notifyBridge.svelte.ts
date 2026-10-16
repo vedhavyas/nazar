@@ -3,7 +3,7 @@
 //! in, and the telling itself - the shell's own `notify` when there is a
 //! shell, else the browser's notifications when they are permitted.
 
-import { api, type Notification } from './api';
+import { api, socketBase, type Notification } from './api';
 
 /** Where entries, camera names, and arrivals come from; a server, or a fake
  * in tests. */
@@ -30,7 +30,7 @@ export function serverNotifySource(): NotifySource {
       let again: ReturnType<typeof setTimeout> | null = null;
       const open = () => {
         if (stopped) return;
-        socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events`);
+        socket = new WebSocket(`${socketBase()}/api/events`);
         socket.onmessage = (message: MessageEvent<string>) => {
           const frame = JSON.parse(String(message.data)) as {
             type?: string;

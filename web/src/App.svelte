@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  import { api } from './lib/api';
+  import { ApiError, api, inShell } from './lib/api';
   import { reachable, watchHealth } from './lib/health';
   import { createNotifications } from './lib/notifyBridge.svelte';
   import Camera from './routes/Camera.svelte';
@@ -9,8 +9,9 @@
   import Login from './routes/Login.svelte';
   import Notifications from './routes/Notifications.svelte';
   import Recordings from './routes/Recordings.svelte';
+  import Setup from './routes/Setup.svelte';
 
-  type Screen = 'checking' | 'login' | 'home' | 'camera' | 'notifications' | 'recordings';
+  type Screen = 'checking' | 'setup' | 'login' | 'home' | 'camera' | 'notifications' | 'recordings';
 
   let screen = $state<Screen>('checking');
   let openId = $state<string | null>(null);
@@ -40,8 +41,11 @@
     try {
       const page = await api.cameras();
       screen = page.needsLogin ? 'login' : 'home';
-    } catch {
-      screen = 'login';
+    } catch (error) {
+      // A shell is not served by the server it calls, so a failure that is
+      // not the server's own answer is the address - Setup is where it is
+      // fixed. In a browser the server answered the page itself.
+      screen = inShell() && !(error instanceof ApiError) ? 'setup' : 'login';
     }
   }
 </script>
@@ -54,6 +58,8 @@
   <main class="gate">
     <p class="quiet">Looking for the server...</p>
   </main>
+{:else if screen === 'setup'}
+  <Setup onready={() => void boot()} />
 {:else if screen === 'login'}
   <Login onloggedin={() => (screen = 'home')} />
 {:else if screen === 'camera' && openId}

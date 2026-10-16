@@ -1,11 +1,16 @@
 //! The API client: the error envelope, cookie carriage, and call shapes.
 
+// @vitest-environment jsdom
+
 import { afterEach, expect, test, vi } from 'vitest';
 
 import { ApiError, api } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  localStorage.clear();
+  // The base resolves at import time, so each address test re-imports.
+  vi.resetModules();
 });
 
 function stubFetch(status: number, body: string) {
@@ -81,4 +86,54 @@ test('watching a camera calls its live route', async () => {
   expect(fetchMock.mock.calls[2][0], "Try again says so in the server's words").toBe(
     '/api/cameras/cam-1/live?quality=high&retry=true',
   );
+});
+
+test('the browser build calls the server it was served from', async () => {
+  const fetchMock = stubFetch(200, JSON.stringify({ ok: true, version: '1.2.3' }));
+
+  await api.health();
+
+  expect(fetchMock.mock.calls[0][0], 'no shell, so the path stays relative').toBe('/api/health');
+});
+
+test('a shell with no stored address defaults to the mesh', async () => {
+  vi.stubGlobal('__TAURI_INTERNALS__', {});
+  const fresh = await import('./api');
+  const fetchMock = stubFetch(200, JSON.stringify({ ok: true, version: '1.2.3' }));
+
+  await fresh.api.health();
+
+  expect(fetchMock.mock.calls[0][0], 'the mesh address carries the path').toBe(
+    'http://nazar.hub/api/health',
+  );
+});
+
+test('a stored address is what the shell calls', async () => {
+  vi.stubGlobal('__TAURI_INTERNALS__', {});
+  localStorage.setItem('nazar.server', 'http://house.lan:8080');
+  const fresh = await import('./api');
+  const fetchMock = stubFetch(200, JSON.stringify({ ok: true, version: '1.2.3' }));
+
+  await fresh.api.cameras();
+
+  expect(fetchMock.mock.calls[0][0], 'the stored server, not the default').toBe(
+    'http://house.lan:8080/api/cameras',
+  );
+});
+
+test('a saved address is normalized and persisted', async () => {
+  vi.stubGlobal('__TAURI_INTERNALS__', {});
+  const fresh = await import('./api');
+
+  fresh.setServerBase(' nazar.hub/ ');
+
+  expect(fresh.serverBase(), 'trailing slashes gone, the mesh scheme assumed').toBe(
+    'http://nazar.hub',
+  );
+  expect(localStorage.getItem('nazar.server'), 'the address outlives the window').toBe(
+    'http://nazar.hub',
+  );
+
+  fresh.setServerBase('https://nazar.hub');
+  expect(fresh.serverBase(), 'a typed scheme is kept').toBe('https://nazar.hub');
 });

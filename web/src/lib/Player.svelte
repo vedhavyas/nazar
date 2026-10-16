@@ -1,6 +1,8 @@
 <script lang="ts">
   /** The picture: go2rtc's WebRTC signalling, with HLS as the fallback for
    * a network where the socket cannot negotiate (design §5). */
+  import { serverBase } from './api';
+
   interface VideoRtcElement extends HTMLElement {
     src: string;
     mode: string;
@@ -120,7 +122,7 @@
     // Audio is negotiated with the stream and kept muted until a gesture
     // says otherwise; nothing re-negotiates when the mute flips.
     player.media = 'video,audio';
-    player.src = `/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
+    player.src = `${serverBase()}/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
     stage.appendChild(player);
 
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
@@ -307,7 +309,7 @@
     const Hls = hlsJs();
     if (!Hls) return;
     const hls = new Hls();
-    hls.loadSource(`/go2rtc/api/stream.m3u8?src=${encodeURIComponent(name)}`);
+    hls.loadSource(`${serverBase()}/go2rtc/api/stream.m3u8?src=${encodeURIComponent(name)}`);
     hls.attachMedia(element);
     return () => hls.destroy();
   });
@@ -326,7 +328,7 @@
     class="hls"
     data-testid="hls"
     bind:this={picture}
-    src={native ? `/go2rtc/api/stream.m3u8?src=${encodeURIComponent(stream)}` : undefined}
+    src={native ? `${serverBase()}/go2rtc/api/stream.m3u8?src=${encodeURIComponent(stream)}` : undefined}
     controls
     autoplay
     playsinline
