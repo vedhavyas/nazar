@@ -13,10 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live};
+use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live, mint_vod};
 use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, live_source, low_source};
+
+/// The shortest wait between a playback stream's idle re-checks: a zero
+/// window would spin.
+const WATCH_FLOOR: Duration = Duration::from_millis(50);
 
 /// How the supervisor paces itself.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +56,22 @@ pub fn stream_name(device_id: &str, quality: Quality) -> String {
     format!("{device_id}-{}", quality.as_str())
 }
 
+/// A playback stream is a camera's name under this prefix: `vod-<device>`.
+pub const VOD_PREFIX: &str = "vod-";
+
+/// The go2rtc stream name for a camera's playback session.
+pub fn vod_name(device_id: &str) -> String {
+    format!("{VOD_PREFIX}{device_id}")
+}
+
+/// A started playback: the stream the player asks for, and how long the
+/// server holds it without any sign of life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VodStream {
+    pub name: String,
+    pub expires_in: u64,
+}
+
 /// A camera's stream state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -66,8 +86,8 @@ pub enum StreamState {
 pub enum SupervisorError {
     #[error("unknown device {0}")]
     UnknownDevice(String),
-    #[error("VOD playback lands in M3")]
-    VodUnavailable,
+    #[error("go2rtc: {0}")]
+    Go2rtc(String),
     #[error("discovery: {0}")]
     Qubo(#[from] qubo::QuboError),
 }
@@ -312,10 +332,118 @@ impl Supervisor {
         Ok(self.status_for(device_id, Quality::Low).await)
     }
 
-    /// Reserved for M3: cloud-allocated VOD sessions for recordings. M1
-    /// streams the live pipeline only, so this refuses rather than guesses.
-    pub fn ensure_vod(&self, _device_id: &str, _timestamp: i64) -> Result<(), SupervisorError> {
-        Err(SupervisorError::VodUnavailable)
+    /// Start playback of `device` at `timestamp_ms`: mint a cloud session
+    /// at the clip's instant, hand it to go2rtc as `vod-<device>`, and
+    /// hold it until the player releases it or it goes both unasked-for
+    /// and unwatched for the idle window. A second seek re-mints - the old
+    /// session is released first, so one camera never runs two at once.
+    pub async fn ensure_vod(
+        &self,
+        device_id: &str,
+        timestamp_ms: i64,
+    ) -> Result<VodStream, SupervisorError> {
+        let device = {
+            let devices = self.devices.read().await;
+            devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+                .cloned()
+        }
+        .ok_or_else(|| SupervisorError::UnknownDevice(device_id.to_owned()))?;
+        let session = self.sessions.load()?.ok_or(qubo::QuboError::Auth {
+            code: None,
+            message: "no Qubo session; log in".to_owned(),
+        })?;
+        let name = vod_name(device_id);
+        let mint = match mint_vod(&self.qubo, &session, &device, timestamp_ms).await {
+            Ok(mint) => mint,
+            Err(err) => {
+                self.settle_auth(&err);
+                return Err(err.into());
+            }
+        };
+        // A seek replaces the session: the old stream is released before
+        // the new source is set, so the cloud slot is never held twice.
+        if let Some(seen_at) = self.last_request_at(&name).await {
+            self.release_vod_if_idle(&name, seen_at).await;
+        }
+        self.go2rtc
+            .put_stream(&name, &live_source(&mint.url))
+            .await
+            .map_err(|err| SupervisorError::Go2rtc(redact(&err.to_string())))?;
+        let fresh = {
+            let mut state = self.state.write().await;
+            let fresh = !state.contains_key(&name);
+            let entry = state.entry(name.clone()).or_insert_with(new_tracked);
+            entry.last_request = Instant::now();
+            entry.state = StreamState::Live {
+                since: Instant::now(),
+            };
+            fresh
+        };
+        if fresh {
+            let supervisor = self.clone();
+            let reaped = name.clone();
+            tokio::spawn(async move { supervisor.vod_reaper(reaped).await });
+        }
+        Ok(VodStream {
+            name,
+            // The only expiry this server enforces itself: the cloud's own
+            // session lifetime was not measured, and the player releases
+            // long before either matters.
+            expires_in: self.pacing.stream_idle.as_secs(),
+        })
+    }
+
+    /// Release the camera's playback stream now: the player left.
+    pub async fn release_vod(&self, device_id: &str) -> bool {
+        let name = vod_name(device_id);
+        match self.last_request_at(&name).await {
+            Some(seen_at) => self.release_vod_if_idle(&name, seen_at).await,
+            None => false,
+        }
+    }
+
+    /// Release a playback session once nobody asks for it and nobody
+    /// watches it: a leaked VOD session burns a camera slot.
+    async fn vod_reaper(self, name: String) {
+        let idle = self.pacing.stream_idle;
+        loop {
+            let Some(last) = self.last_request_at(&name).await else {
+                return; // released by the player
+            };
+            tokio::time::sleep(idle.saturating_sub(last.elapsed()).max(WATCH_FLOOR)).await;
+            if self.last_request_at(&name).await != Some(last) {
+                continue; // asked for again; wait out its own window
+            }
+            if self.watched(&name).await {
+                // A viewer holds it open: re-check within a window, so
+                // their leaving is noticed at all.
+                tokio::time::sleep(idle.max(WATCH_FLOOR)).await;
+                continue;
+            }
+            self.release_vod_if_idle(&name, last).await;
+            return;
+        }
+    }
+
+    /// Release a playback stream, if the entry this reaper decided about
+    /// is still the entry that is there: the claim and the delete run
+    /// under the state lock, so a seek landing mid-release waits and
+    /// starts its own session rather than having it deleted under it.
+    async fn release_vod_if_idle(&self, name: &str, seen_at: Instant) -> bool {
+        let mut state = self.state.write().await;
+        match state.get(name) {
+            Some(tracked) if tracked.last_request == seen_at => {
+                state.remove(name);
+            }
+            _ => return false,
+        }
+        if let Err(err) = self.go2rtc.delete_stream(name).await {
+            tracing::warn!(stream = name, %err, "the playback stream could not be released");
+        }
+        tracing::info!(stream = name, "playback released");
+        true
     }
 
     async fn remint_loop(self, device: Device, mut wait: Duration) {

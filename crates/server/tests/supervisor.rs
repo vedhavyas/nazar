@@ -17,7 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::{Quality, QuboClient, Session, SessionStore};
 use server::go2rtc::Go2rtc;
-use server::supervisor::{Pacing, StreamState, Supervisor, SupervisorError, stream_name};
+use server::supervisor::{Pacing, StreamState, Supervisor, stream_name};
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
@@ -482,20 +482,6 @@ async fn discovery_backs_off_between_tries() {
     assert!(
         h.supervisor.discovery_due(),
         "the backoff expires and recovery can be noticed again"
-    );
-    let _ = std::fs::remove_file(&h.sessions_path);
-}
-
-#[tokio::test]
-async fn vod_is_reserved_for_m3() {
-    let h = harness(pacing(Duration::from_secs(30))).await;
-    let err = h
-        .supervisor
-        .ensure_vod(DEVICE_ID, 1_700_000_000_000)
-        .expect_err("M1 has no VOD path");
-    assert!(
-        matches!(err, SupervisorError::VodUnavailable),
-        "the stub refuses, naming M3: {err:?}"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

@@ -1,27 +1,30 @@
-//! The recording calendar: the days the cloud holds footage for, as the
-//! wire carries them (a bare array of DD-MM-YYYY strings, unordered).
+//! The recording calendar and VOD minting: the days the cloud holds
+//! footage for, and the playback session a clip's instant buys.
 //!
-//! Fixture provenance: `calendar.json` is the captured body from a live
-//! session (2026-10-16, docs/qubo-vod-verification.md) - the days are
-//! deliberately out of order, as the cloud sent them.
+//! Fixture provenance: `calendar.json` and `mint_vod.json` are captured
+//! from a live session (2026-10-16, docs/qubo-vod-verification.md); the
+//! days are deliberately out of order, as the cloud sent them, and the
+//! playback token is redacted.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
 
+use serde_json::Value;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::client::QuboClient;
 use qubo::devices::Device;
 use qubo::error::QuboError;
-use qubo::recordings::recorded_days;
+use qubo::recordings::{mint_vod, recorded_days};
 use qubo::session::Session;
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 const CALENDAR_PATH: &str = "/content-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01/calendar";
+const VOD_PATH: &str = "/stream-manager/api/v2/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 
 fn client_for(server: &MockServer) -> QuboClient {
     let base = server
@@ -98,6 +101,68 @@ async fn recorded_days_sorts_the_calendar_and_asks_the_documented_parameters() {
         query.get("timezone").map(String::as_str),
         Some("Asia/Kolkata"),
         "the household's own day decides what a day is"
+    );
+}
+
+#[tokio::test]
+async fn a_vod_mint_asks_for_the_instant_and_carries_the_url_back() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(VOD_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/mint_vod.json")),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let mint = mint_vod(&client, &session(), &device(), 1_792_089_000_000)
+        .await
+        .expect("the mint succeeds");
+
+    let payload: Value =
+        serde_json::from_str(include_str!("fixtures/mint_vod.json")).expect("fixture is JSON");
+    assert_eq!(
+        mint.url, payload["streamURL"],
+        "the URL comes from streamURL"
+    );
+    assert_eq!(
+        mint.session_id, payload["appSessionId"],
+        "the session id comes from appSessionId, not sessionId"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let query: HashMap<String, String> = requests[0]
+        .url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    assert_eq!(
+        query.get("timestamp").map(String::as_str),
+        Some("1792089000000"),
+        "the clip's own instant is asked for"
+    );
+    assert_eq!(
+        query.get("type").map(String::as_str),
+        Some("high"),
+        "playback asks for the high class"
+    );
+    assert_eq!(
+        query.get("streamSourceCamera").map(String::as_str),
+        Some("primary"),
+        "the primary camera source is requested"
+    );
+    assert_eq!(
+        query.get("singleRecord").map(String::as_str),
+        Some("0"),
+        "single recordings are what a timeline seeks in"
+    );
+
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("the body is JSON");
+    assert_eq!(
+        body["userAppID"],
+        client.device_id(),
+        "the client's device id is sent as userAppID"
     );
 }
 
