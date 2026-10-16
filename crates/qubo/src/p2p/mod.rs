@@ -861,9 +861,12 @@ impl ArmedSession {
     /// The next decrypted media packet. `Ok(None)` means the socket was idle
     /// for the read window - a liveness tick, not an end - unless no media
     /// has arrived within `media_timeout` of arming or the last packet, in
-    /// which case the session is silent: `Err(MediaSilence)`, so the
-    /// caller's pipeline falls back instead of pinning a viewer to a dead
-    /// source.
+    /// which case the session is silent: `Err(MediaSilence)`, which is what
+    /// lets the caller fall back instead of re-arming into the same silence.
+    ///
+    /// The bound is checked on every tick - an idle read window, a control
+    /// datagram and a rejected one alike - so a peer that keeps talking
+    /// without ever sending media cannot defer it.
     ///
     /// The accounting is the reference's receive loop exactly: control
     /// packets (small and cookie-tagged) are answered or skipped without
@@ -873,12 +876,13 @@ impl ArmedSession {
     pub async fn recv_media(&mut self) -> Result<Option<MediaPacket>, P2pError> {
         let mut buf = vec![0_u8; 4096];
         loop {
+            self.media_silence()?;
             let received = tokio::time::timeout(MEDIA_IDLE, self.socket.recv_from(&mut buf)).await;
             let (len, from) = match received {
                 Err(_elapsed) => {
-                    if self.last_media.elapsed() >= self.media_timeout {
-                        return Err(P2pError::MediaSilence(self.media_timeout));
-                    }
+                    // The wait itself is a tick; it may have crossed the
+                    // bound.
+                    self.media_silence()?;
                     return Ok(None);
                 }
                 Ok(Err(err)) => return Err(P2pError::Io(err)),
@@ -917,6 +921,15 @@ impl ArmedSession {
                 header,
             }));
         }
+    }
+
+    /// The silence bound as of right now: `Err(MediaSilence)` once no media
+    /// has arrived within it.
+    fn media_silence(&self) -> Result<(), P2pError> {
+        if self.last_media.elapsed() >= self.media_timeout {
+            return Err(P2pError::MediaSilence(self.media_timeout));
+        }
+        Ok(())
     }
 
     /// Send one control envelope as a `2001` data-channel frame - the
@@ -1512,8 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_session_ends_at_the_media_bound() {
         // Armed but never delivers media: the session reports silence, so
-        // the pipeline behind it falls back to the cloud path rather than
-        // pinning a viewer to a dead source.
+        // a caller can fall back instead of ticking on a dead source.
         let (mut session, _target, _sender) = media_session(
             "82458EA37F4740361F47B4E68946546F",
             "A3B6C1B75EEB65ACF59802CE5A6995B3",
@@ -1564,6 +1576,40 @@ mod tests {
             "past the bound the session is silent again, got {outcome:?}",
         );
         drop(feeder);
+    }
+
+    #[tokio::test]
+    async fn control_traffic_cannot_defer_the_silence_bound() {
+        // A peer that keeps answering with control datagrams (and junk)
+        // without ever sending media: the bound is evaluated on those ticks
+        // too, so the session still reports silence rather than ticking
+        // forever.
+        let (mut session, target, sender) = media_session(
+            "82458EA37F4740361F47B4E68946546F",
+            "A3B6C1B75EEB65ACF59802CE5A6995B3",
+            idle_client(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let chatter = tokio::spawn(async move {
+            let mut control = vec![0x20, 0x03, 0x00, 0x00];
+            control.extend_from_slice(&relay::COOKIE);
+            let junk = [0x00_u8; 4];
+            loop {
+                let _ = sender.send_to(&control, target).await;
+                let _ = sender.send_to(&junk, target).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), session.recv_media())
+            .await
+            .expect("the bound fires on control ticks, not only on idle windows");
+        assert!(
+            matches!(outcome, Err(P2pError::MediaSilence(_))),
+            "control traffic with no media is still silence, got {outcome:?}",
+        );
+        chatter.abort();
     }
 
     #[test]
