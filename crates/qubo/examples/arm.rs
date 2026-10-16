@@ -23,12 +23,14 @@
 //! The identity defaults are the capture's own (the phone's unit device),
 //! exactly what the Python reference ran with. Acceptance is the
 //! `relay engaged` debug line within ~1s of the register, then `extended
-//! SYN acked - session up`, then `[rtp]` lines appearing below.
+//! SYN acked - session up`, then `[rtp]` lines appearing below. A session
+//! that armed but never delivered media prints its tally and exits cleanly
+//! at the media bound - the negative readout, not an error.
 
 use std::error::Error;
 use std::time::Duration;
 
-use qubo::p2p::{AesMode, H264Assembler, P2pConfig, P2pEngine, P2pIdentity};
+use qubo::p2p::{AesMode, H264Assembler, P2pConfig, P2pEngine, P2pError, P2pIdentity};
 use qubo::{BASE_URL, Device, SessionStore};
 
 #[tokio::main]
@@ -93,8 +95,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut assembler = H264Assembler::new();
     let mut nals = 0_u32;
     while std::time::Instant::now() < deadline {
-        match armed.recv_media().await? {
-            Some(packet) => {
+        match armed.recv_media().await {
+            Ok(Some(packet)) => {
                 datagrams += 1;
                 payload_types.insert(packet.header().payload_type);
                 let payload = packet.payload();
@@ -114,7 +116,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
             }
-            None => println!("[arm] idle so far: {datagrams} datagrams"),
+            Ok(None) => println!("[arm] idle so far: {datagrams} datagrams"),
+            // The negative readout ends here cleanly, with the tally below.
+            Err(P2pError::MediaSilence(bound)) => {
+                println!("[arm] media silent for {bound:?}; the session ended");
+                break;
+            }
+            Err(err) => return Err(err.into()),
         }
     }
     println!("[arm] received {datagrams} datagrams; payload types {payload_types:?}");
