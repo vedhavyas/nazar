@@ -44,33 +44,7 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .with_hold(Arc::new(FfmpegHold::new(config.ffmpeg_bin.clone())));
-    // The fast lane is opt-in per camera; without a preference the server
-    // never arms it and the cloud path is the only one.
-    let supervisor = if config.prefer_p2p.is_empty() {
-        supervisor
-    } else {
-        // The signaling leg speaks with the SDK's own identity headers
-        // (protocol 5.2); the server's other calls keep the plain set.
-        let lane_client = qubo.clone().with_headers(vec![
-            (
-                "Login-Device-Name".to_owned(),
-                config.p2p_login_device_name.clone(),
-            ),
-            ("User-Agent".to_owned(), "libcurl-agent".to_owned()),
-        ]);
-        let lane = server::fast_lane::EngineLane::new(
-            lane_client,
-            sessions.clone(),
-            qubo::p2p::P2pIdentity {
-                self_device: config.p2p_self_device.clone(),
-                src_device_id: config.p2p_src_device_id.clone(),
-                camera_controller: config.p2p_camera_controller.clone(),
-            },
-            qubo::p2p::P2pConfig::default(),
-            config.data_dir.clone(),
-        );
-        supervisor.with_fast_lane(Arc::new(lane), config.prefer_p2p.clone())
-    };
+    let supervisor = with_fast_lane(&config, &qubo, &sessions, supervisor);
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);
@@ -143,4 +117,39 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, app(state)).await.context("serving")?;
     Ok(())
+}
+
+/// The supervisor with the fast lane wired in when any camera prefers it;
+/// without a preference the server never arms it and the cloud path is the
+/// only one.
+fn with_fast_lane(
+    config: &Config,
+    qubo: &QuboClient,
+    sessions: &SessionStore,
+    supervisor: Supervisor,
+) -> Supervisor {
+    if config.prefer_p2p.is_empty() {
+        return supervisor;
+    }
+    // The signaling leg speaks with the SDK's own identity headers
+    // (protocol 5.2); the server's other calls keep the plain set.
+    let lane_client = qubo.clone().with_headers(vec![
+        (
+            "Login-Device-Name".to_owned(),
+            config.p2p_login_device_name.clone(),
+        ),
+        ("User-Agent".to_owned(), "libcurl-agent".to_owned()),
+    ]);
+    let lane = server::fast_lane::EngineLane::new(
+        lane_client,
+        sessions.clone(),
+        qubo::p2p::P2pIdentity {
+            self_device: config.p2p_self_device.clone(),
+            src_device_id: config.p2p_src_device_id.clone(),
+            camera_controller: config.p2p_camera_controller.clone(),
+        },
+        qubo::p2p::P2pConfig::default(),
+        config.data_dir.clone(),
+    );
+    supervisor.with_fast_lane(Arc::new(lane), config.prefer_p2p.clone())
 }
