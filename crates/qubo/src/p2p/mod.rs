@@ -45,6 +45,20 @@ const BROKER_PORT: u16 = 8883;
 const BROKER_KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// Bound on requests in flight; the engine subscribes to one topic.
 const BROKER_CAPACITY: usize = 32;
+/// Broker reconnect backoff, the paho shape (the reference's client backs
+/// off 1s..120s; a session lives minutes, so the cap is the session's own
+/// scale). Without it, a broker that fails fast spins the pump.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The next reconnect delay: 1s, then doubling, capped.
+fn next_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        RETRY_MIN
+    } else {
+        (current * 2).min(RETRY_MAX)
+    }
+}
 
 /// How long a quiet media socket may be before `recv_media` reports idle.
 const MEDIA_IDLE: Duration = Duration::from_millis(500);
@@ -232,14 +246,13 @@ impl P2pEngine {
         let answer = self
             .wait_for_answer(&mut broker.answers, &session_id)
             .await?;
-        let (targets, relay_endpoint) = if let Some(answer) = &answer {
+        if let Some(answer) = &answer {
             tracing::debug!(
                 event = %answer.event,
                 handle = ?answer.handle_name,
                 candidates = ?candidate_endpoints(&answer.candidates),
                 "camera answered",
             );
-            handshake_targets(answer, &allocation)
         } else {
             // The reference proceeds on the relay leg alone when the answer
             // never lands - the relay endpoint comes from the allocation,
@@ -248,8 +261,8 @@ impl P2pEngine {
                 window = ?self.config.answer_timeout,
                 "no p2pCallStarted within the window; proceeding on the relay leg alone",
             );
-            (Vec::new(), relay_endpoint(&allocation))
-        };
+        }
+        let (targets, relay_endpoint) = handshake_plan(answer.as_ref(), &allocation);
         if targets.is_empty() && relay_endpoint.is_none() {
             return Err(P2pError::NoTargets);
         }
@@ -416,9 +429,11 @@ impl P2pEngine {
         let subscribe_client = client.clone();
         let monitor_topic = monitor_topic.to_owned();
         let pump = tokio::spawn(async move {
+            let mut backoff = Duration::ZERO;
             loop {
                 match eventloop.poll().await {
                     Ok(rumqttc::Event::Incoming(rumqttc::Incoming::ConnAck(_))) => {
+                        backoff = Duration::ZERO;
                         if let Err(err) = subscribe_client
                             .subscribe(monitor_topic.clone(), QoS::ExactlyOnce)
                             .await
@@ -435,11 +450,19 @@ impl P2pEngine {
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        // rumqttc's poll reconnects on its next call (its
-                        // own contract), and the reference's paho does the
-                        // same - so a blip must not end the leg; keep
-                        // polling and the ConnAck above re-subscribes.
-                        tracing::debug!(%err, "the p2p broker connection dropped; polling on");
+                        // rumqttc's poll reconnects on its next call (its own
+                        // contract), and the reference's paho does the same -
+                        // but poll carries no delay of its own, so a broker
+                        // that refuses fast would spin the loop. Back off
+                        // between attempts, and the ConnAck above
+                        // re-subscribes on the way back in.
+                        backoff = next_backoff(backoff);
+                        tracing::debug!(
+                            %err,
+                            backoff = ?backoff,
+                            "the p2p broker connection dropped; retrying",
+                        );
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
@@ -543,6 +566,19 @@ fn handshake_targets(
         .filter_map(|(ip, port)| relay::endpoint_of(ip, *port))
         .collect();
     (targets, relay_endpoint(allocation))
+}
+
+/// The handshake plan for one arm: the camera's candidates and the relay
+/// when the answer arrived; on a missing answer, the relay leg alone - the
+/// endpoint comes from the allocation, never from the answer.
+fn handshake_plan(
+    answer: Option<&Callback>,
+    allocation: &Allocation,
+) -> (Vec<SocketAddr>, Option<SocketAddr>) {
+    match answer {
+        Some(answer) => handshake_targets(answer, allocation),
+        None => (Vec::new(), relay_endpoint(allocation)),
+    }
 }
 
 /// The relay endpoint from the allocation, when it names one.
@@ -668,7 +704,15 @@ fn broker_options(session: &Session, unit: &str, config: &P2pConfig) -> rumqttc:
 /// connect probe would source from the tunnel - the exact failure the
 /// reference client's first live runs hit (`docs/qubo-findings.md`).
 fn default_route_ip() -> IpAddr {
-    route_table_ip().unwrap_or_else(udp_connect_ip)
+    preferred_ip(route_table_ip(), udp_connect_ip)
+}
+
+/// The table wins whenever it answers: a split-tunnel VPN leaves the
+/// default route on the physical interface while the connect probe would
+/// source from the tunnel (`docs/qubo-findings.md`), so the probe only
+/// stands in when the table does not answer.
+fn preferred_ip(table: Option<IpAddr>, probe: impl FnOnce() -> IpAddr) -> IpAddr {
+    table.unwrap_or_else(probe)
 }
 
 /// The default route's interface address, via the platform's own tools.
@@ -1430,6 +1474,145 @@ mod tests {
         assert!(
             matches!(session.push_audio(&[0xBB]).await, Err(P2pError::NotTalking)),
             "audio after the stop is refused, never swallowed"
+        );
+    }
+
+    #[test]
+    fn the_route_table_wins_over_the_connect_probe() {
+        // The split-tunnel VPN case: the table says the LAN address, the
+        // probe would say the tunnel's - the table's is what the camera
+        // must be offered.
+        let table: IpAddr = "192.0.2.140".parse().expect("an ip");
+        let tunnel: IpAddr = "198.51.100.15".parse().expect("an ip");
+        assert_eq!(
+            preferred_ip(Some(table), || tunnel),
+            table,
+            "the table's address wins whenever it answers"
+        );
+        assert_eq!(
+            preferred_ip(None, || tunnel),
+            tunnel,
+            "without a table answer the probe stands in"
+        );
+    }
+
+    #[test]
+    fn a_missing_answer_still_plans_the_relay_leg() {
+        let allocation = Allocation {
+            app_session_id: "session".to_owned(),
+            aes_key: "key".to_owned(),
+            aes_iv: "iv".to_owned(),
+            server_ip: Some("13.204.183.153".to_owned()),
+            server_port: Some(56329),
+        };
+        let relay: SocketAddr = "13.204.183.153:56329".parse().expect("an addr");
+
+        let (targets, plan) = handshake_plan(None, &allocation);
+        assert!(targets.is_empty(), "no answer means no camera candidates");
+        assert_eq!(
+            plan,
+            Some(relay),
+            "the relay leg comes from the allocation even with no answer"
+        );
+
+        let bare = Allocation {
+            server_ip: None,
+            server_port: None,
+            ..allocation.clone()
+        };
+        let (targets, plan) = handshake_plan(None, &bare);
+        assert!(
+            targets.is_empty() && plan.is_none(),
+            "an answer-less arm with no relay endpoint has no plan at all"
+        );
+
+        let answer = Callback {
+            event: "p2pCallStarted".to_owned(),
+            session_id: "session".to_owned(),
+            handle_name: None,
+            candidates: vec![Candidate {
+                host: Some("192.0.2.21:56839".to_owned()),
+                srflx: Vec::new(),
+            }],
+        };
+        let (targets, plan) = handshake_plan(Some(&answer), &allocation);
+        assert_eq!(
+            targets,
+            vec!["192.0.2.21:56839".parse().expect("an addr")],
+            "an answered arm plans the camera's candidates"
+        );
+        assert_eq!(plan, Some(relay), "and keeps the relay leg");
+    }
+
+    #[test]
+    fn the_reconnect_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_backoff(Duration::ZERO),
+            Duration::from_secs(1),
+            "the first retry waits a second, the paho minimum"
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(1)),
+            Duration::from_secs(2),
+            "then it doubles"
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(30)),
+            Duration::from_secs(30),
+            "and it caps at the session's scale"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fast_failing_broker_does_not_spin_the_pump() {
+        // A broker that accepts and immediately closes: every poll fails
+        // fast, and only the backoff bounds the attempts (measured at ~39k/s
+        // unbacked against a refused port).
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("bound address").port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        let acceptor = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(socket);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let engine = P2pEngine::new(
+            QuboClient::new(
+                "http://127.0.0.1:9".parse().expect("a url"),
+                crate::client::ServiceProvider::default(),
+            ),
+            P2pConfig {
+                broker_host: "127.0.0.1".to_owned(),
+                broker_port: port,
+                broker_tls: false,
+                ..P2pConfig::default()
+            },
+        );
+        let session = Session {
+            access_token: "t".to_owned(),
+            uuid: "u".to_owned(),
+            email: None,
+        };
+        let broker = engine.connect_broker(&session, "unit", "/monitor/unit/cam/p2pStreaming");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        broker.pump.abort();
+        acceptor.abort();
+
+        let attempts = accepts.load(Ordering::SeqCst);
+        assert!(attempts >= 1, "the pump did try to connect");
+        assert!(
+            attempts <= 3,
+            "the backoff bounds the attempts over 1.5s (saw {attempts})"
         );
     }
 
