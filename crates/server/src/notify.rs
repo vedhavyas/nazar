@@ -161,10 +161,14 @@ impl NotificationStore {
     /// that cannot be read is not fatal: the list starts empty.
     pub fn open(path: PathBuf, window: Duration) -> Self {
         let ledger = match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|err| {
-                tracing::warn!(%err, path = %path.display(), "the notification log is unreadable; starting empty");
-                Ledger::default()
-            }),
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(ledger) => ledger,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path.display(), "the notification log is unreadable; keeping it aside and starting empty");
+                    crate::episodes::preserve(&path);
+                    Ledger::default()
+                }
+            },
             Err(_) => Ledger::default(),
         };
         let (tx, _) = broadcast::channel(ANNOUNCE_CAPACITY);

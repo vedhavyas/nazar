@@ -126,6 +126,28 @@ fn an_episode_past_its_retention_is_forgotten() {
 }
 
 #[test]
+fn an_unreadable_log_is_kept_aside_not_overwritten() {
+    let dir = temp_dir("episodes-broken");
+    let path = dir.join("episodes.json");
+    std::fs::write(&path, "{ not json at all").expect("a broken log");
+
+    let store = EpisodeStore::open(path.clone(), COALESCE, KEEP_30_DAYS);
+    assert_eq!(store.list().len(), 0, "an unreadable log starts empty");
+
+    let backup = dir.join("episodes.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("the original is kept aside"),
+        "{ not json at all",
+        "the unreadable bytes survive: the next save must not erase whatever they were"
+    );
+
+    // And the store writes again, beside the kept original.
+    store.record("hall", now_ms(), None);
+    assert!(path.exists(), "the fresh log lands where the store expects it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_memory_survives_a_restart() {
     let dir = temp_dir("episodes-restart");
     {

@@ -46,13 +46,18 @@ pub struct EpisodeStore {
 impl EpisodeStore {
     /// Open the store at `path`, carrying what it already holds and
     /// trimming anything past `retention`. A file that cannot be read is
-    /// not fatal: the memory starts empty.
+    /// not fatal - the memory starts empty - but it is kept aside, never
+    /// overwritten: the next save would erase whatever was in it.
     pub fn open(path: PathBuf, window: Duration, retention: Duration) -> Self {
         let mut ledger = match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|err| {
-                tracing::warn!(%err, path = %path.display(), "the episode log is unreadable; starting empty");
-                Ledger::default()
-            }),
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(ledger) => ledger,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path.display(), "the episode log is unreadable; keeping it aside and starting empty");
+                    preserve(&path);
+                    Ledger::default()
+                }
+            },
             Err(_) => Ledger::default(),
         };
         trim(&mut ledger, retention, now_ms());
@@ -128,6 +133,15 @@ impl EpisodeStore {
         if let Err(err) = write() {
             tracing::warn!(%err, path = %self.path.display(), "the episode log did not save");
         }
+    }
+}
+
+/// Move an unreadable log aside, `x.json` to `x.bak`, so the evidence in
+/// it survives the next save.
+pub(crate) fn preserve(path: &std::path::Path) {
+    let backup = path.with_extension("bak");
+    if let Err(err) = std::fs::rename(path, &backup) {
+        tracing::warn!(%err, path = %path.display(), "the unreadable log could not be set aside");
     }
 }
 
