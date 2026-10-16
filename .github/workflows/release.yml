@@ -6,8 +6,10 @@ name: Release shells
 #
 # A tag WITHOUT a suffix publishes; a `-test` tag is a dry run that only
 # uploads workflow artifacts, so the tag space can never collide with a
-# real version and no half-signed release can appear. The Android half
-# joins these steps when that shell ships.
+# real version and no half-signed release can appear. A tag that does not
+# name the shell crate's own version is the server's cut, and the desktop
+# half skips rather than fail its signature check. The Android half joins
+# these steps when that shell ships.
 
 on:
   push:
@@ -15,8 +17,30 @@ on:
       - 'v*'
 
 jobs:
+  shell:
+    name: is the tag the shell's version?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      shell: ${{ steps.shell.outputs.shell }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: shell
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          shell_version=$(python3 -c "import tomllib; print(tomllib.load(open('web/src-tauri/Cargo.toml','rb'))['package']['version'])")
+          if [ "${version%-test}" = "$shell_version" ]; then
+            echo "shell=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "shell=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${GITHUB_REF_NAME} is not the shell's version ($shell_version); the desktop release is skipped"
+          fi
+
   desktop:
     name: desktop bundle, signature and manifest
+    needs: shell
+    if: needs.shell.outputs.shell == 'true'
     runs-on: macos-latest
     permissions:
       contents: read
