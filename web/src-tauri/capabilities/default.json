@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The shell's own window, with the notification plugin's API reachable from the web: the bridge's fallback probing calls it, and without a grant the plugin's own injected script is denied on every launch.",
+  "windows": ["main"],
+  "permissions": ["core:default", "notification:default"]
+}
