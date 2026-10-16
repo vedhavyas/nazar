@@ -47,6 +47,13 @@ pub fn clips_for(store: &EpisodeStore, device_id: &str, day: &str) -> Option<Vec
 const IST_OFFSET_MS: i64 = 5 * 3_600_000 + 30 * 60_000;
 const DAY_MS: i64 = 86_400_000;
 
+/// The start of the household's day containing `at_ms`: the store's
+/// retention trims at these boundaries, so a day never empties through the
+/// day as the clock advances.
+pub(crate) fn ist_day_start(at_ms: i64) -> i64 {
+    (at_ms + IST_OFFSET_MS).div_euclid(DAY_MS) * DAY_MS - IST_OFFSET_MS
+}
+
 /// The household's day `DD-MM-YYYY` as `[start, end)` in epoch
 /// milliseconds.
 fn ist_day_bounds(day: &str) -> Option<(i64, i64)> {

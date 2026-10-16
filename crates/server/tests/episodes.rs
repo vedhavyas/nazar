@@ -110,18 +110,9 @@ fn an_episode_past_its_retention_is_forgotten() {
         aged.list()
     );
 
-    // And a long-running process ages them out in place: a marker is
-    // trimmed by the record that finds it past the window, restart or no.
-    let tight = EpisodeStore::open(dir.join("tight.json"), COALESCE, Duration::from_millis(200));
-    tight.record("hall", now_ms(), None);
-    std::thread::sleep(Duration::from_millis(300));
-    tight.record("gate", now_ms(), None);
-    assert_eq!(
-        tight.list().len(),
-        1,
-        "the record past the window trimmed the old marker: {:?}",
-        tight.list()
-    );
+    // The in-place trim's whole-day semantics live in the store's own unit
+    // tests (`retention_drops_whole_days_only`): a sub-day retention cannot
+    // be observed through this clock, since retention now drops whole days.
     let _ = std::fs::remove_dir_all(&dir);
 }
 
