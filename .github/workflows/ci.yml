@@ -42,6 +42,28 @@ jobs:
       - run: npm --prefix web test
       - run: npm --prefix web run build
 
+  shell:
+    name: tauri shell builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The shell crate is its own workspace root; its target dir sits
+          # under web/src-tauri.
+          workspaces: web/src-tauri
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Tauri on linux compiles against the webkit2gtk stack.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - run: npm --prefix web ci
+      - run: npm --prefix web run tauri -- build --no-bundle --ci -- --locked
+
   image:
     name: docker build
     runs-on: ubuntu-latest

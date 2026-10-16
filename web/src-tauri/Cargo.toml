@@ -1,0 +1,30 @@
+[package]
+name = "nazar-shell"
+version = "0.1.0"
+description = "The nazar desktop and Android shell"
+edition = "2024"
+
+# Its own workspace root, so the crate above is not a member of nazar's: the
+# shell links the whole webview stack, which is minutes of compile the
+# workspace gate should not carry for every Rust-only change. `just
+# shell-check` builds it.
+[workspace]
+
+[lib]
+# The Android target links the app as a native library; a binary-only crate
+# gives `tauri android build` no library target to build.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `generate_context!` embeds the config's `plugins` section through serde_json.
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-log = "2"
+
+# Desktop-only: no plugin path exists for Android, where the APK updates
+# through the system installer instead (a Kotlin side of its own).
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"
