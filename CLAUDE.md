@@ -14,7 +14,7 @@ Status: designed - the approved design is `docs/design.md` (the contract the imp
 ## Hard facts from the research (do not re-derive)
 
 - Login: the raw phone-OTP verify gives a 1h session with no refresh token, BUT the app's own OTP login does not stay there - its profile-select step mints a refreshToken with a 180-day expiry (measured in-app 2026-10-16, docs/qubo-findings.md). Google sign-in also returns a refreshToken (durable path). Email is display-only on phone-created accounts.
-- Streaming: per-session RTSPS mint (`/stream-manager/.../v1/live/...`), session ~5 min, one unconsumed URL dies ~1 min; go2rtc + ffmpeg transcode works (see the spike).
+- Streaming: per-session RTSPS mint (`/stream-manager/.../v1/live/...`); the URL is one-shot per attach - after its first consumer leaves (or after any failed attach) the same URL is dead, so retries must re-mint, and the camera's push can lag seconds after a mint (measured 2026-10-16, spec section on the mint). go2rtc + ffmpeg transcode works (see the spike).
 - Controls: PUT command envelope `{topic, payload:{devices:{deviceUUID, services:{<svc>:{attributes...}}}}}`; the camera ACKs everything 200 regardless - always read the shadow back.
 - MQTT: username = account userUUID, password = a live accessToken; topics `/monitor/<unit>/<device>/<svc>`, `/control/...`, `/config/<unit>`.
 - P2P: pairing is relay-initiated and the relay's forwarding is armed server-side for genuine app-session SDK sessions; a standalone client cannot trigger it. The real app's own sessions may inherit this - verify when built.
