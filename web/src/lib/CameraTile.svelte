@@ -78,8 +78,8 @@
         {attempt}
         muted
         onsettled={(state) => {
-          if (state === 'hls') {
-            fallingBack = true;
+          if (state === 'hls' || state === 'recovered') {
+            fallingBack = state === 'hls';
             stalled = null;
             return;
           }

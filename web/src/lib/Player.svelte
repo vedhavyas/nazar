@@ -19,8 +19,9 @@
     attempt?: number;
     /** Told when the picture was not there: 'start' for a socket that never
      * negotiated (and no HLS to fall back to), 'frozen' for one that
-     * stopped, 'hls' for a fallback that took over. */
-    onsettled?: (state: 'start' | 'frozen' | 'hls') => void;
+     * stopped, 'hls' for a fallback that took over, 'recovered' for a
+     * picture that was started again on coming back to the tab. */
+    onsettled?: (state: 'start' | 'frozen' | 'hls' | 'recovered') => void;
   } = $props();
 
   /** How long a first frame may take before WebRTC is given up on. */
@@ -43,6 +44,8 @@
 
   let host = $state<HTMLDivElement | null>(null);
   let fallback = $state(false);
+  /** Bumped when the picture is started again after the tab came back. */
+  let rebuilt = $state(0);
   /** The browser plays HLS itself; nothing needs loading. */
   let native = $state(true);
   let picture = $state<HTMLVideoElement | null>(null);
@@ -104,6 +107,7 @@
     const name = stream;
     if (!stage || !name || fallback) return;
     void attempt; // retrying rebuilds the player
+    void rebuilt; // so does coming back to a picture that did not
 
     const player = document.createElement('video-rtc') as VideoRtcElement;
     player.className = 'player';
@@ -122,31 +126,74 @@
         onsettled?.(taken ? 'hls' : state);
       });
     };
-    const timer = setTimeout(() => stall('start'), START_WINDOW_MS);
+    let timer: ReturnType<typeof setTimeout> | null = setTimeout(
+      () => stall('start'),
+      START_WINDOW_MS,
+    );
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
-    const onplaying = () => {
-      clearTimeout(timer);
-      if (watching) return;
-      watching = setInterval(() => {
-        const video = player.querySelector('video');
-        if (!video) return;
-        if (video.currentTime <= lastTime) {
-          if (watching) clearInterval(watching);
-          watching = null;
-          stall('frozen');
-          return;
-        }
-        lastTime = video.currentTime;
-      }, WATCH_EVERY_MS);
+    let playing = false;
+    /** Where the clock stood when the tab was hidden, if it had started. */
+    let awayAt = -1;
+
+    const tick = () => {
+      const video = player.querySelector('video');
+      if (!video) return;
+      if (video.currentTime <= lastTime) {
+        if (watching) clearInterval(watching);
+        watching = null;
+        stall('frozen');
+        return;
+      }
+      lastTime = video.currentTime;
     };
+    const watch = () => {
+      if (watching) return;
+      watching = setInterval(tick, WATCH_EVERY_MS);
+    };
+    const onplaying = () => {
+      playing = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      watch();
+    };
+
+    // A background tab is not a stalled picture: Chromium throttles it and
+    // may drop the peer behind its back, so the watch stands down while it
+    // cannot see, and the picture is started again on return when the clock
+    // did not follow us back - a dropped peer never re-attaches on its own.
+    const onVisibility = () => {
+      const video = player.querySelector('video');
+      if (document.hidden) {
+        awayAt = playing && video ? video.currentTime : -1;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (watching) clearInterval(watching);
+        watching = null;
+        return;
+      }
+      const here = video ? video.currentTime : -1;
+      if (!playing || (awayAt >= 0 && here <= awayAt)) {
+        fallback = false;
+        rebuilt += 1;
+        onsettled?.('recovered');
+        return;
+      }
+      // Still the same picture: watch it again from where it stands.
+      awayAt = -1;
+      lastTime = -1;
+      watch();
+    };
+
     const video = player.querySelector('video');
     video?.addEventListener('playing', onplaying);
+    document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (watching) clearInterval(watching);
       video?.removeEventListener('playing', onplaying);
+      document.removeEventListener('visibilitychange', onVisibility);
       player.remove();
     };
   });

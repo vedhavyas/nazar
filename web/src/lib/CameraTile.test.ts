@@ -316,6 +316,10 @@ test('a backgrounded tab is never called a stalled picture', async () => {
   await vi.advanceTimersByTimeAsync(60000);
   expect(screen.queryByText(/stopped/), 'away is not a freeze').toBeNull();
   expect(document.querySelectorAll('video-rtc').length, 'and nothing rebuilt').toBe(1);
+  expect(
+    document.querySelector('script[src="/hls.min.js"]'),
+    'no stall was even considered while the page could not see',
+  ).toBeNull();
 
   // Back, with the picture still moving: the watch resumes where it was.
   video.currentTime = 64;
@@ -344,14 +348,17 @@ test('a picture that did not follow us back is started again', async () => {
   setHidden(false);
   await vi.advanceTimersByTimeAsync(50);
 
-  expect(onwatch, 'the tile asks for the stream again').toHaveBeenCalledWith('cam-1');
   expect(
     document.querySelector('video-rtc'),
-    'and the dead player was replaced rather than left on the screen',
+    'the dead player was replaced rather than left on the screen',
   ).not.toBe(first);
   expect(
     document.querySelectorAll('video-rtc').length,
     'one player at a time, the new one',
   ).toBe(1);
+  expect(
+    onwatch,
+    'the same stream is asked for again, so the server need not be troubled',
+  ).not.toHaveBeenCalled();
   expect(screen.queryByText(/stopped/), 'the recovery is not framed as a failure').toBeNull();
 });
