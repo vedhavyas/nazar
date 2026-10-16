@@ -1,6 +1,7 @@
 <script lang="ts">
   /** The picture: go2rtc's WebRTC signalling, with HLS as the fallback for
    * a network where the socket cannot negotiate (design §5). */
+  import { untrack } from 'svelte';
   import { serverBase } from './api';
 
   interface VideoRtcElement extends HTMLElement {
@@ -13,12 +14,18 @@
     stream,
     muted = true,
     attempt = 0,
+    waiting = false,
     onsettled,
   }: {
     stream: string;
     muted?: boolean;
     /** Bump this to start the picture over from the WebRTC socket. */
     attempt?: number;
+    /** The server is still bringing the stream up (`waking`): the start
+     * window must not run yet - there is no picture to negotiate - and it
+     * opens the moment the state leaves waking. The server's own window
+     * can outlast this player's many times over. */
+    waiting?: boolean;
     /** Told when the picture was not there: 'start' for a socket that never
      * negotiated (and no HLS to fall back to), 'frozen' for one that
      * stopped, 'hls' for a fallback that took over, 'recovered' for a
@@ -50,6 +57,9 @@
   }
 
   let host = $state<HTMLDivElement | null>(null);
+  /** Arms the start window once the server stops waking; installed by the
+   * setup effect so the waiting flip never rebuilds the player. */
+  let armStartFor = $state<(() => void) | null>(null);
   let fallback = $state(false);
   /** Bumped when the picture is started again after the tab came back. */
   let rebuilt = $state(0);
@@ -133,10 +143,7 @@
         onsettled?.(taken ? 'hls' : state, playhead);
       });
     };
-    let timer: ReturnType<typeof setTimeout> | null = setTimeout(
-      () => stall('start'),
-      START_WINDOW_MS,
-    );
+    let timer: ReturnType<typeof setTimeout> | null = null;
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
     let playing = false;
@@ -144,6 +151,19 @@
     let paused = false;
     /** Where the clock stood when the tab was hidden, if it had started. */
     let awayAt = -1;
+
+    /** Open the start window. Held back while the server is still waking
+     * (there is no picture to negotiate yet, and its window can outlast
+     * this one many times over); the waiting effect arms it then. */
+    const armStart = () => {
+      if (timer || playing) return;
+      timer = setTimeout(() => stall('start'), START_WINDOW_MS);
+    };
+    if (untrack(() => waiting)) {
+      armStartFor = armStart;
+    } else {
+      armStart();
+    }
 
     const tick = () => {
       const video = player.querySelector('video');
@@ -210,6 +230,7 @@
     document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
+      if (armStartFor === armStart) armStartFor = null;
       if (timer) clearTimeout(timer);
       if (watching) clearInterval(watching);
       video?.removeEventListener('playing', onplaying);
@@ -217,6 +238,15 @@
       document.removeEventListener('visibilitychange', onVisibility);
       player.remove();
     };
+  });
+
+  // Leaving waking opens the start window: the arm is taken here rather
+  // than in the setup effect so a waiting flip never rebuilds the player.
+  $effect(() => {
+    if (waiting || !armStartFor) return;
+    const arm = armStartFor;
+    armStartFor = null;
+    arm();
   });
 
   // The fallback is a picture like any other: a stalled one must not stand

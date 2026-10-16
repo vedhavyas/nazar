@@ -71,11 +71,12 @@
     <span class="state" data-state={camera.state}>{STATE_WORDS[camera.state]}</span>
   </header>
 
-  {#if camera.state === 'live' && stream}
+  {#if (camera.state === 'live' || camera.state === 'waking') && stream}
     <div class="picture" class:hidden={still && !stalled} bind:this={picture}>
       <Player
         {stream}
         {attempt}
+        waiting={camera.state === 'waking'}
         muted
         onsettled={(state) => {
           if (state === 'hls' || state === 'recovered') {
@@ -92,6 +93,12 @@
           stalled = state;
         }}
       />
+      {#if camera.state === 'waking'}
+        <!-- Waking keeps the player mounted: unmounting tore the picture
+             down, and a remount re-negotiated it - the flip that made a
+             refocus look like a restart. -->
+        <div class="spinner" role="status" aria-label="Starting the stream"></div>
+      {/if}
     </div>
     {#if still && !stalled}
       <canvas class="still" bind:this={snapshot}></canvas>
@@ -177,6 +184,43 @@
   /* Away mode hides the live picture behind the still it feeds. */
   .picture.hidden {
     display: none;
+  }
+
+  .picture {
+    position: relative;
+  }
+
+  .spinner {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+
+  .spinner::after {
+    content: '';
+    width: 28px;
+    height: 28px;
+    border: 3px solid var(--line);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner::after {
+      /* A turned-off rotation still reads as waiting. */
+      animation: none;
+      border-color: var(--accent);
+    }
   }
 
   .still {

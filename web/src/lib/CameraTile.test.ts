@@ -202,6 +202,45 @@ test('away mode shows a still over the tile it already streams', async () => {
   ).toBeTruthy();
 });
 
+test('a waking tile keeps its player mounted and shows a spinner', () => {
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'waking', reason: null },
+    stream: 'cam-1-low',
+    onwatch,
+  });
+
+  expect(
+    document.querySelector('video-rtc'),
+    'the waking tile keeps its player: unmounting and remounting is the flip that restarted the picture',
+  ).toBeTruthy();
+  expect(
+    document.querySelector('.spinner'),
+    'and a spinner says it is still starting',
+  ).toBeTruthy();
+});
+
+test('a waking tile does not run the player start window', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'waking', reason: null },
+    stream: 'cam-1-low',
+    onwatch,
+  });
+
+  await vi.advanceTimersByTimeAsync(20000);
+  expect(
+    document.querySelector('script[src="/hls.min.js"]'),
+    'no fallback was ever reached: the start window never ran while the server was waking',
+  ).toBeNull();
+  expect(
+    screen.queryByText(/did not start/),
+    'and nothing was declared a failure for a stream the server is still bringing up',
+  ).toBeNull();
+});
+
 test('a live tile carries no still', () => {
   liveTile();
 
