@@ -126,8 +126,9 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
     );
 
     let config = std::fs::read_to_string(go2rtc.config_path()).expect("the config is written");
-    assert!(
-        config.contains("listen: \"127.0.0.1:1984\""),
+    assert_eq!(
+        listen_of(&config, "api").as_deref(),
+        Some("127.0.0.1:1984"),
         "the API binds loopback only"
     );
     assert!(
@@ -150,8 +151,9 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
         config.contains("candidates:") && config.contains("198.51.100.1:8555"),
         "the configured WebRTC candidate reaches the generated config"
     );
-    assert!(
-        config.contains("rtsp:") && config.contains("\"127.0.0.1:8554\""),
+    assert_eq!(
+        listen_of(&config, "rtsp").as_deref(),
+        Some("127.0.0.1:8554"),
         "the chain's rtsp listener is pinned to loopback: go2rtc's default exposes :8554 on every interface"
     );
 
@@ -187,6 +189,29 @@ async fn no_webrtc_section_without_a_configured_candidate() {
     );
 
     go2rtc.stop().await.expect("stop kills the fake binary");
+}
+
+/// The `listen:` value under a top-level `section:`, as the generated
+/// config carries it. go2rtc reads the section, not the text: a commented
+/// or misplaced pair must not count as a listener.
+fn listen_of(config: &str, section: &str) -> Option<String> {
+    let mut inside = false;
+    for line in config.lines() {
+        if line == format!("{section}:") {
+            inside = true;
+            continue;
+        }
+        if !inside || line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            return None; // the section ended without a listener
+        }
+        if let Some(value) = line.trim().strip_prefix("listen:") {
+            return Some(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
 }
 
 /// Where the fake binary records its argv: beside its own config, so
