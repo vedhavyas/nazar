@@ -179,7 +179,7 @@ fn control_frame_matches_the_captured_pan_command() {
     );
 
     // A json length that is not a multiple of four is zero-padded, as the
-    // capture's odd-length 2001 frame (0x1cc) shows.
+    // capture's frame 2218 shows (its 477-byte JSON pads by 3).
     let frame = relay::control_frame(&txid, b"{}abc", &[0u8; 20]).expect("fits a u16 length");
     assert_eq!(
         frame.len(),

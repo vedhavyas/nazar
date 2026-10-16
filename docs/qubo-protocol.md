@@ -691,11 +691,19 @@ the simple SYN with the same name until the peer answers, then stops it.
 
 Once a leg is up, control commands ride it as `2001` frames instead of MQTT. Captured 09:27
 while the app panned the camera (frames 1886, 2024, 2218, 2442, 3012, 3166, 3354, 3356 -
-11.2s to 21.4s into the session, over the relay socket 52233):
+11.2s to 21.4s into the session, over the relay socket 52233). Frame 1886, byte-exact
+(the earlier reading of this frame was wrong and is corrected here - what looked like an
+unpinned 1-byte field is the JSON attribute's own `7001` header and 2-byte length):
 
 ```
-2001 <len16> 244a2112 <13B name> 0101 <1B> {json command envelope} 0008 0014 <20B nonce>
+2001 01f8 244a2112 <12B txid> 7001 01dc {476B json command envelope} 0008 0014 <20B nonce>
 ```
+
+`len16` counts everything after the 20-byte header: the JSON attribute (4-byte header + JSON
++ zero-padding to the 4-byte boundary) plus the nonce attribute. So 0x01f8 = 504 = 4 + 476 +
+0 + 24; frame 2218's 477-byte JSON pads by 3 (0x01fc = 508 = 4 + 477 + 3 + 24), and frame
+2024's 430-byte one by 2. The 12 bytes after the cookie are a fresh txid from the same
+monotonic generator as the handshake's.
 
 The JSON is the section 4.2 envelope in plaintext (unlike RTP), e.g. frame 1886:
 
@@ -706,10 +714,9 @@ The JSON is the section 4.2 envelope in plaintext (unlike RTP), e.g. frame 1886:
  "timestamp": 1791950277327}
 ```
 
-Actions seen: `startPan` (LEFT/RIGHT), `stopPan`, one command per user tap. `len16` counts
-the JSON plus the trailing nonce (0x01f8 = 484 + 20); the 1-byte field between `0101` and the
-JSON is not pinned yet [UNCERTAIN]. This is `sendCommandFromDataChannel` on the SDK side -
-the low-latency twin of the MQTT `/control` path, used during a live session.
+Actions seen: `startPan` (LEFT/RIGHT), `stopPan`, one command per user tap. This is
+`sendCommandFromDataChannel` on the SDK side - the low-latency twin of the MQTT `/control`
+path, used during a live session.
 
 ### 6.8 The relay client anatomy - from the SDK's own libraries
 
