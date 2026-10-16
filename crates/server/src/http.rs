@@ -28,6 +28,7 @@ use crate::events::EventBus;
 use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
+use crate::recordings::clips_for;
 use crate::supervisor::{StreamState, Supervisor, SupervisorError, stream_name};
 
 /// The built SPA. Debug builds read it from disk; release builds embed it.
@@ -216,6 +217,11 @@ pub fn app(state: AppState) -> Router {
             get(camera_privacy_state).post(camera_privacy),
         )
         .route("/api/motion/hero", get(motion_hero))
+        .route(
+            "/api/cameras/{id}/recordings/days",
+            get(camera_recording_days),
+        )
+        .route("/api/cameras/{id}/recordings", get(camera_recordings))
         .route("/api/notifications", get(notifications))
         .route("/api/snaps/{id}", get(snap))
         .route("/api/events", get(events_socket))
@@ -320,6 +326,66 @@ async fn camera_live(
         .ensure(&id, quality, query.retry.unwrap_or(false))
         .await?;
     Ok(Json(json!({ "stream": stream_name(&id, quality) })))
+}
+
+#[derive(Deserialize)]
+struct DaysQuery {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+/// The days the cloud holds recordings for, oldest first.
+async fn camera_recording_days(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DaysQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (Some(from), Some(to)) = (query.from, query.to) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "the window needs ?from&to in epoch milliseconds",
+        ));
+    };
+    let (device, session) = control_target(&state, &id).await?;
+    let days = qubo::recorded_days(&state.qubo, &session, &device, from, to).await?;
+    Ok(Json(json!({ "days": days })))
+}
+
+#[derive(Deserialize)]
+struct ClipsQuery {
+    day: Option<String>,
+}
+
+/// A day's segments: the house's own motion memory, since the cloud lists
+/// no clips.
+async fn camera_recordings(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ClipsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(day) = query.day else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "the day needs ?day=DD-MM-YYYY",
+        ));
+    };
+    ensure_devices(&state).await?;
+    let known = state
+        .supervisor
+        .devices()
+        .await
+        .iter()
+        .any(|device| device.device_id == id);
+    if !known {
+        return Err(SupervisorError::UnknownDevice(id).into());
+    }
+    let clips = clips_for(&state.notifications, &id, &day).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("day {day} is not DD-MM-YYYY"),
+        )
+    })?;
+    Ok(Json(json!({ "clips": clips })))
 }
 
 /// The camera the house is watching: the supervisor's hysteresis decision,

@@ -142,6 +142,17 @@ impl QuboClient {
         self.send(Method::POST, path, &[], Some(body), auth).await
     }
 
+    /// GET `path` with query parameters, authenticated when a session is
+    /// given.
+    pub async fn get_json_query(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        auth: Option<&Session>,
+    ) -> Result<Value, QuboError> {
+        self.send(Method::GET, path, query, None, auth).await
+    }
+
     /// POST a JSON `body` to `path` with query parameters, authenticated
     /// when a session is given.
     pub async fn post_json_query(

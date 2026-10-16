@@ -11,4 +11,5 @@ pub mod http;
 pub mod motion;
 pub mod mqtt;
 pub mod notify;
+pub mod recordings;
 pub mod supervisor;
