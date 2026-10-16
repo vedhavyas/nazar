@@ -22,6 +22,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "android": {
       "minSdkVersion": 26
     },
@@ -32,5 +33,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhDQUNDRkYyOTFDMEEwRDcKUldUWG9NQ1I4cytzakJiYnJkMGVjaERQV0RrRXNvNjZxcWdOd3M5dXFzVEpaNjVnSUZMR0E2c2wK",
+      "endpoints": [
+        "https://github.com/vedhavyas/nazar-releases/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
   }
 }

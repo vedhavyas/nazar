@@ -1,0 +1,76 @@
+name: Release shells
+
+# The desktop shell's release artifacts: the signed update tarball, its
+# signature, and latest.json - published to vedhavyas/nazar-releases, whose
+# releases are public so an installed app can reach them from anywhere.
+#
+# A tag WITHOUT a suffix publishes; a `-test` tag is a dry run that only
+# uploads workflow artifacts, so the tag space can never collide with a
+# real version and no half-signed release can appear. The Android half
+# joins these steps when that shell ships.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  desktop:
+    name: desktop bundle, signature and manifest
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The shell crate is its own workspace root; its target dir sits
+          # under web/src-tauri.
+          workspaces: web/src-tauri
+      - name: Version from the tag
+        id: version
+        run: |
+          # The shell's own version is what the app reports and what the
+          # updater compares against; a -test suffix is the dry run's, not
+          # the app's.
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version%-test}" >> "$GITHUB_OUTPUT"
+      - run: npm --prefix web ci
+      - name: Build and sign the app bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm --prefix web run tauri -- build --bundles app --ci -- --locked
+      - name: The signature is from the pinned key, for this version
+        run: python3 scripts/check_updater_signature.py . ${{ steps.version.outputs.version }}
+      - name: The manifest names what was built
+        run: python3 scripts/update_manifest.py . ${{ steps.version.outputs.version }}
+      - name: Keep the dry run's artifacts
+        if: endsWith(github.ref_name, '-test')
+        uses: actions/upload-artifact@v4
+        with:
+          name: nazar-desktop-${{ github.ref_name }}
+          path: |
+            web/src-tauri/target/release/bundle/macos/nazar.app.tar.gz
+            web/src-tauri/target/release/bundle/macos/nazar.app.tar.gz.sig
+            web/src-tauri/target/release/bundle/latest.json
+      - name: Publish the release
+        if: ${{ !endsWith(github.ref_name, '-test') }}
+        env:
+          # A token with contents: write on nazar-releases: the workflow's
+          # own token cannot reach another repository's releases.
+          GH_TOKEN: ${{ secrets.NAZAR_RELEASES_TOKEN }}
+        run: |
+          bundle=web/src-tauri/target/release/bundle
+          gh release create "$GITHUB_REF_NAME" \
+            -R vedhavyas/nazar-releases \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "$bundle/macos/nazar.app.tar.gz" \
+            "$bundle/macos/nazar.app.tar.gz.sig" \
+            "$bundle/latest.json"
