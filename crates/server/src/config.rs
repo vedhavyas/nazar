@@ -107,15 +107,17 @@ pub fn aqi_line(raw: Option<&str>) -> u32 {
 }
 
 /// The timeline's retention from its environment value: anything that is
-/// not a number keeps the default.
+/// not a positive number of days keeps the default - zero would silently
+/// disable the timeline, which no one asking for a retention window means.
 pub fn retention_days(raw: Option<&str>) -> u32 {
-    raw.map_or(EPISODE_RETENTION_DAYS, |raw| {
-        raw.parse().unwrap_or_else(|_| {
+    raw.map_or(EPISODE_RETENTION_DAYS, |raw| match raw.parse::<u32>() {
+        Ok(days) if days > 0 => days,
+        _ => {
             tracing::warn!(
                 value = %raw,
-                "NAZAR_EPISODE_RETENTION_DAYS is not a number; keeping the default"
+                "NAZAR_EPISODE_RETENTION_DAYS is not a positive number of days; keeping the default"
             );
             EPISODE_RETENTION_DAYS
-        })
+        }
     })
 }
