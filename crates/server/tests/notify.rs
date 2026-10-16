@@ -290,6 +290,7 @@ struct Harness {
     store: Arc<NotificationStore>,
     episodes: Arc<EpisodeStore>,
     supervisor: Supervisor,
+    data_dir: std::path::PathBuf,
     /// The bus the service follows: events go in here, not into the store.
     events: EventBus,
 }
@@ -356,6 +357,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
         store,
         episodes,
         supervisor,
+        data_dir,
         events,
     }
 }
@@ -580,6 +582,36 @@ async fn the_bell_rings_before_the_still_is_resolved() {
     })
     .await;
     assert!(attached, "and the still attaches when it lands");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stills are written per event and their entries age out; a file neither
+/// store references any more must not outlive them.
+#[tokio::test]
+async fn a_still_no_entry_references_is_swept() {
+    let dir = temp_dir("notify-sweep");
+    let store = store_in(&dir);
+    let h = harness(Arc::clone(&store)).await;
+
+    // A stray from an earlier life, beside a still its entry still holds.
+    let snaps = h.data_dir.join("snaps");
+    std::fs::create_dir_all(&snaps).expect("the stills directory");
+    std::fs::write(snaps.join("ghost-1.jpg"), b"ghost").expect("a stray still");
+    store.push(&motion(CAMERA), Instant::now());
+    let id = store.list()[0].id.clone();
+    store.attach(&id, format!("/api/snaps/{id}"));
+    let kept = format!("{id}.jpg");
+    std::fs::write(snaps.join(&kept), b"kept").expect("a referenced still");
+
+    // Any motion triggers the sweep, restart or no. Another camera's, so
+    // it records its own marker rather than coalescing into the pushed one.
+    h.events.publish(motion("elsewhere"));
+    let swept = common::eventually(|| async { !snaps.join("ghost-1.jpg").exists() }).await;
+    assert!(swept, "the stray still is dropped with the markers");
+    assert!(
+        snaps.join(&kept).exists(),
+        "and a still a live entry references stays"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

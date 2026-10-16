@@ -330,6 +330,62 @@ impl Snapshots {
             .ok()
             .flatten()
     }
+
+    /// Drop the stills no live entry references. Stills are written per
+    /// event and their entries age out (the bell's ring, the timeline's
+    /// retention), so without this the directory grows without bound while
+    /// nothing can reach the files.
+    pub async fn sweep(&self, keep: std::collections::HashSet<String>) {
+        let dir = self.dir.clone();
+        let swept = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                // No directory yet: nothing was ever written.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(err) => return Err(err),
+            };
+            let mut dropped = 0;
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(stem) = std::path::Path::new(&name)
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                else {
+                    continue;
+                };
+                if !keep.contains(stem) {
+                    std::fs::remove_file(entry.path())?;
+                    dropped += 1;
+                }
+            }
+            Ok(dropped)
+        })
+        .await;
+        match swept {
+            Ok(Ok(0)) => {}
+            Ok(Ok(dropped)) => tracing::debug!(dropped, "unreferenced stills dropped"),
+            other => tracing::warn!(?other, "the still sweep failed"),
+        }
+    }
+}
+
+/// The still ids the two stores still reference: a still is kept while the
+/// bell holds its entry or the timeline holds its marker, and dropped when
+/// neither does.
+fn still_ids(store: &NotificationStore, episodes: &EpisodeStore) -> std::collections::HashSet<String> {
+    let urls = store
+        .list()
+        .into_iter()
+        .filter_map(|entry| entry.snapshot_url)
+        .chain(
+            episodes
+                .list()
+                .into_iter()
+                .filter_map(|entry| entry.snapshot_url),
+        );
+    urls.filter_map(|url| url.strip_prefix("/api/snaps/").map(str::to_owned))
+        .collect()
 }
 
 /// Follow the house's events into the bell, and motion into the recording
@@ -380,6 +436,9 @@ pub fn start(
                             attached.at,
                             attached.snapshot_url.clone(),
                         );
+                        // The sweep rides the marker: a still neither store
+                        // references is a file nothing can reach.
+                        snapshots.sweep(still_ids(&store, &episodes)).await;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
