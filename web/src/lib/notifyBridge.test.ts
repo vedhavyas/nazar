@@ -131,6 +131,32 @@ test('the bell wears its count and opens the list', () => {
   expect(screen.queryByTestId('unread'), 'nothing new wears no badge').toBeNull();
 });
 
+test("the list's relative times tick with the wall", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-16T12:00:00Z'));
+  render(Notifications, {
+    entries: [
+      {
+        id: 'a',
+        device_id: 'cam-1',
+        at: Date.now() - 120_000,
+        snapshot_url: null,
+        kind: 'motion',
+      },
+    ],
+    names: { 'cam-1': 'Hall' },
+    onback: vi.fn(),
+    onopen: vi.fn(),
+  });
+
+  expect(screen.getByText('2m'), 'a two-minute-old entry reads as two minutes').toBeTruthy();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(
+    screen.getByText('3m'),
+    'and the minute advances without a reload',
+  ).toBeTruthy();
+});
+
 test('a still-less entry reads as a note, not a broken picture', () => {
   const onopen = vi.fn();
   render(Notifications, {
