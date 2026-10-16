@@ -107,6 +107,10 @@ pub struct Pacing {
     /// takes over. The engine's stages can sum past this on a bad network,
     /// so the bound cancels rather than waits.
     pub arm_timeout: Duration,
+    /// How long a camera's fast lane is benched once its session ended
+    /// without media: the passes inside the cooldown take the cloud path,
+    /// and the lane is retried once it elapses.
+    pub lane_cooldown: Duration,
 }
 
 impl Default for Pacing {
@@ -123,6 +127,7 @@ impl Default for Pacing {
             touch_ttl: Duration::from_secs(30),
             warm_idle: Duration::from_mins(30),
             arm_timeout: Duration::from_secs(15),
+            lane_cooldown: Duration::from_secs(600),
         }
     }
 }
@@ -353,6 +358,9 @@ pub struct Supervisor {
     /// camera asking at the same moment cannot both arm - and one camera's
     /// arm never queues behind another's.
     arm_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Cameras whose fast lane is benched after their session ended without
+    /// media; the value is when the bench began.
+    lane_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// narar's own consumer on a stream, held for the loop's lifetime and
@@ -399,6 +407,7 @@ impl Supervisor {
             prefer_p2p: Arc::new(HashSet::new()),
             armed: Arc::new(RwLock::new(HashMap::new())),
             arm_locks: Arc::new(RwLock::new(HashMap::new())),
+            lane_cooldowns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -459,8 +468,8 @@ impl Supervisor {
     }
 
     /// Enable the fast lane: cameras in `prefer` try it before the cloud
-    /// mint, and a failure or an over-bound arm falls back without the
-    /// viewer noticing.
+    /// mint, and a failure, an over-bound arm, or a session that ended
+    /// without media falls back to the cloud path for that pass.
     #[must_use]
     pub fn with_fast_lane(mut self, lane: Arc<dyn Lane>, prefer: Vec<String>) -> Self {
         self.lane = Some(lane);
@@ -488,6 +497,9 @@ impl Supervisor {
 
     /// The camera's fast-lane session, arming one if none is live: one
     /// session per camera, and a second ask reuses it rather than stacking.
+    /// A session that ended on its own - no media - benches the camera's
+    /// lane instead of being replaced, so the pass behind it takes the
+    /// cloud path.
     async fn lane_session(
         &self,
         lane: &Arc<dyn Lane>,
@@ -498,8 +510,25 @@ impl Supervisor {
             .await
             .lock_owned()
             .await;
-        if let Some(session) = self.fast_lane_for(&device.device_id).await {
-            return Ok(session);
+        let ended_without_media = {
+            let mut armed = self.armed.write().await;
+            match armed.get(&device.device_id) {
+                Some(session) if session.alive() => return Ok(Arc::clone(session)),
+                Some(_) => {
+                    armed.remove(&device.device_id);
+                    true
+                }
+                None => false,
+            }
+        };
+        if ended_without_media {
+            self.bench_lane(&device.device_id);
+            return Err(
+                "the fast-lane session ended without media; the lane is benched".to_owned(),
+            );
+        }
+        if self.lane_benched(&device.device_id) {
+            return Err("the fast lane is benched after a media-silent session".to_owned());
         }
         let session = tokio::time::timeout(self.pacing.arm_timeout, lane.arm(device.clone()))
             .await
@@ -509,6 +538,24 @@ impl Supervisor {
             .await
             .insert(device.device_id.clone(), Arc::clone(&session));
         Ok(session)
+    }
+
+    /// Bench a camera's fast lane after its session ended without media:
+    /// the passes inside the cooldown take the cloud path.
+    fn bench_lane(&self, device_id: &str) {
+        self.lane_cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device_id.to_owned(), Instant::now());
+    }
+
+    /// Whether a camera's lane is still inside its silence cooldown.
+    fn lane_benched(&self, device_id: &str) -> bool {
+        self.lane_cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(device_id)
+            .is_some_and(|benched_at| benched_at.elapsed() < self.pacing.lane_cooldown)
     }
 
     /// Whether a refused session's re-discovery is worth trying yet.
@@ -1095,9 +1142,10 @@ impl Supervisor {
     /// stream's own name, so a viewer's stream URL survives re-mints. A mint
     /// the gateway turns away spends the stored refresh token once and runs
     /// again before the refusal is believed. A camera set to prefer the
-    /// fast lane tries it first; any fast-lane failure (arm refused, over
-    /// its bound, or the session ended) falls back to the cloud mint within
-    /// the loop's own retry cadence.
+    /// fast lane tries it first; any fast-lane failure - an arm refused or
+    /// over its bound, a session that ended, or a lane benched after media
+    /// silence - falls back to the cloud mint for that pass, and a benched
+    /// lane is retried once its cooldown elapses.
     async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), String> {
         let name = stream_name(&device.device_id, quality);
         if let Some(lane) = &self.lane
@@ -1407,6 +1455,11 @@ impl Supervisor {
             .keys()
             .any(|key| key.starts_with(&prefix));
         if !remaining && let Some(session) = self.armed.write().await.remove(device_id) {
+            // A session already dead here ended without media; bench the
+            // lane so the next ask is not an arm into the same silence.
+            if !session.alive() {
+                self.bench_lane(device_id);
+            }
             session.shutdown();
             tracing::info!(
                 camera = device_id,
@@ -1636,6 +1689,7 @@ mod tests {
     struct RecordingSession {
         ended: Arc<AtomicBool>,
         released: Arc<Mutex<Vec<String>>>,
+        alive: AtomicBool,
     }
 
     impl LaneSession for RecordingSession {
@@ -1648,7 +1702,7 @@ mod tests {
         }
 
         fn alive(&self) -> bool {
-            true
+            self.alive.load(Ordering::SeqCst)
         }
 
         fn release(&self, name: &str) {
@@ -1670,6 +1724,7 @@ mod tests {
         let session = Arc::new(RecordingSession {
             ended: Arc::clone(&ended),
             released: Arc::clone(&released),
+            alive: AtomicBool::new(true),
         });
         (session, ended, released)
     }
@@ -1705,6 +1760,10 @@ mod tests {
             [name.as_str()],
             "and the stream's reader was released from the session"
         );
+        assert!(
+            !supervisor.lane_benched("cam"),
+            "the teardown of a healthy session leaves the lane free"
+        );
 
         // With another stream left, the session stays - but its reader
         // still leaves.
@@ -1733,6 +1792,38 @@ mod tests {
             released.lock().unwrap().as_slice(),
             [name.as_str()],
             "the torn stream's reader is released even when the session stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_sessions_teardown_benches_the_lane() {
+        // The session died on its own (no media) before its last stream
+        // idled out; its teardown must bench the lane so the next ask is
+        // not an arm into the same silence.
+        let supervisor = quiet_supervisor();
+        let (session, _, _) = recorded_session();
+        session.alive.store(false, Ordering::SeqCst);
+        supervisor
+            .armed
+            .write()
+            .await
+            .insert("cam".to_owned(), session);
+        let name = stream_name("cam", Quality::Low);
+        supervisor.state.write().await.insert(
+            name.clone(),
+            Tracked {
+                state: StreamState::Live {
+                    since: Instant::now(),
+                },
+                wake: Arc::new(Notify::new()),
+                last_request: Instant::now(),
+            },
+        );
+
+        supervisor.teardown(&name).await;
+        assert!(
+            supervisor.lane_benched("cam"),
+            "a session that died without media benches the lane on its teardown"
         );
     }
 

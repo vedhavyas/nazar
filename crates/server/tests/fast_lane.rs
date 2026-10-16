@@ -1,7 +1,7 @@
 //! Fast-lane wiring: the cloud path is the floor (a failed or over-bound
-//! arm falls back to the mint), PTZ rides the engine while a session is
-//! armed, and one fast-lane session serves a camera however many of its
-//! streams ask.
+//! arm, or a session that ended without media, falls back to the mint),
+//! PTZ rides the engine while a session is armed, and one fast-lane
+//! session serves a camera however many of its streams ask.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -48,12 +48,14 @@ struct Harness {
 }
 
 /// A harness with the fast lane installed for `prefer`; `remint` is the
-/// loop's re-mint cadence (long, unless a test watches a re-arm happen).
+/// loop's re-mint cadence and `lane_cooldown` how long a media-silent
+/// session benches the lane (both long, unless a test watches the retry).
 async fn harness(
     lane: FakeLane,
     prefer: Vec<String>,
     arm_timeout: Duration,
     remint: Duration,
+    lane_cooldown: Duration,
 ) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = FakeApi::start().await;
@@ -85,6 +87,7 @@ async fn harness(
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
             arm_timeout,
+            lane_cooldown,
         },
     )
     .with_fast_lane(
@@ -255,6 +258,7 @@ async fn an_arm_failure_falls_back_to_the_cloud_mint() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     h.supervisor
@@ -280,6 +284,7 @@ async fn a_hanging_arm_falls_back_within_the_bound() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_millis(200),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     h.supervisor
@@ -316,6 +321,7 @@ async fn one_cameras_slow_arm_does_not_hold_another_camera_back() {
         // the whole test window.
         Duration::from_secs(5),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
 
@@ -348,6 +354,7 @@ async fn a_refused_fast_lane_source_falls_back_in_the_same_pass() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     h.go2rtc.set_put_refused_marker(Some("nazar-fake.sdp"));
@@ -382,6 +389,7 @@ async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     mount_control(&h.qubo, vec!["10,10", "20,15", "20,15"]).await;
@@ -437,6 +445,7 @@ async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
         Vec::new(),
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     mount_control(&rest.qubo, vec!["10,10", "20,15", "20,15"]).await;
@@ -471,6 +480,7 @@ async fn an_unlanded_armed_move_reports_not_applied() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     // The shadow never reaches the target: the read-back must say so even
@@ -516,6 +526,7 @@ async fn a_dead_sessions_camera_routes_ptz_back_to_rest() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_secs(30),
+        Duration::from_secs(600),
     )
     .await;
     mount_control(&h.qubo, vec!["10,10", "20,15"]).await;
@@ -562,6 +573,7 @@ async fn a_second_stream_reuses_the_camera_session() {
         vec![DEVICE_ID.to_owned()],
         Duration::from_secs(15),
         Duration::from_millis(400),
+        Duration::from_secs(600),
     )
     .await;
 
@@ -599,13 +611,84 @@ async fn a_second_stream_reuses_the_camera_session() {
             "the {quality} stream is fed by the one session: {puts:?}"
         );
     }
+}
 
-    // A session that ended is not reused: the next ask arms afresh.
-    h.lane.session().shutdown();
+#[tokio::test]
+async fn a_media_silent_session_benches_the_lane_and_the_pass_takes_the_cloud_path() {
+    // The session died the way a media-silent one does - alive false while
+    // its entry is still mapped - and the next pass must not re-arm into
+    // it: the lane is benched and the cloud path serves.
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_millis(400),
+        Duration::from_secs(600),
+    )
+    .await;
     h.supervisor
-        .ensure(DEVICE_ID, Quality::High, true)
+        .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("ensure accepts");
-    let rearmed = common::eventually(|| async { h.lane.arms() == 2 }).await;
-    assert!(rearmed, "a dead session is replaced, not reused");
+    let armed = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(_, source)| source.contains("nazar-fake.sdp"))
+    })
+    .await;
+    assert!(armed, "the fast lane served the first pass");
+
+    h.lane.session().shutdown();
+    let cloud = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(name, source)| name == &format!("{DEVICE_ID}-high") && is_cloud_source(source))
+    })
+    .await;
+    assert!(
+        cloud,
+        "the pass after the silent session mints the cloud source"
+    );
+    // The bench holds across further passes' worth of cadence.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        h.lane.arms(),
+        1,
+        "the silent session is benched for its cooldown, never re-armed inside it"
+    );
+}
+
+#[tokio::test]
+async fn a_benched_lane_is_retried_once_its_cooldown_elapses() {
+    // After the silence one pass takes cloud; once the cooldown elapses
+    // the lane is tried again rather than staying benched forever.
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_millis(300),
+        Duration::from_millis(100),
+    )
+    .await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let armed = common::eventually(|| async { h.lane.arms() == 1 }).await;
+    assert!(armed, "the fast lane served the first pass");
+
+    h.lane.session().shutdown();
+    let cloud = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .any(|(_, source)| is_cloud_source(source))
+    })
+    .await;
+    assert!(cloud, "the benched pass takes the cloud path");
+
+    let retried = common::eventually(|| async { h.lane.arms() == 2 }).await;
+    assert!(retried, "the lane is retried once its cooldown elapses");
 }

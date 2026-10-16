@@ -48,6 +48,7 @@ fn pacing(stream_idle: Duration) -> Pacing {
         touch_ttl: Duration::from_millis(300),
         warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
+        lane_cooldown: Duration::from_secs(600),
     }
 }
 
