@@ -373,7 +373,10 @@ impl Snapshots {
 /// The still ids the two stores still reference: a still is kept while the
 /// bell holds its entry or the timeline holds its marker, and dropped when
 /// neither does.
-fn still_ids(store: &NotificationStore, episodes: &EpisodeStore) -> std::collections::HashSet<String> {
+fn still_ids(
+    store: &NotificationStore,
+    episodes: &EpisodeStore,
+) -> std::collections::HashSet<String> {
     let urls = store
         .list()
         .into_iter()

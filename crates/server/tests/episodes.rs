@@ -154,7 +154,10 @@ fn an_unreadable_log_is_kept_aside_not_overwritten() {
 
     // And the store writes again, beside the kept original.
     store.record("hall", now_ms(), None);
-    assert!(path.exists(), "the fresh log lands where the store expects it");
+    assert!(
+        path.exists(),
+        "the fresh log lands where the store expects it"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
