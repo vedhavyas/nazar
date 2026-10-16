@@ -33,6 +33,9 @@ pub struct Config {
     /// (`NAZAR_P2P_CAMERA_CONTROLLER`); `None` reads it from the device
     /// listing.
     pub p2p_camera_controller: Option<String>,
+    /// The `Login-Device-Name` header the SDK's stream client sends - the
+    /// phone's unit device name (`NAZAR_P2P_LOGIN_DEVICE_NAME`).
+    pub p2p_login_device_name: String,
 }
 
 impl Config {
@@ -64,6 +67,8 @@ impl Config {
             p2p_src_device_id: var("NAZAR_P2P_SRC_DEVICE_ID")
                 .unwrap_or_else(|| "<mobile-id>".to_owned()),
             p2p_camera_controller: var("NAZAR_P2P_CAMERA_CONTROLLER"),
+            p2p_login_device_name: var("NAZAR_P2P_LOGIN_DEVICE_NAME")
+                .unwrap_or_else(|| "MobileApp_<mobile-id>".to_owned()),
         }
     }
 

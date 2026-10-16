@@ -17,6 +17,7 @@ fn config_in(dir: &std::path::Path) -> Config {
         p2p_self_device: "self-device".to_owned(),
         p2p_src_device_id: "src-device".to_owned(),
         p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
     }
 }
 
