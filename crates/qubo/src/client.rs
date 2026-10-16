@@ -128,7 +128,7 @@ impl QuboClient {
     /// GET `path`, relative to the gateway, authenticated when a session
     /// is given.
     pub async fn get_json(&self, path: &str, auth: Option<&Session>) -> Result<Value, QuboError> {
-        self.send(Method::GET, path, &[], None, auth).await
+        self.send(Method::GET, path, &[], None, auth, "USER").await
     }
 
     /// POST a JSON `body` to `path`, authenticated when a session is
@@ -139,7 +139,8 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, &[], Some(body), auth).await
+        self.send(Method::POST, path, &[], Some(body), auth, "USER")
+            .await
     }
 
     /// GET `path` with query parameters, authenticated when a session is
@@ -150,7 +151,8 @@ impl QuboClient {
         query: &[(&str, &str)],
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::GET, path, query, None, auth).await
+        self.send(Method::GET, path, query, None, auth, "USER")
+            .await
     }
 
     /// POST a JSON `body` to `path` with query parameters, authenticated
@@ -162,7 +164,21 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<Value, QuboError> {
-        self.send(Method::POST, path, query, Some(body), auth).await
+        self.send(Method::POST, path, query, Some(body), auth, "USER")
+            .await
+    }
+
+    /// POST a JSON `body` to `path` with query parameters, no Authorization
+    /// header, and `Source: ANDROID` - the exact shape the app's own login
+    /// calls carry (docs/qubo-google-login.md §3).
+    pub async fn post_login_json(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, QuboError> {
+        self.send(Method::POST, path, query, Some(body), None, "ANDROID")
+            .await
     }
 
     /// PUT a JSON `body` and ignore the body it answers with. Device
@@ -173,7 +189,7 @@ impl QuboClient {
         body: &Value,
         auth: Option<&Session>,
     ) -> Result<(), QuboError> {
-        self.send_raw(Method::PUT, path, &[], Some(body), auth)
+        self.send_raw(Method::PUT, path, &[], Some(body), auth, "USER")
             .await
             .map(drop)
     }
@@ -185,8 +201,11 @@ impl QuboClient {
         query: &[(&str, &str)],
         body: Option<&Value>,
         auth: Option<&Session>,
+        source: &str,
     ) -> Result<Value, QuboError> {
-        let text = self.send_raw(method, path, query, body, auth).await?;
+        let text = self
+            .send_raw(method, path, query, body, auth, source)
+            .await?;
         if text.trim().is_empty() {
             return Ok(Value::Object(serde_json::Map::new()));
         }
@@ -200,6 +219,7 @@ impl QuboClient {
         query: &[(&str, &str)],
         body: Option<&Value>,
         auth: Option<&Session>,
+        source: &str,
     ) -> Result<String, QuboError> {
         let url = self.url_for(path, query)?;
         let mut request = self
@@ -216,7 +236,7 @@ impl QuboClient {
                 .header("User-UUID", &session.uuid)
                 .header("Token-Type", "USER")
                 .header("Source", "Android"),
-            None => request.header("Source", "USER"),
+            None => request.header("Source", source),
         };
         if let Some(body) = body {
             request = request.json(body);

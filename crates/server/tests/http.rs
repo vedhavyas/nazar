@@ -33,6 +33,7 @@ const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 const OTP_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login";
 const VERIFY_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify";
+const GOOGLE_PATH: &str = "/sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login";
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,6 +59,7 @@ async fn harness() -> Harness {
             access_token: "token-abc".to_owned(),
             uuid: "user-uuid-1".to_owned(),
             email: None,
+            refresh_token: None,
         })
         .expect("a stored session, as after a login");
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
@@ -173,6 +175,7 @@ async fn a_refused_session_reads_as_needs_login() {
             access_token: "token-dead".to_owned(),
             uuid: "user-uuid-1".to_owned(),
             email: None,
+            refresh_token: None,
         })
         .expect("swap the session");
     for route in [UNITS_PATH, DEVICES_PATH] {
@@ -510,6 +513,39 @@ async fn verify_saves_the_session() {
     assert!(
         stored.contains("token-live"),
         "the session lands in the data dir: {stored}"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
+async fn login_google_stores_the_durable_session() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(GOOGLE_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("../../qubo/tests/fixtures/gm_login.json")),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    let response = client()
+        .post(format!("{}/api/login/google", h.base))
+        .json(&json!({ "id_token": "the-id-token" }))
+        .send()
+        .await
+        .expect("the login");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let stored = std::fs::read_to_string(h.data_dir.join("session.json")).expect("session saved");
+    assert!(
+        stored.contains("gm-access-token"),
+        "the fresh session lands in the data dir: {stored}"
+    );
+    assert!(
+        stored.contains("gm-refresh-token"),
+        "with the refresh token that makes it durable: {stored}"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

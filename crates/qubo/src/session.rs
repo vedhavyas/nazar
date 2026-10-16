@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::QuboError;
 
-/// A logged-in Qubo account session. The phone-OTP route issues no
-/// refresh token, so there is none here.
+/// A logged-in Qubo account session. The phone-OTP route issues no refresh
+/// token; the Google route does, and it is what makes the session durable
+/// (spec §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -16,6 +17,8 @@ pub struct Session {
     pub uuid: String,
     #[serde(default)]
     pub email: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 /// A session file at a caller-provided path.

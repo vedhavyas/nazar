@@ -9,20 +9,29 @@
 //! 2026-10-15 when the resend window was exhausted. The envelope shape
 //! (`message` as an array) is live-captured. What these tests pin is that
 //! whatever code and message the gateway sends survive into `QuboError`.
+//!
+//! `gm_login.json` carries the GM v4 login's response keys
+//! (docs/qubo-google-login.md §3; live-verified 2026-10-14 that the route
+//! returns a refreshToken), and `refresh.json` the refresh response's
+//! (spec §3.2); both bodies' values are synthesized.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use serde_json::Value;
-use wiremock::matchers::{method, path};
+use serde_json::{Value, json};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use qubo::auth::{request_otp, verify_otp};
+use qubo::Session;
+use qubo::auth::{refresh_session, request_otp, verify_google, verify_otp};
 use qubo::client::{BASE_URL, QuboClient, ServiceProvider};
 use qubo::error::QuboError;
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const REQUEST_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/login";
 const VERIFY_PATH: &str = "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/phone/verify";
+const GM_PATH: &str = "/sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login";
+const REFRESH_PATH: &str =
+    "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh";
 
 fn client_for(server: &MockServer) -> QuboClient {
     let base = server
@@ -334,4 +343,152 @@ async fn live_request_otp_reaches_the_gateway() {
     request_otp(&client, &phone)
         .await
         .expect("the gateway accepts the OTP request");
+}
+
+/// Feeds a real Google ID token to the GM login. Ignored by default; run
+/// deliberately with the app's own token (docs/qubo-google-login.md) in
+/// `QUBO_ID_TOKEN`.
+#[tokio::test]
+#[ignore = "live: exchanges a real Google ID token; run with QUBO_ID_TOKEN set"]
+async fn live_verify_google_exchanges_the_apps_own_token() {
+    let id_token = std::env::var("QUBO_ID_TOKEN").expect("set QUBO_ID_TOKEN from the app");
+    let base = BASE_URL.parse().expect("the gateway URL parses");
+    let client = QuboClient::new(base, ServiceProvider::default());
+    let session = verify_google(&client, &id_token)
+        .await
+        .expect("the gateway accepts the app's token");
+    assert!(
+        session.refresh_token.is_some(),
+        "the GM route is what makes the session durable"
+    );
+}
+
+#[tokio::test]
+async fn verify_google_exchanges_the_id_token_for_a_durable_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(GM_PATH))
+        .and(query_param("system", "GM"))
+        .and(query_param("type", "RELEASE"))
+        .and(header("source", "ANDROID"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/gm_login.json")),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+
+    let session = verify_google(&client, "the-id-token")
+        .await
+        .expect("the login");
+
+    assert_eq!(session.access_token, "gm-access-token");
+    assert_eq!(session.uuid, "user-uuid-1");
+    assert_eq!(
+        session.refresh_token.as_deref(),
+        Some("gm-refresh-token"),
+        "the refresh token is what makes the session durable"
+    );
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("a json body");
+    assert_eq!(body["accessToken"], json!("the-id-token"));
+    assert_eq!(body["username"], json!(""));
+    assert_eq!(body["password"], json!(""));
+    assert!(
+        body["deviceAttribute"].is_string(),
+        "the attribute rides the body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_spends_both_tokens_and_takes_the_fresh_pair() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .and(header("authorization", "Bearer gm-access-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/refresh.json")),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some("gm-refresh-token".to_owned()),
+    };
+
+    let refreshed = refresh_session(&client, &stored)
+        .await
+        .expect("the refresh");
+
+    assert_eq!(refreshed.access_token, "gm-access-token-2");
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("gm-refresh-token-2")
+    );
+    assert_eq!(refreshed.uuid, "user-uuid-1", "the account does not move");
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("a json body");
+    assert_eq!(body["accessToken"], json!("gm-access-token"));
+    assert_eq!(body["refreshToken"], json!("gm-refresh-token"));
+}
+
+#[tokio::test]
+async fn a_refresh_without_a_rotation_keeps_the_stored_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(
+            // Spec §3.2: refreshToken is optional, and the old one is kept.
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "accessToken": "gm-access-token-2" }).to_string()),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some("gm-refresh-token".to_owned()),
+    };
+
+    let refreshed = refresh_session(&client, &stored)
+        .await
+        .expect("the refresh");
+
+    assert_eq!(refreshed.access_token, "gm-access-token-2");
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("gm-refresh-token"),
+        "no rotation means the stored token stays"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_without_a_token_is_refused_locally() {
+    let server = MockServer::start().await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: None,
+    };
+
+    let failure = refresh_session(&client, &stored)
+        .await
+        .expect_err("nothing to spend");
+
+    assert!(matches!(failure, QuboError::Auth { .. }), "{failure:?}");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "no call is made without a token to spend"
+    );
 }

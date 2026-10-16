@@ -23,6 +23,18 @@ struct Profile {
     uuid: String,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+/// The refresh response (spec §3.2): the access token is required, and the
+/// refresh token is optional - the old one is kept when it is absent.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Refreshed {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,5 +117,57 @@ pub async fn verify_otp(
         access_token: profile.access_token,
         uuid: profile.uuid,
         email: profile.email,
+        refresh_token: profile.refresh_token,
+    })
+}
+
+/// Exchange a Google ID token for a Qubo session (the app's own `system=GM`
+/// v4 login; docs/qubo-google-login.md §3). Its response carries the refresh
+/// token the phone route never does - the token comes from the Qubo app's
+/// own sign-in, since Google refuses to mint one for anything else.
+pub async fn verify_google(client: &QuboClient, id_token: &str) -> Result<Session, QuboError> {
+    let path = format!("/sms/api/v4/sp/{}/user/login", client.service_provider());
+    let body = json!({
+        "accessToken": id_token,
+        "username": "",
+        "password": "",
+        "deviceAttribute": DEVICE_ATTRIBUTE,
+    });
+    let response = client
+        .post_login_json(&path, &[("system", "GM"), ("type", "RELEASE")], &body)
+        .await?;
+    let profile: Profile = serde_json::from_value(response)?;
+    Ok(Session {
+        access_token: profile.access_token,
+        uuid: profile.uuid,
+        email: profile.email,
+        refresh_token: profile.refresh_token,
+    })
+}
+
+/// Spend the stored refresh token for a fresh access token (spec §3.2). The
+/// failed access token rides the request, since that is what the gateway
+/// knows; a response without a refresh token keeps the stored one.
+pub async fn refresh_session(client: &QuboClient, session: &Session) -> Result<Session, QuboError> {
+    let refresh_token = session.refresh_token.clone().ok_or(QuboError::Auth {
+        code: None,
+        message: "no refresh token; log in again".to_owned(),
+    })?;
+    let path = format!(
+        "/sms/api/v1/sp/{}/users/{}/auth/refresh",
+        client.service_provider(),
+        session.uuid
+    );
+    let body = json!({
+        "accessToken": session.access_token,
+        "refreshToken": refresh_token,
+    });
+    let response = client.post_json(&path, &body, Some(session)).await?;
+    let refreshed: Refreshed = serde_json::from_value(response)?;
+    Ok(Session {
+        access_token: refreshed.access_token,
+        uuid: session.uuid.clone(),
+        email: session.email.clone(),
+        refresh_token: refreshed.refresh_token.or(Some(refresh_token)),
     })
 }

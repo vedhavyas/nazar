@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -23,6 +23,8 @@ const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const REFRESH_PATH: &str =
+    "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
 
@@ -74,6 +76,7 @@ fn session(token: &str) -> Session {
         access_token: token.to_owned(),
         uuid: "user-uuid-1".to_owned(),
         email: None,
+        refresh_token: None,
     }
 }
 
@@ -487,6 +490,127 @@ async fn discovery_backs_off_between_tries() {
     assert!(
         h.supervisor.discovery_due(),
         "the backoff expires and recovery can be noticed again"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+fn durable_session(access: &str, refresh: &str) -> Session {
+    Session {
+        access_token: access.to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some(refresh.to_owned()),
+    }
+}
+
+/// A 401 mid-mint spends the stored refresh token once and runs the mint
+/// again with the fresh one: the durable session heals with no phone.
+#[tokio::test]
+async fn a_mid_mint_401_spends_the_refresh_token_and_heals() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    mount_discovery(&h.qubo).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    mint_mock(200, &mint_body("first"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock(401, include_str!("fixtures/error_auth_002.json"))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(header("authorization", "Bearer token-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(mint_body("second")))
+        .with_priority(3)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "accessToken": "token-new", "refreshToken": "refresh-2" }).to_string(),
+        ))
+        .expect(1)
+        .mount(&h.qubo)
+        .await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream starts");
+    let healed = common::eventually(|| async {
+        let stored = SessionStore::new(&h.sessions_path)
+            .load()
+            .expect("the session loads")
+            .expect("a session is stored");
+        is_live(&h.supervisor).await
+            && !h.supervisor.needs_login()
+            && stored.access_token == "token-new"
+            && stored.refresh_token.as_deref() == Some("refresh-2")
+    })
+    .await;
+    assert!(healed, "the fresh session is stored and the stream is up");
+
+    let requests = h.qubo.received_requests().await.expect("recorded requests");
+    let refreshes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == REFRESH_PATH)
+        .collect();
+    assert_eq!(
+        refreshes.len(),
+        1,
+        "the refresh token is spent exactly once"
+    );
+    let body: Value = serde_json::from_slice(&refreshes[0].body).expect("a json body");
+    assert_eq!(body["accessToken"], json!("token-old"));
+    assert_eq!(body["refreshToken"], json!("refresh-1"));
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A refresh the gateway refuses is the session's end: the stream degrades
+/// and the login flag rises, and the stored session is left untouched.
+#[tokio::test]
+async fn a_refused_refresh_surfaces_needs_login() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    mount_discovery(&h.qubo).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    mint_mock(401, include_str!("fixtures/error_auth_002.json"))
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .mount(&h.qubo)
+        .await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let refused = common::eventually(|| async { h.supervisor.needs_login() }).await;
+    assert!(refused, "a refused refresh ends in the login flag");
+    assert!(
+        matches!(settled(&h.supervisor).await, StreamState::Degraded { .. }),
+        "and the stream is degraded, not pretending"
+    );
+    let stored = SessionStore::new(&h.sessions_path)
+        .load()
+        .expect("the session loads")
+        .expect("a session is stored");
+    assert_eq!(
+        stored.access_token, "token-old",
+        "a refused refresh does not clobber the stored session"
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
