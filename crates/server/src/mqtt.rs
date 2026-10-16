@@ -2,12 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use qubo::{Device, QuboClient, QuboError, SessionStore, list_devices};
+use qubo::{Device, QuboError, SessionStore};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, TlsConfiguration, Transport};
 use serde_json::Value;
 
 use crate::events::EventBus;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{Supervisor, SupervisorError};
 
 /// The broker the app itself uses, reached over TLS with the session
 /// token as the password (spec §5).
@@ -110,13 +110,12 @@ impl MqttService {
     /// token on every reconnect, and backs off while the broker or the
     /// login is missing.
     pub fn start(
-        client: QuboClient,
         sessions: SessionStore,
         supervisor: Supervisor,
         events: EventBus,
         config: FeedConfig,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(run(client, sessions, supervisor, events, config))
+        tokio::spawn(run(sessions, supervisor, events, config))
     }
 }
 
@@ -187,16 +186,10 @@ async fn stored_session(sessions: &SessionStore) -> Result<Option<qubo::Session>
         .map_err(MqttError::from)
 }
 
-async fn run(
-    client: QuboClient,
-    sessions: SessionStore,
-    supervisor: Supervisor,
-    events: EventBus,
-    config: FeedConfig,
-) {
+async fn run(sessions: SessionStore, supervisor: Supervisor, events: EventBus, config: FeedConfig) {
     let mut backoff = config.retry_min;
     loop {
-        match feed(&client, &sessions, &supervisor, &events, &config).await {
+        match feed(&sessions, &supervisor, &events, &config).await {
             // A deliberate reconnect (the session moved, or the house went
             // quiet): straight back on, no backoff.
             Ok(FeedEnd::Reconnect) => continue,
@@ -231,23 +224,28 @@ async fn run(
 /// apart: it re-resolves the units over REST, where an expired token is an
 /// error the login flag can carry.
 async fn feed(
-    client: &QuboClient,
     sessions: &SessionStore,
     supervisor: &Supervisor,
     events: &EventBus,
     config: &FeedConfig,
 ) -> Result<FeedEnd, MqttError> {
+    if stored_session(sessions).await?.is_none() {
+        return Err(MqttError::NoSession);
+    }
+    // The re-resolve is where an expired token is visible, so it is also
+    // where the stored refresh token is spent once, per the discovery
+    // rule the mints already follow. The supervisor's call raises the
+    // login flag on an unhealable refusal.
+    let units = match supervisor.refresh_devices().await {
+        Ok(devices) => units_of(&devices),
+        Err(SupervisorError::Qubo(err)) => return Err(err.into()),
+        Err(err) => return Err(MqttError::Connection(err.to_string())),
+    };
+    // Whatever the store holds now, not what was read before: a refusal
+    // here spends the refresh token, so the broker must connect on the
+    // fresh session or it reconnects on the dead one.
     let Some(session) = stored_session(sessions).await? else {
         return Err(MqttError::NoSession);
-    };
-    let units = match list_devices(client, &session).await {
-        Ok(devices) => units_of(&devices),
-        Err(err) => {
-            if matches!(err, QuboError::Auth { .. }) {
-                supervisor.mark_needs_login();
-            }
-            return Err(err.into());
-        }
     };
     let Some(first) = units.first() else {
         return Err(MqttError::NoUnits);

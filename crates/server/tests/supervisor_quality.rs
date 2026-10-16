@@ -46,6 +46,7 @@ fn pacing(stream_idle: Duration) -> Pacing {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     }
 }
 
@@ -329,6 +330,7 @@ async fn the_chain_is_re_asserted_after_a_mint() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     })
     .await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
@@ -497,6 +499,7 @@ async fn a_recovered_camera_starts_its_backoff_over() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     })
     .await;
     // Two refusals, then an answer: the loop has backed off to 200ms when

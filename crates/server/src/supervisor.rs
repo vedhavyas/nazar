@@ -1,14 +1,15 @@
 //! The stream supervisor: one mint-and-swap loop per live camera.
 //!
-//! Qubo sessions last about five minutes and cannot be refreshed (the OTP
-//! route issues no refresh token), so a live stream is re-minted on a
-//! cadence and the session is re-read from the store on every mint - a
-//! fresh login heals the streams without restarting the server. The cloud
+//! Qubo access tokens last about an hour; a stored 180-day refresh token
+//! heals them, spent once per refused call wherever a refusal is visible -
+//! a mint, a discovery, the feed's re-resolve. With no refresh left, a
+//! refusal routes the UI to login. A live stream is re-minted on a cadence
+//! and the session is re-read from the store on every mint. The cloud
 //! keeps one stream per camera (mints are last-mint-wins), so only the
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,12 +26,24 @@ use crate::go2rtc::{Go2rtc, live_source, low_source};
 /// nobody asks for and the hold goes cold with it - and it never counts
 /// as a viewer: `watched` subtracts it.
 pub trait StreamHold: Send + Sync {
-    /// Begin holding `name`; dropping the lease releases the consumer.
-    fn hold(&self, name: &str) -> Box<dyn HoldLease>;
+    /// Begin holding `name`; dropping the last reference to the lease
+    /// releases the consumer.
+    fn hold(&self, name: &str) -> Arc<dyn HoldLease>;
 }
 
-/// A running hold; dropping it releases the consumer.
-pub trait HoldLease: Send + Sync {}
+/// A running hold: it releases on drop, and reports whether a real
+/// consumer is attached right now.
+pub trait HoldLease: Send + Sync {
+    /// Whether the consumer actually attached: the subtraction counts
+    /// what is attached, never the intent to attach - a hold whose ffmpeg
+    /// has not come up (or keeps dying) must not shadow a real viewer.
+    fn attached(&self) -> bool;
+}
+
+/// The leases narar runs, by stream name: keyed per name but removed by
+/// lease identity, so a parked loop's late drop can never erase the
+/// registration a respawn just made.
+type HoldRegistry = Arc<Mutex<HashMap<String, Vec<Arc<dyn HoldLease>>>>>;
 
 /// The shortest wait between a playback stream's idle re-checks: a zero
 /// window would spin.
@@ -79,6 +92,13 @@ pub struct Pacing {
     /// watch's own polls with margin; silence minutes long opens nothing
     /// and closes nothing.
     pub touch_ttl: Duration,
+    /// How long a stream warmed by a login or a boot survives without
+    /// anyone asking. Generous on purpose: the warmth is bought so the
+    /// next client to load finds pictures already flowing, and a session
+    /// of browsing is shorter than this - while a stream nobody asks for
+    /// past the window still drops, which is the trade Ved named (warm on
+    /// access, dropped when unasked).
+    pub warm_idle: Duration,
 }
 
 impl Default for Pacing {
@@ -93,6 +113,7 @@ impl Default for Pacing {
             connect_window: Duration::from_secs(90),
             liveness_poll: Duration::from_secs(2),
             touch_ttl: Duration::from_secs(30),
+            warm_idle: Duration::from_mins(30),
         }
     }
 }
@@ -271,25 +292,38 @@ pub struct Supervisor {
     touches: Arc<Mutex<HashMap<String, Instant>>>,
     /// The hold narar keeps on its own streams, when one is configured.
     hold: Option<Arc<dyn StreamHold>>,
-    /// The streams this server currently holds a consumer on, so a viewer
-    /// count can subtract narar's own presence.
-    holds: Arc<Mutex<HashSet<String>>>,
+    /// Set when a login or a boot wants the house warmed; the first
+    /// discovery that succeeds after it starts `warm_all` once.
+    warm_wanted: Arc<AtomicBool>,
+    /// Whether `warm_all` has run for that wish.
+    warmed: Arc<AtomicBool>,
+    /// The leases this server currently runs, by stream: a viewer count
+    /// subtracts only the leases that actually attached. Keyed by name
+    /// with per-lease identity, so a parked loop's late drop can never
+    /// erase the registration a respawn just made.
+    holds: HoldRegistry,
 }
 
 /// narar's own consumer on a stream, held for the loop's lifetime and
 /// released on drop.
 struct HeldStream {
     name: String,
-    holds: Arc<Mutex<HashSet<String>>>,
-    _lease: Box<dyn HoldLease>,
+    holds: HoldRegistry,
+    lease: Arc<dyn HoldLease>,
 }
 
 impl Drop for HeldStream {
     fn drop(&mut self) {
-        self.holds
+        let mut holds = self
+            .holds
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.name);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(leases) = holds.get_mut(&self.name) {
+            leases.retain(|lease| !Arc::ptr_eq(lease, &self.lease));
+            if leases.is_empty() {
+                holds.remove(&self.name);
+            }
+        }
     }
 }
 
@@ -306,8 +340,17 @@ impl Supervisor {
             last_discovery: Arc::new(Mutex::new(None)),
             touches: Arc::new(Mutex::new(HashMap::new())),
             hold: None,
-            holds: Arc::new(Mutex::new(HashSet::new())),
+            holds: Arc::new(Mutex::new(HashMap::new())),
+            warm_wanted: Arc::new(AtomicBool::new(false)),
+            warmed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Ask that the house be warmed: the first discovery that succeeds
+    /// from here on starts every camera, once. A boot whose discovery
+    /// fails still warms when a later poll's discovery lands.
+    pub fn warm_on_discovery(&self) {
+        self.warm_wanted.store(true, Ordering::SeqCst);
     }
 
     /// Keep a warm consumer on every tracked stream, so connecting clients
@@ -326,20 +369,23 @@ impl Supervisor {
         self.holds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_owned());
+            .entry(name.to_owned())
+            .or_default()
+            .push(Arc::clone(&lease));
         Some(HeldStream {
             name: name.to_owned(),
             holds: Arc::clone(&self.holds),
-            _lease: lease,
+            lease,
         })
     }
 
-    /// Whether narar's own hold is (to be) counted on `name`.
+    /// Whether narar's own hold is attached on `name` right now.
     fn held(&self, name: &str) -> bool {
         self.holds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(name)
+            .get(name)
+            .is_some_and(|leases| leases.iter().any(|lease| lease.attached()))
     }
 
     /// A viewer's ask, as narar itself sees it. The ask is normalized to
@@ -376,11 +422,14 @@ impl Supervisor {
             .last_discovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-        let session = self.sessions.load()?.ok_or(qubo::QuboError::Auth {
-            code: None,
-            message: "no Qubo session; log in".to_owned(),
-        })?;
-        let devices = match list_devices(&self.qubo, &session).await {
+        // A refused call spends the stored refresh token once, exactly as
+        // the mints do: an idle hub's hour-expired access token must not
+        // strand the house at the login screen while a 180-day refresh
+        // sits in the store.
+        let devices = match self
+            .with_fresh_session(|session| async move { list_devices(&self.qubo, &session).await })
+            .await
+        {
             Ok(devices) => devices,
             Err(err) => {
                 self.settle_auth(&err);
@@ -389,6 +438,13 @@ impl Supervisor {
         };
         self.needs_login.store(false, Ordering::SeqCst);
         *self.devices.write().await = devices.clone();
+        // Warm on access: a login or a boot asked for it, and this is a
+        // discovery that actually landed - on the boot thread, or on a
+        // later poll after the boot's discovery failed.
+        if self.warm_wanted.load(Ordering::SeqCst) && !self.warmed.swap(true, Ordering::SeqCst) {
+            let supervisor = self.clone();
+            tokio::spawn(async move { supervisor.warm_all().await });
+        }
         Ok(devices)
     }
 
@@ -461,18 +517,24 @@ impl Supervisor {
         })?;
         match call(session.clone()).await {
             Err(qubo::QuboError::Auth { .. }) if session.refresh_token.is_some() => {
+                // Single flight: the boot pair and the feed race here by
+                // construction (both refuse on the same expired token),
+                // and a second spend of the same pair is a refusal the
+                // gateway may well answer with a rotation - leaving the
+                // login flag raised on a session that was just healed. A
+                // store that no longer holds the refused token is that
+                // heal; retrying with it skips the spend.
+                if let Some(current) = self.sessions.load()?
+                    && current.access_token != session.access_token
+                {
+                    return call(current).await;
+                }
                 let refreshed = qubo::auth::refresh_session(&self.qubo, &session).await?;
                 self.sessions.save(&refreshed)?;
                 call(refreshed).await
             }
             other => other,
         }
-    }
-
-    /// Remember that Qubo refused the session. The MQTT feed raises the
-    /// same flag when its own reconnect is turned away.
-    pub fn mark_needs_login(&self) {
-        self.needs_login.store(true, Ordering::SeqCst);
     }
 
     /// Ensure the camera's stream of `quality` is running: mint, hand the
@@ -538,10 +600,60 @@ impl Supervisor {
             state.insert(name.clone(), new_waking());
         }
         let supervisor = self.clone();
+        let idle = self.pacing.stream_idle;
         tokio::spawn(async move {
-            supervisor.remint_loop(device, Duration::ZERO).await;
+            supervisor.remint_loop(device, Duration::ZERO, idle).await;
         });
         Ok(self.status_for(device_id, Quality::High).await)
+    }
+
+    /// Start the camera's stream in the background, on the generous idle a
+    /// warmed stream gets: the caller is a login or a boot, not a viewer.
+    /// Failures are the loop's to log - warming must never fail a login -
+    /// and an already-tracked stream is left where it is.
+    pub async fn warm(&self, device_id: &str) {
+        let name = stream_name(device_id, Quality::High);
+        let device = self
+            .devices
+            .read()
+            .await
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .cloned();
+        let Some(device) = device else {
+            tracing::warn!(device = device_id, "warming skipped an unknown camera");
+            return;
+        };
+        {
+            let mut state = self.state.write().await;
+            if state.contains_key(&name) {
+                return;
+            }
+            state.insert(name.clone(), new_waking());
+        }
+        let supervisor = self.clone();
+        let idle = self.pacing.warm_idle;
+        tokio::spawn(async move {
+            supervisor.remint_loop(device, Duration::ZERO, idle).await;
+        });
+    }
+
+    /// Warm every known camera: the house starts minting and holding as
+    /// soon as access is given, so the first client to load finds pictures
+    /// already flowing. Best effort by design - each camera runs its own
+    /// background loop, and nothing here raises.
+    pub async fn warm_all(&self) {
+        let cameras: Vec<String> = self
+            .devices()
+            .await
+            .iter()
+            .filter(|device| device.is_camera())
+            .map(|device| device.device_id.clone())
+            .collect();
+        tracing::info!(cameras = cameras.len(), "warming every camera");
+        for device_id in cameras {
+            self.warm(&device_id).await;
+        }
     }
 
     /// Ensure the camera's tile rendition: a chain inside go2rtc off the
@@ -624,6 +736,33 @@ impl Supervisor {
             .put_stream(&name, &live_source(&mint.url))
             .await
             .map_err(|err| SupervisorError::Go2rtc(redact(&err.to_string())))?;
+        // The live path's contract, kept: the entry must be held, or the
+        // mint went nowhere. Connectedness is deliberately NOT demanded
+        // here, and the live path cannot demand it at this instant either:
+        // a producer dials on its first consumer - for a VOD the player
+        // that just asked - so neither is connected yet. What the live
+        // path has behind the mark and this one does not is the watch,
+        // which exists because a backgrounded live tile cannot show its
+        // own failure; a playback player is on screen showing the failure
+        // itself, and its session is superseded or released, not healed.
+        let held = self
+            .go2rtc
+            .streams()
+            .await
+            .map_err(|err| SupervisorError::Go2rtc(redact(&err.to_string())))?
+            .iter()
+            .any(|stream| stream.name == name && stream.live);
+        if !held {
+            // The source landed but go2rtc lost it between the ack and
+            // the read: leave nothing behind for nobody to release.
+            if let Err(err) = self.go2rtc.delete_stream(&name).await {
+                tracing::warn!(stream = %name, %err, "the untaken playback stream could not be dropped");
+            }
+            tracing::warn!(stream = %name, "go2rtc did not take the playback stream");
+            return Err(SupervisorError::Go2rtc(
+                "go2rtc did not take the stream".to_owned(),
+            ));
+        }
         let fresh = {
             let mut state = self.state.write().await;
             let fresh = !state.contains_key(&name);
@@ -699,16 +838,17 @@ impl Supervisor {
         true
     }
 
-    async fn remint_loop(self, device: Device, mut wait: Duration) {
+    async fn remint_loop(self, device: Device, mut wait: Duration, idle: Duration) {
         let name = stream_name(&device.device_id, Quality::High);
-        // narar's own consumer: the producer stays warm between viewers,
-        // and goes cold with the loop when the idle teardown parks it.
-        let _held = self.start_hold(&name);
+        // narar's own consumer starts with the first landed PUT, not with
+        // the loop: a hold dialled against a stream go2rtc has not been
+        // given yet 404s, counts as a young death, and delays the warmth.
+        // It goes cold with the loop when the idle teardown parks it.
+        let mut held: Option<HeldStream> = None;
         let wake = self.wake_signal(&name).await;
         // Every stream idles out when nobody is watching and nobody has
         // asked: a demoted hero's high stream must not run for ever. The
         // consumer check keeps a watched one - a hero - alive regardless.
-        let idle = self.pacing.stream_idle;
         let mut next_mint = Instant::now();
         let mut failed = false;
         let mut stall = Stall::new();
@@ -778,8 +918,11 @@ impl Supervisor {
                     }
                     StallStep::Closed => {
                         // The recovery itself clears the pace: the deadline
-                        // armed for the run's next attempt is stale.
+                        // armed for the run's next attempt is stale, and so
+                        // is a mint-failure backoff grown while the run was
+                        // open.
                         failed = false;
+                        wait = Duration::ZERO;
                         next_mint = Instant::now() + self.pacing.remint;
                     }
                     StallStep::Idle => {}
@@ -798,6 +941,9 @@ impl Supervisor {
             next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     failed = false;
+                    if held.is_none() {
+                        held = self.start_hold(&name);
+                    }
                     self.reconcile_low(&name).await;
                     if stall.since.is_none() {
                         // A recovered stream starts its backoff over: the
@@ -853,9 +999,11 @@ impl Supervisor {
             .await
             .map_err(|err| redact(&err.to_string()))?;
         // No liveness check here: go2rtc keeps no producer while nothing
-        // consumes the stream, and the minted URL stays unspent until a
-        // viewer is the one to dial it. Whether the picture is actually up
-        // is the loop's liveness watch to judge, from the consumers' side.
+        // consumes the stream, and the minted URL stays unspent until its
+        // first consumer dials it - a viewer, or narar's own hold, which
+        // with a hold configured is the dial that makes the stream warm.
+        // Whether the picture is actually up is the loop's liveness watch
+        // to judge, from the consumers' side.
         let held = self
             .go2rtc
             .streams()
@@ -1138,7 +1286,10 @@ impl Supervisor {
     }
 
     /// `Live` keeps its original `since` through successful re-mints. A
-    /// tile rendition has no life of its own: it mirrors the stream.
+    /// tile rendition has no life of its own: it mirrors the stream - and
+    /// the mirror is sound because a rendition's producer, like a live
+    /// one's, dials on its first consumer (the tile's own player), with
+    /// the chain's re-assert behind it when the original PUT never took.
     async fn mark_live(&self, name: &str) {
         let mut state = self.state.write().await;
         let entry = state.entry(name.to_owned()).or_insert_with(new_tracked);
@@ -1280,6 +1431,10 @@ mod tests {
     fn the_default_window_lands_before_the_idle_teardown() {
         let pacing = Pacing::default();
         assert!(
+            pacing.connect_grace < pacing.connect_window,
+            "the first attempt waits out a whole slow dial before the window can end it"
+        );
+        assert!(
             pacing.connect_window < pacing.stream_idle,
             "the degradation must surface while a stream nobody asks for is still alive"
         );
@@ -1335,5 +1490,70 @@ mod tests {
             None,
             "the claim takes the entry before the stream is deleted"
         );
+    }
+
+    /// A hold whose lease is observable: enough for the registry test.
+    struct RegistryHold;
+
+    struct RegistryLease;
+
+    impl HoldLease for RegistryLease {
+        fn attached(&self) -> bool {
+            true
+        }
+    }
+
+    impl StreamHold for RegistryHold {
+        fn hold(&self, _name: &str) -> Arc<dyn HoldLease> {
+            Arc::new(RegistryLease)
+        }
+    }
+
+    /// Registry identity: a parked loop's late drop must never erase a
+    /// fresh registration, or the stream would never park and phantom
+    /// runs would open with nobody watching.
+    #[test]
+    fn a_late_drop_never_erases_a_fresh_registration() {
+        let supervisor = quiet_supervisor().with_hold(Arc::new(RegistryHold));
+        let first = supervisor.start_hold("cam-high").expect("a hold");
+        let second = supervisor.start_hold("cam-high").expect("a respawned hold");
+        assert!(supervisor.held("cam-high"), "two leases, held");
+
+        drop(first);
+        assert!(
+            supervisor.held("cam-high"),
+            "the fresh registration stands after the old loop's drop"
+        );
+        drop(second);
+        assert!(
+            !supervisor.held("cam-high"),
+            "with the last lease gone, nothing is held"
+        );
+    }
+
+    /// The subtraction counts attachment, not intent: a lease that never
+    /// attached is invisible to every viewer count.
+    #[test]
+    fn an_unattached_lease_is_not_subtracted() {
+        struct NeverAttaches;
+        struct DeadLease;
+        impl HoldLease for DeadLease {
+            fn attached(&self) -> bool {
+                false
+            }
+        }
+        impl StreamHold for NeverAttaches {
+            fn hold(&self, _name: &str) -> Arc<dyn HoldLease> {
+                Arc::new(DeadLease)
+            }
+        }
+
+        let supervisor = quiet_supervisor().with_hold(Arc::new(NeverAttaches));
+        let lease = supervisor.start_hold("cam-high").expect("a hold");
+        assert!(
+            !supervisor.held("cam-high"),
+            "a hold that never attached must not shadow a viewer"
+        );
+        drop(lease);
     }
 }

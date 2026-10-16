@@ -7,7 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use reqwest::Url;
 use serde::Deserialize;
@@ -319,10 +322,55 @@ fn snippet(body: &str) -> String {
 /// Where the generated config's rtsp listener answers.
 pub const RTSP_BASE: &str = "rtsp://127.0.0.1:8554";
 
-/// How long a hold waits before reconnecting: long enough that a camera
+/// The base delay before a hold reconnects: long enough that a camera
 /// that is away is not dialled every second, short enough that a viewer
-/// arriving after a failure waits seconds, not minutes.
+/// arriving after a failure waits seconds, not minutes. Consecutive young
+/// deaths double it up to `HOLD_BACKOFF_MAX`.
 const HOLD_RETRY: Duration = Duration::from_secs(5);
+
+/// The cap on the hold's respawn backoff: an offline camera settles at
+/// one dial a minute.
+const HOLD_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// A hold run this long counts as healthy and resets the failure streak.
+const HOLD_HEALTHY_RUN: Duration = Duration::from_secs(30);
+
+/// How long a hold's child must outlive its startup before the consumer
+/// counts as attached: a dial that dies fast (a missing stream, a broken
+/// binary) never registered at go2rtc.
+const HOLD_ATTACH_GRACE: Duration = Duration::from_secs(1);
+
+/// After this many consecutive young deaths, say the diagnosis once: a
+/// hold that never attaches is otherwise invisible in the retry noise.
+const HOLD_ESCALATE_AT: u32 = 5;
+
+fn hold_backoff(failures: u32) -> Duration {
+    (HOLD_RETRY * 2u32.pow(failures.min(4))).min(HOLD_BACKOFF_MAX)
+}
+
+/// Drain a child's stderr to EOF on its own task, keeping the TAIL: the
+/// last words name the failure, and a closed pipe would kill the child
+/// with SIGPIPE on its next write.
+fn drain_tail(mut stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut tail: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > 2048 {
+                        let over = tail.len() - 2048;
+                        tail.drain(..over);
+                    }
+                }
+            }
+        }
+        tail
+    })
+}
 
 /// narar's own consumer on a stream: an ffmpeg reading it over the
 /// loopback rtsp listener the generated config already runs. A consumer
@@ -340,56 +388,140 @@ impl FfmpegHold {
 }
 
 impl StreamHold for FfmpegHold {
-    fn hold(&self, name: &str) -> Box<dyn HoldLease> {
+    fn hold(&self, name: &str) -> Arc<dyn HoldLease> {
         let ffmpeg = self.ffmpeg.clone();
         let target = format!("{RTSP_BASE}/{name}");
         let stream = name.to_owned();
-        let worker = tokio::spawn(async move {
-            loop {
-                match Command::new(&ffmpeg)
-                    .args([
-                        "-v",
-                        "error",
-                        "-rtsp_transport",
-                        "tcp",
-                        "-i",
-                        &target,
-                        "-c",
-                        "copy",
-                        "-f",
-                        "null",
-                        "-",
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                {
-                    Ok(mut child) => {
-                        tracing::debug!(stream = %stream, "the hold consumer is up");
-                        let _ = child.wait().await;
+        let attached = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let attached = Arc::clone(&attached);
+            tokio::spawn(async move {
+                let mut failures: u32 = 0;
+                loop {
+                    let started = Instant::now();
+                    match Command::new(&ffmpeg)
+                        .args([
+                            "-nostdin",
+                            "-v",
+                            "error",
+                            "-rtsp_transport",
+                            "tcp",
+                            "-i",
+                            &target,
+                            "-c",
+                            "copy",
+                            "-f",
+                            "null",
+                            "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        Ok(mut child) => {
+                            let drain = child.stderr.take().map(drain_tail);
+                            // Attached means the consumer REGISTERED, not
+                            // that a process was spawned: a child that
+                            // dies inside the startup grace never counted
+                            // at go2rtc and must not be subtracted.
+                            let status = if let Ok(status) =
+                                tokio::time::timeout(HOLD_ATTACH_GRACE, child.wait()).await
+                            {
+                                status
+                            } else {
+                                attached.store(true, Ordering::SeqCst);
+                                child.wait().await
+                            };
+                            attached.store(false, Ordering::SeqCst);
+                            let reason = match drain {
+                                Some(handle) => {
+                                    String::from_utf8_lossy(&handle.await.unwrap_or_default())
+                                        .into_owned()
+                                }
+                                None => String::new(),
+                            };
+                            if started.elapsed() >= HOLD_HEALTHY_RUN {
+                                failures = 0;
+                            } else {
+                                failures += 1;
+                            }
+                            tracing::warn!(
+                                stream = %stream,
+                                ran_for = ?started.elapsed(),
+                                ?status,
+                                failures,
+                                reason = %snippet(&reason),
+                                "the hold consumer exited"
+                            );
+                        }
+                        Err(err) => {
+                            attached.store(false, Ordering::SeqCst);
+                            failures += 1;
+                            tracing::warn!(
+                                stream = %stream,
+                                %err,
+                                failures,
+                                "the hold consumer could not start"
+                            );
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(stream = %stream, %err, "the hold consumer could not start");
+                    if failures == HOLD_ESCALATE_AT {
+                        tracing::warn!(
+                            stream = %stream,
+                            failures,
+                            "the hold keeps dying young; check the ffmpeg path and the rtsp listener"
+                        );
                     }
+                    tokio::time::sleep(hold_backoff(failures)).await;
                 }
-                tokio::time::sleep(HOLD_RETRY).await;
-            }
-        });
-        Box::new(FfmpegLease { worker })
+            })
+        };
+        Arc::new(FfmpegLease { worker, attached })
     }
 }
 
 /// The running hold: aborting the worker kills its ffmpeg through
-/// `kill_on_drop`.
+/// `kill_on_drop`, and the attach flag clears with it.
 struct FfmpegLease {
     worker: tokio::task::JoinHandle<()>,
+    attached: Arc<AtomicBool>,
 }
 
-impl HoldLease for FfmpegLease {}
+impl HoldLease for FfmpegLease {
+    fn attached(&self) -> bool {
+        self.attached.load(Ordering::SeqCst)
+    }
+}
 
 impl Drop for FfmpegLease {
     fn drop(&mut self) {
         self.worker.abort();
+        self.attached.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn the_hold_backoff_doubles_from_five_and_caps_at_a_minute() {
+        let values: Vec<u64> = (1..=7)
+            .map(|failures| hold_backoff(failures).as_secs())
+            .collect();
+        assert_eq!(
+            values,
+            vec![10, 20, 40, 60, 60, 60, 60],
+            "the base is 5s, doubling per consecutive failure to the 60s cap"
+        );
+        assert_eq!(
+            hold_backoff(0),
+            HOLD_RETRY,
+            "with no failures yet, the base itself"
+        );
     }
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 use qubo::ServiceProvider;
 use server::config::Config;
 use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source, low_source};
+use server::supervisor::StreamHold;
 
 #[test]
 fn live_source_references_the_config_template() {
@@ -286,4 +287,157 @@ fn temp_dir() -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
+}
+
+/// The ffmpeg hold's own lifecycle: it starts on the stream's loopback
+/// target, and releasing the lease kills the child.
+#[tokio::test]
+async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
+    let dir = temp_dir();
+    let bin = dir.join("fake-ffmpeg.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/ffmpeg.args\"\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/ffmpeg.pid\"\nexec sleep 60\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+
+    let hold = server::go2rtc::FfmpegHold::new(bin);
+    let lease = hold.hold("hall-high");
+
+    let args_path = dir.join("ffmpeg.args");
+    // The window clears the spawn with slack: a first spawn under load can
+    // be slow, and the hold's retry (5s doubling per failure) is what then
+    // writes the args.
+    let mut args = String::new();
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&args_path)
+            && !text.is_empty()
+        {
+            args = text;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let args: Vec<&str> = args.lines().collect();
+    let target = args.iter().position(|a| *a == "-i").map(|i| args[i + 1]);
+    assert_eq!(
+        target,
+        Some("rtsp://127.0.0.1:8554/hall-high"),
+        "the hold reads the stream over the loopback rtsp listener: {args:?}"
+    );
+
+    let pid_path = dir.join("ffmpeg.pid");
+    let mut pid = String::new();
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(&pid_path)
+            && !text.is_empty()
+        {
+            pid = text;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!pid.is_empty(), "the stand-in recorded its pid");
+
+    // The attach flag: true once the child outlives its startup (the
+    // subtraction counts registered consumers, not spawned processes),
+    // and false again the moment the child is gone.
+    let mut attached = false;
+    for _ in 0..150 {
+        if lease.attached() {
+            attached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(attached, "the hold reports attached once its child is up");
+    let killed = std::process::Command::new("kill")
+        .args([&pid])
+        .status()
+        .expect("kill runs");
+    assert!(killed.success(), "the child was killed for the flag's fall");
+    let mut fallen = false;
+    for _ in 0..150 {
+        if !lease.attached() {
+            fallen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fallen, "and reads unattached once the child is gone");
+
+    drop(lease);
+    let mut gone = false;
+    for _ in 0..300 {
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .expect("kill runs");
+        // A zombie is a killed child awaiting reaping: gone for our purpose.
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid])
+            .output()
+            .expect("ps runs");
+        if !status.success() || String::from_utf8_lossy(&state.stdout).contains('Z') {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "releasing the lease kills the hold's child");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hold whose child dies comes back: the camera's blip must not leave
+/// the stream cold for good.
+#[tokio::test]
+async fn the_ffmpeg_hold_restarts_after_the_child_dies() {
+    let dir = temp_dir();
+    let bin = dir.join("dead-ffmpeg.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nexit 0\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+
+    let hold = server::go2rtc::FfmpegHold::new(bin);
+    let lease = hold.hold("hall-high");
+
+    let runs_path = dir.join("runs.log");
+    // Two runs means the retry landed: the first respawn waits the base
+    // doubled once (5s -> 10s), so the window clears it with wide slack
+    // under load.
+    let mut restarted = false;
+    for _ in 0..1200 {
+        if let Ok(text) = std::fs::read_to_string(&runs_path)
+            && text.len() >= 2
+        {
+            restarted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        restarted,
+        "the hold re-runs its ffmpeg after the child exits: {:?}",
+        std::fs::read_to_string(&runs_path)
+    );
+    assert!(
+        !lease.attached(),
+        "a child that keeps dying young never reads attached"
+    );
+    drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
 }

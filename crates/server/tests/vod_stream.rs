@@ -82,6 +82,7 @@ async fn harness(stream_idle: Duration) -> Harness {
             connect_window: Duration::from_millis(300),
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
+            warm_idle: Duration::from_secs(60),
         },
     );
     let snapshots = Snapshots::new(
@@ -152,6 +153,26 @@ async fn play(h: &Harness, timestamp: i64) -> reqwest::Response {
         .send()
         .await
         .expect("the playback starts")
+}
+
+/// A vod whose source go2rtc did not take is an error, as the live path's
+/// is - never a session the player is left chasing.
+#[tokio::test]
+async fn a_vod_go2rtc_did_not_take_is_an_error() {
+    let h = harness(Duration::from_secs(120)).await;
+    mount_vod(&h.qubo).await;
+    h.go2rtc.set_streams_visible(false);
+
+    let refusal = play(&h, CLIP_MS).await;
+    assert_eq!(refusal.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: Value = refusal.json().await.expect("json");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not take"),
+        "the refusal names the reason: {body}"
+    );
 }
 
 #[tokio::test]

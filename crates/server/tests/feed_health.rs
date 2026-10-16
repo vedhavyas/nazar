@@ -116,16 +116,11 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
             connect_window: Duration::from_millis(300),
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
+            warm_idle: Duration::from_secs(60),
         },
     );
     let events = EventBus::new();
-    let _feed = MqttService::start(
-        client,
-        sessions.clone(),
-        supervisor.clone(),
-        events.clone(),
-        config,
-    );
+    let _feed = MqttService::start(sessions.clone(), supervisor.clone(), events.clone(), config);
 
     Harness {
         supervisor,
@@ -202,6 +197,105 @@ async fn a_chatty_feed_is_left_alone() {
         broker.sessions(),
         1,
         "a feed that keeps hearing the house is never reconnected"
+    );
+}
+
+/// A refusal on the feed's re-resolve spends the stored refresh token
+/// once, and the connect that follows rides the fresh session - the
+/// reconnect must never carry the token that was just refused.
+#[tokio::test]
+async fn a_refused_re_resolve_heals_onto_the_fresh_token() {
+    const REFRESH_PATH: &str =
+        "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh";
+    let broker = common::mqtt::FakeBroker::chatty(Duration::from_millis(40)).await;
+    let h = harness(
+        &broker,
+        Duration::from_secs(30),
+        Duration::from_millis(30),
+        Duration::from_secs(30),
+    )
+    .await;
+    // The durable pair, as a real login would have left it.
+    h.sessions
+        .save(&Session {
+            access_token: "token-old".to_owned(),
+            uuid: "user-uuid-1".to_owned(),
+            email: None,
+            refresh_token: Some("refresh-1".to_owned()),
+        })
+        .expect("the durable session saves");
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer token-old",
+            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .with_priority(2)
+            .mount(&h.qubo)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer token-new",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(if route == UNITS_PATH {
+                json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string()
+            } else {
+                json!({ "data": [{ "deviceUUID": "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01", "deviceName": "Hall", "deviceType": "HCP01" }] })
+                    .to_string()
+            }))
+            .with_priority(1)
+            .mount(&h.qubo)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "accessToken": "token-new", "refreshToken": "refresh-2" }).to_string(),
+        ))
+        .expect(1)
+        .mount(&h.qubo)
+        .await;
+
+    let connected = common::eventually(|| async { broker.sessions() >= 1 }).await;
+    assert!(
+        connected,
+        "the feed connects once the refusal heals: {} sessions",
+        broker.sessions()
+    );
+    assert!(
+        !h.supervisor.needs_login(),
+        "a healed re-resolve never raises the login flag"
+    );
+    let stored = h
+        .sessions
+        .load()
+        .expect("the session loads")
+        .expect("a session is stored");
+    assert_eq!(
+        stored.access_token, "token-new",
+        "the broker's next connect rides the fresh token"
+    );
+    // The wire is the proof: no CONNECT ever carried the refused token -
+    // the store would read healed even if the connect went out stale.
+    let connects = broker.connects();
+    assert!(
+        !connects.is_empty(),
+        "at least one CONNECT was recorded: {connects:?}"
+    );
+    assert!(
+        connects.iter().all(|token| token != "token-old"),
+        "no connect ever carried the refused token: {connects:?}"
+    );
+    assert!(
+        connects.iter().any(|token| token == "token-new"),
+        "and a connect carried the fresh one: {connects:?}"
     );
 }
 

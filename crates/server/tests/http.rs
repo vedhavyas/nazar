@@ -55,6 +55,7 @@ async fn harness() -> Harness {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     })
     .await
 }
@@ -528,6 +529,62 @@ async fn verify_saves_the_session() {
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
 
+/// Warm on access: the login that just succeeded starts every camera, so
+/// the first client to load finds pictures already flowing.
+#[tokio::test]
+async fn a_login_warms_the_house() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(OTP_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"uuid":"login-1"}"#))
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(VERIFY_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!([{ "accessToken": "token-live", "uuid": "user-uuid-1", "email": "family@example.com" }])
+                .to_string(),
+        ))
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({
+                "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}?token=t"),
+                "sessionId": "s1",
+            })
+            .to_string(),
+        ))
+        .mount(&h.qubo)
+        .await;
+
+    let browser = client();
+    let otp = browser
+        .post(format!("{}/api/login/otp", h.base))
+        .json(&json!({ "phone": "9876543210" }))
+        .send()
+        .await
+        .expect("otp first");
+    assert_eq!(otp.status(), reqwest::StatusCode::NO_CONTENT);
+    let response = browser
+        .post(format!("{}/api/login/verify", h.base))
+        .json(&json!({ "phone": "9876543210", "code": "123456" }))
+        .send()
+        .await
+        .expect("verify");
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let warmed = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
+    assert!(
+        warmed,
+        "the login started the house warming: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
 #[tokio::test]
 async fn login_google_stores_the_durable_session() {
     let h = harness().await;
@@ -625,6 +682,7 @@ async fn a_proxied_viewer_ask_heals_a_dead_stream() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     })
     .await;
     mount_discovery(&h.qubo).await;

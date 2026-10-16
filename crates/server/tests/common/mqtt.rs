@@ -8,8 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -19,6 +19,9 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct FakeBroker {
     port: u16,
     sessions: Arc<AtomicUsize>,
+    /// Every password a CONNECT carried, in arrival order: what the feed
+    /// actually authenticated with.
+    connects: Arc<Mutex<Vec<String>>>,
 }
 
 /// What a broker does with a connection once it is subscribed.
@@ -79,16 +82,28 @@ impl FakeBroker {
         let port = listener.local_addr().expect("the address").port();
         let sessions = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&sessions);
+        let connects = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&connects);
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
                 let counter = Arc::clone(&counter);
-                tokio::spawn(async move { serve(socket, mode, counter).await });
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move { serve(socket, mode, counter, recorder).await });
             }
         });
-        Self { port, sessions }
+        Self {
+            port,
+            sessions,
+            connects,
+        }
+    }
+
+    /// The passwords every CONNECT carried, in arrival order.
+    pub fn connects(&self) -> Vec<String> {
+        self.connects.lock().unwrap().clone()
     }
 
     pub fn port(&self) -> u16 {
@@ -116,7 +131,12 @@ fn motion() -> (String, Vec<u8>) {
     (topic, payload)
 }
 
-async fn serve(mut socket: TcpStream, mode: Mode, sessions: Arc<AtomicUsize>) {
+async fn serve(
+    mut socket: TcpStream,
+    mode: Mode,
+    sessions: Arc<AtomicUsize>,
+    connects: Arc<Mutex<Vec<String>>>,
+) {
     loop {
         let Some(packet) = read_packet(&mut socket).await else {
             return;
@@ -124,6 +144,9 @@ async fn serve(mut socket: TcpStream, mode: Mode, sessions: Arc<AtomicUsize>) {
         match packet[0] >> 4 {
             // CONNECT: accepted, no session carried over.
             1 => {
+                if let Some(token) = connect_password(&packet) {
+                    connects.lock().unwrap().push(token);
+                }
                 if socket.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
                     return;
                 }
@@ -205,6 +228,35 @@ fn publish_frame(topic: &str, payload: &[u8]) -> Vec<u8> {
     push_length(&mut frame, body.len());
     frame.extend_from_slice(&body);
     frame
+}
+
+/// The password a CONNECT packet carries, when its flags include one: the
+/// feed sends the session token there, so it is what a connect
+/// authenticated with.
+fn connect_password(packet: &[u8]) -> Option<String> {
+    // read_packet keeps only the fixed header's first byte: the body -
+    // protocol name first - starts right after it.
+    let mut at = 1;
+    let read_str = |at: &mut usize| -> Option<&[u8]> {
+        let len = u16::from_be_bytes([*packet.get(*at)?, *packet.get(*at + 1)?]) as usize;
+        *at += 2;
+        let out = packet.get(*at..*at + len)?;
+        *at += len;
+        Some(out)
+    };
+    read_str(&mut at)?; // protocol name
+    at += 1; // protocol level
+    let flags = *packet.get(at)?;
+    at += 1;
+    at += 2; // keepalive
+    read_str(&mut at)?; // client id
+    if flags & 0x80 != 0 {
+        read_str(&mut at)?; // username
+    }
+    if flags & 0x40 != 0 {
+        return String::from_utf8(read_str(&mut at)?.to_vec()).ok();
+    }
+    None
 }
 
 /// Read one MQTT packet: the header, the length, and the body.

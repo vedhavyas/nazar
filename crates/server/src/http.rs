@@ -317,14 +317,26 @@ async fn login_verify(
     Json(body): Json<VerifyRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = verify_otp(&state.qubo, &body.phone, &body.code).await?;
+    persist_login(&state, session).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The session a login route just minted, stored and put to work. A
+/// refused discovery is logged, never raised - the login itself has
+/// succeeded - and the house then warms in the background: every camera
+/// starts minting and holding, so the first client to load finds pictures
+/// already flowing (Ved, 2026-10-16); a stream nobody asks for past the
+/// warm window still drops.
+async fn persist_login(state: &AppState, session: Session) -> Result<(), ApiError> {
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
         .await?
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    state.supervisor.warm_on_discovery();
     if let Err(err) = state.supervisor.refresh_devices().await {
         tracing::warn!(%err, "device discovery after login failed");
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -340,13 +352,7 @@ async fn login_google(
     Json(body): Json<GoogleLoginRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = verify_google(&state.qubo, &body.id_token).await?;
-    let sessions = state.sessions.clone();
-    blocking(move || sessions.save(&session))
-        .await?
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    if let Err(err) = state.supervisor.refresh_devices().await {
-        tracing::warn!(%err, "device discovery after login failed");
-    }
+    persist_login(&state, session).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

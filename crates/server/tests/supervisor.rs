@@ -48,6 +48,7 @@ fn pacing(remint: Duration) -> Pacing {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     }
 }
 
@@ -320,6 +321,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -509,6 +511,340 @@ fn durable_session(access: &str, refresh: &str) -> Session {
         email: None,
         refresh_token: Some(refresh.to_owned()),
     }
+}
+
+/// A refusal on a session someone has already healed spends nothing: the
+/// boot pair and the feed race here by construction, and a second spend
+/// of the same pair is a refusal the login flag must not ride.
+#[tokio::test]
+async fn a_refusal_on_an_already_healed_session_spends_nothing() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    // The old token's refusal lands slowly, so the heal can land while
+    // the call is in flight.
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-old"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(Duration::from_millis(200))
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .with_priority(2)
+            .mount(&h.qubo)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-new"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(if route == UNITS_PATH {
+                    json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string()
+                } else {
+                    json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" }] })
+                        .to_string()
+                }),
+            )
+            .with_priority(1)
+            .mount(&h.qubo)
+            .await;
+    }
+    // Any spend at all would be refused: the pin is that none happens.
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .expect(0)
+        .mount(&h.qubo)
+        .await;
+
+    let supervisor = h.supervisor.clone();
+    let discover = tokio::spawn(async move { supervisor.refresh_devices().await });
+    // The other caller heals the store while the refusal is in flight.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-new", "refresh-2"))
+        .expect("the heal lands");
+    let devices = discover
+        .await
+        .expect("the task joins")
+        .expect("the call heals");
+    assert!(!devices.is_empty(), "the stored heal's devices arrive");
+    assert!(
+        !h.supervisor.needs_login(),
+        "no login flag on a session that was healed mid-flight"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// Warm on access: every camera starts minting in the background, and the
+/// account's non-cameras are left alone.
+#[tokio::test]
+async fn warm_all_starts_every_camera_in_the_background() {
+    const SECOND: &str = "c0000000-0000-4000-8000-000000000002";
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_json(
+        &h.qubo,
+        UNITS_PATH,
+        json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
+    )
+    .await;
+    mount_json(
+        &h.qubo,
+        DEVICES_PATH,
+        json!({ "data": [
+            { "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "ptzCamera3MP", "aModelNo": "HCP01" },
+            { "deviceUUID": SECOND, "deviceName": "Gate", "deviceType": "ptzCamera3MP", "aModelNo": "HCP01" },
+            { "deviceUUID": "air-1", "deviceName": "Purifier", "deviceType": "smartAirPurifierX4", "aModelNo": "HPH04A" },
+        ] })
+        .to_string(),
+    )
+    .await;
+    mint_mock(200, &mint_body("one")).mount(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH.replace(DEVICE_ID, SECOND)))
+        .respond_with(ResponseTemplate::new(200).set_body_string(mint_body("two")))
+        .mount(&h.qubo)
+        .await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor.warm_all().await;
+    let warmed = common::eventually(|| async {
+        let puts = h.go2rtc.puts();
+        puts.iter()
+            .any(|(name, _)| name == &stream_name(DEVICE_ID, Quality::High))
+            && puts
+                .iter()
+                .any(|(name, _)| name == &stream_name(SECOND, Quality::High))
+    })
+    .await;
+    assert!(
+        warmed,
+        "every camera started minting: {:?}",
+        h.go2rtc.puts()
+    );
+    assert!(
+        !h.go2rtc
+            .puts()
+            .iter()
+            .any(|(name, _)| name.contains("air-1")),
+        "the account's non-cameras are left alone"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// Warm on access lands on the first discovery that succeeds: a boot
+/// whose own discovery failed still warms when a later poll's lands.
+#[tokio::test]
+async fn a_late_discovery_still_warms_the_house() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mint_mock(200, &mint_body("one")).mount(&h.qubo).await;
+    h.supervisor.warm_on_discovery();
+
+    // The boot's discovery fails: no mocks are mounted yet.
+    h.supervisor
+        .refresh_devices()
+        .await
+        .expect_err("an unmocked discovery fails");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        h.go2rtc.puts().is_empty(),
+        "nothing warms without a device list"
+    );
+
+    // A later poll's discovery lands: the warmth follows it.
+    mount_discovery(&h.qubo).await;
+    h.supervisor
+        .refresh_devices()
+        .await
+        .expect("the late discovery lands");
+    let warmed = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
+    assert!(
+        warmed,
+        "the first successful discovery starts the house: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A stream warmed by a login outlives the asking window - the warmth is
+/// bought so the next client finds pictures flowing - and is parked once
+/// nobody comes, at its own generous window.
+#[tokio::test]
+async fn a_warmed_stream_outlives_the_asking_window() {
+    let h = harness(Pacing {
+        stream_idle: Duration::from_millis(100),
+        warm_idle: Duration::from_millis(400),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    mint_mock(200, &mint_body("one")).mount(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor.warm_all().await;
+    let minted = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
+    assert!(minted, "the warm started the mint");
+
+    // Past the asking window, still up: nobody asked, but the warmth is
+    // the point.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "the warmed stream outlives the asking window: {:?}",
+        h.go2rtc.deletes()
+    );
+
+    // Past the warm window, parked - a stream nobody asks for still drops.
+    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
+    assert!(retired, "and is parked at its own window once nobody comes");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// Warming can never fail a login: a refused mint is the stream's state,
+/// not the caller's error.
+#[tokio::test]
+async fn a_refused_warm_degrades_and_returns() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+
+    h.supervisor.warm_all().await;
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(
+        degraded,
+        "the refusal surfaces on the stream, and warm_all returned: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A 401 on discovery spends the stored refresh token once and lists
+/// again with the fresh session: an idle hub's hour-expired access token
+/// must not strand the house at the login screen while a 180-day refresh
+/// sits in the store.
+#[tokio::test]
+async fn a_refused_discovery_spends_the_refresh_token_and_heals() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-old"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .with_priority(2)
+            .mount(&h.qubo)
+            .await;
+    }
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("authorization", "Bearer token-new"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(if route == UNITS_PATH {
+                    json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string()
+                } else {
+                    json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01" }] })
+                        .to_string()
+                }),
+            )
+            .with_priority(1)
+            .mount(&h.qubo)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "accessToken": "token-new", "refreshToken": "refresh-2" }).to_string(),
+        ))
+        .expect(1)
+        .mount(&h.qubo)
+        .await;
+
+    let devices = h
+        .supervisor
+        .refresh_devices()
+        .await
+        .expect("discovery heals");
+    assert!(
+        !devices.is_empty(),
+        "the devices came from the fresh session"
+    );
+    assert!(
+        !h.supervisor.needs_login(),
+        "a healed discovery never raises the login flag"
+    );
+    let stored = SessionStore::new(&h.sessions_path)
+        .load()
+        .expect("the session loads")
+        .expect("a session is stored");
+    assert_eq!(stored.access_token, "token-new");
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-2"));
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A refused refresh is the session's end, wherever the refusal lands:
+/// discovery degrades to the login flag and the stored session is left
+/// untouched.
+#[tokio::test]
+async fn a_refused_refresh_on_discovery_raises_the_login_flag() {
+    let h = harness(pacing(Duration::from_millis(120))).await;
+    SessionStore::new(&h.sessions_path)
+        .save(&durable_session("token-old", "refresh-1"))
+        .expect("the durable session saves");
+    for route in [UNITS_PATH, DEVICES_PATH] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(include_str!("fixtures/error_auth_002.json")),
+            )
+            .mount(&h.qubo)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(REFRESH_PATH))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(include_str!("fixtures/error_auth_002.json")),
+        )
+        .expect(1)
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .refresh_devices()
+        .await
+        .expect_err("the refused refresh is the end");
+    assert!(
+        h.supervisor.needs_login(),
+        "a discovery that cannot heal routes to login"
+    );
+    let stored = SessionStore::new(&h.sessions_path)
+        .load()
+        .expect("the session loads")
+        .expect("a session is stored");
+    assert_eq!(
+        stored.access_token, "token-old",
+        "a refused refresh does not clobber the stored session"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
 }
 
 /// A 401 mid-mint spends the stored refresh token once and runs the mint
@@ -1169,6 +1505,13 @@ async fn an_unreadable_or_missing_producer_does_not_heal() {
         h.supervisor.status(DEVICE_ID).await
     );
     h.go2rtc.set_streams_error(false);
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        ),
+        "the sampling window opens on a degraded stream"
+    );
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(
@@ -1204,12 +1547,12 @@ async fn an_unreadable_or_missing_producer_does_not_heal() {
 #[tokio::test]
 async fn a_held_stream_stays_warm_without_viewers() {
     let mut h = harness(pacing(Duration::from_secs(30))).await;
-    h.supervisor = h
-        .supervisor
-        .clone()
-        .with_hold(std::sync::Arc::new(common::FakeHold {
-            api: h.go2rtc.clone(),
-        }));
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
     mount_discovery(&h.qubo).await;
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one"]).await;
@@ -1243,12 +1586,12 @@ async fn the_hold_does_not_keep_a_stream_alive() {
         ..pacing(Duration::from_secs(30))
     })
     .await;
-    h.supervisor = h
-        .supervisor
-        .clone()
-        .with_hold(std::sync::Arc::new(common::FakeHold {
-            api: h.go2rtc.clone(),
-        }));
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
     mount_discovery(&h.qubo).await;
     h.supervisor.refresh_devices().await.expect("discovery");
     mount_mint_ladder(&h.qubo, &["one"]).await;
@@ -1267,6 +1610,120 @@ async fn the_hold_does_not_keep_a_stream_alive() {
     );
     let released = common::eventually(|| async { h.go2rtc.stream_view(&name).0 == 0 }).await;
     assert!(released, "and the hold is released with it");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A closed run leaves no stale deadline behind: a deadline armed during
+/// the run (here: a failed mint's backoff) must not fire after the
+/// recovery.
+#[tokio::test]
+async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
+    let h = harness(Pacing {
+        retry_base: Duration::from_millis(100),
+        retry_max: Duration::from_secs(10),
+        connect_window: Duration::from_secs(5),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(reminted, "the starved run re-mints: {:?}", h.go2rtc.puts());
+
+    // The cloud starts refusing: the loop backs off with a deadline armed.
+    mint_mock(500, "").with_priority(1).mount(&h.qubo).await;
+    let refused =
+        common::eventually(|| async { mint_count(&h.qubo).await > h.go2rtc.puts().len() }).await;
+    assert!(refused, "the run hit a refused mint: {:?}", h.go2rtc.puts());
+    // Let the storm grow the failure tail, so the leg below discriminates.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    // The camera's push lands on the URL already attached: the run closes
+    // while the failure's deadline is still standing.
+    h.go2rtc.connect_producer(&name);
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "the recovery closes the run");
+    let settled = mint_count(&h.qubo).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        mint_count(&h.qubo).await,
+        settled,
+        "no mint rides the closed run's stale deadline"
+    );
+    assert!(
+        is_live(&h.supervisor).await,
+        "and the state holds live: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    // The stale tail: from the recovery, a fresh storm retries at
+    // retry_base, not at the tail the closed run had grown. Refused mints
+    // are the observable: four-plus fit in the window with the reset, and
+    // a surviving tail puts the first gap alone at seconds.
+    h.go2rtc.disconnect_producer(&name);
+    h.go2rtc.set_viewers(&name, 1);
+    let before = mint_count(&h.qubo).await;
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let refusals = mint_count(&h.qubo).await - before;
+    assert!(
+        refusals >= 4,
+        "the post-recovery storm retries at retry_base: {refusals} refused mints in 1.6s"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// narar's own hold alone never opens a stall run: a held stream whose
+/// producer is away, with no viewers, stays as it was.
+#[tokio::test]
+async fn a_held_stream_with_a_dead_producer_opens_no_run() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let warm = common::eventually(|| async { h.go2rtc.stream_view(&name).1 }).await;
+    assert!(warm, "the hold warmed the producer");
+
+    // The camera goes away under the hold: the entry keeps its consumer
+    // (the hold) but the producer is not up. Nobody is watching.
+    h.go2rtc.disconnect_producer(&name);
+    let mints = h.go2rtc.puts().len();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            is_live(&h.supervisor).await,
+            "narar's own hold is not a viewer - no run opens: {:?}",
+            h.supervisor.status(DEVICE_ID).await
+        );
+    }
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        mints,
+        "and no re-mint went out: {:?}",
+        h.go2rtc.puts()
+    );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
@@ -1305,6 +1762,74 @@ async fn a_stall_re_mints_on_a_compounding_backoff() {
     assert!(
         (1..=6).contains(&minted),
         "paced, not per-slice: {minted} re-mints in a second"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A hold that never attaches must not shadow a real viewer: the viewer
+/// still counts as watching, so the idle window cannot tear the stream
+/// down under them.
+#[tokio::test]
+async fn a_never_attaching_hold_does_not_shadow_a_viewer() {
+    let mut h = harness(Pacing {
+        stream_idle: Duration::from_millis(150),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::never_attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "the viewer holds the stream past the idle window: {:?}",
+        h.go2rtc.deletes()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// And the other half: a never-attaching hold must not mask a starved
+/// viewer from the liveness watch - the run still opens and mints.
+#[tokio::test]
+async fn a_never_attaching_hold_does_not_mask_a_starved_viewer() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::never_attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(
+        reminted,
+        "the viewer's starvation still opens the run: {:?}",
+        h.go2rtc.puts()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

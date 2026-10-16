@@ -275,14 +275,31 @@ impl FakeApi {
 /// fake, so the producer stays warm while it is held.
 pub struct FakeHold {
     pub api: FakeApi,
+    attach: bool,
+}
+
+impl FakeHold {
+    /// A hold whose consumer attaches, as the ffmpeg does.
+    pub fn attaching(api: FakeApi) -> Self {
+        Self { api, attach: true }
+    }
+
+    /// A hold that never attaches - a wrong binary, a dead listener: the
+    /// registration exists, no consumer does.
+    pub fn never_attaching(api: FakeApi) -> Self {
+        Self { api, attach: false }
+    }
 }
 
 impl server::supervisor::StreamHold for FakeHold {
-    fn hold(&self, name: &str) -> Box<dyn server::supervisor::HoldLease> {
-        self.api.hold(name, true);
-        Box::new(FakeLease {
+    fn hold(&self, name: &str) -> std::sync::Arc<dyn server::supervisor::HoldLease> {
+        if self.attach {
+            self.api.hold(name, true);
+        }
+        std::sync::Arc::new(FakeLease {
             api: self.api.clone(),
             name: name.to_owned(),
+            attached: self.attach,
         })
     }
 }
@@ -290,13 +307,20 @@ impl server::supervisor::StreamHold for FakeHold {
 struct FakeLease {
     api: FakeApi,
     name: String,
+    attached: bool,
 }
 
-impl server::supervisor::HoldLease for FakeLease {}
+impl server::supervisor::HoldLease for FakeLease {
+    fn attached(&self) -> bool {
+        self.attached
+    }
+}
 
 impl Drop for FakeLease {
     fn drop(&mut self) {
-        self.api.hold(&self.name, false);
+        if self.attached {
+            self.api.hold(&self.name, false);
+        }
     }
 }
 
