@@ -46,6 +46,12 @@ fn pacing(stream_idle: Duration) -> Pacing {
 }
 
 async fn harness(stream_idle: Duration) -> Harness {
+    harness_with(pacing(stream_idle)).await
+}
+
+/// A harness on its own pacing, for tests that need the re-mint cadence
+/// or the retry backoff inside their window.
+async fn harness_with(pacing: Pacing) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     mount_discovery(&qubo).await;
@@ -59,12 +65,7 @@ async fn harness(stream_idle: Duration) -> Harness {
         })
         .expect("the session saves");
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
-    let supervisor = Supervisor::new(
-        client,
-        store,
-        Go2rtc::connect(go2rtc.base.clone()),
-        pacing(stream_idle),
-    );
+    let supervisor = Supervisor::new(client, store, Go2rtc::connect(go2rtc.base.clone()), pacing);
     supervisor.refresh_devices().await.expect("discovery");
     Harness {
         supervisor,
@@ -303,6 +304,57 @@ async fn an_idle_tile_is_dropped() {
         h.go2rtc.puts().len(),
         settled,
         "the dropped tile's loop is gone, not re-minting"
+    );
+}
+
+#[tokio::test]
+async fn the_chain_is_re_asserted_after_a_mint() {
+    let h = harness_with(Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_millis(20),
+        retry_max: Duration::from_millis(50),
+        discovery_retry: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(30),
+    })
+    .await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    // A go2rtc that refuses every source, as one that was down would: the
+    // tile's own ask cannot put its chain, and neither can the first mint.
+    h.go2rtc.set_put_status(500);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let chain = |h: &Harness| {
+        h.go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &format!("{DEVICE_ID}-low"))
+            .count()
+    };
+    let refused = common::eventually(|| async { chain(&h) >= 1 }).await;
+    assert!(refused, "the tile's own chain attempt was made");
+
+    // go2rtc answers again; the next mint is what puts the chain back, so
+    // a mint that re-asserts the tile is the only reason it exists.
+    h.go2rtc.set_put_status(200);
+    let re_asserted = common::eventually(|| async { chain(&h) >= 2 }).await;
+    assert!(
+        re_asserted,
+        "the mint re-asserted the tile's chain: {:?}",
+        h.go2rtc.puts()
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        ),
+        "and the tile rides the stream again"
     );
 }
 
