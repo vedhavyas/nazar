@@ -482,7 +482,9 @@ async fn a_still_comes_from_a_pipeline_already_running() {
         "nothing is grabbed from a camera that is not streaming"
     );
 
-    // With a live stream, the frame is taken and served.
+    // The stream is configured: the entry is there but the one-shot URL is
+    // unspent, and go2rtc's frame handler would dial it - taking a still
+    // would spend exactly what the viewer about to open the stream needs.
     let browser = client();
     let started = browser
         .post(format!("{}/api/cameras/{CAMERA}/live", h.base))
@@ -498,10 +500,7 @@ async fn a_still_comes_from_a_pipeline_already_running() {
     })
     .await;
     assert!(live, "the stream reached go2rtc");
-
-    // A configured but not running pipeline is not a live one: no still
-    // may be grabbed from it.
-    h.go2rtc.set_producers(false);
+    // Past the coalesce window, so the next sighting is its own episode.
     tokio::time::sleep(Duration::from_millis(150)).await;
     h.events.publish(motion(CAMERA));
     let told = common::eventually(|| async { h.store.list().len() == 2 }).await;
@@ -510,13 +509,12 @@ async fn a_still_comes_from_a_pipeline_already_running() {
     assert_eq!(
         h.store.list()[0].snapshot_url,
         None,
-        "a stream with no producer is not a pipeline that is running"
+        "a URL-only producer is not a pipeline that is running: no still spends the one-shot URL"
     );
 
-    // Running again: a fresh episode, past the window, and its still is
-    // taken.
-    h.go2rtc.set_producers(true);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // A viewer attached the producer: now a frame is free, and the still
+    // is taken.
+    h.go2rtc.set_viewers(&format!("{CAMERA}-high"), 1);
     h.events.publish(motion(CAMERA));
     let grabbed = common::eventually(|| async {
         h.store
@@ -627,6 +625,9 @@ async fn the_bell_rings_before_the_still_is_resolved() {
     })
     .await;
     assert!(live, "a pipeline is running, so the grab is a real one");
+    // A viewer on it, so the producer is actually up: the grab reads a
+    // free frame instead of dialling the URL for one.
+    h.go2rtc.set_viewers(&format!("{CAMERA}-high"), 1);
 
     let mut told = store.subscribe();
     h.events.publish(motion(CAMERA));
@@ -690,6 +691,9 @@ async fn the_still_landing_is_told_again() {
     })
     .await;
     assert!(live, "a pipeline is running, so the grab is a real one");
+    // A viewer on it, so the producer is actually up: the grab reads a
+    // free frame instead of dialling the URL for one.
+    h.go2rtc.set_viewers(&format!("{CAMERA}-high"), 1);
 
     let mut told = store.subscribe();
     h.events.publish(motion(CAMERA));

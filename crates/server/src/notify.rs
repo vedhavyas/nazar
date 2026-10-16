@@ -285,9 +285,12 @@ impl Snapshots {
         Self { go2rtc, dir }
     }
 
-    /// A served URL for `id`'s still, grabbed only when this device already
-    /// has a live pipeline: a frame is free where one is running and a
-    /// spawned producer where none is.
+    /// A served URL for `id`'s still, grabbed only while this device's
+    /// producer is already up: go2rtc's frame handler dials the producer,
+    /// and a still is not worth spending a one-shot URL the viewer about
+    /// to open the stream is going to need. The tradeoff: a stream nobody
+    /// watches yields its first still only once a real producer is up,
+    /// instead of burning the URL to take one.
     pub async fn grab(&self, id: &str, device_id: &str) -> Option<String> {
         let streams = match self.go2rtc.streams().await {
             Ok(streams) => streams,
@@ -299,7 +302,7 @@ impl Snapshots {
         let name = streams
             .iter()
             .find(|stream| {
-                stream.live
+                stream.connected
                     && (stream.name
                         == crate::supervisor::stream_name(device_id, qubo::Quality::High)
                         || stream.name
