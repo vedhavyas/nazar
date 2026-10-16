@@ -57,6 +57,7 @@ fn device_with(device_id: &str, device_type: &str) -> Device {
         model: String::new(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
+        controller_id: None,
     }
 }
 

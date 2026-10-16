@@ -94,6 +94,15 @@ async fn list_devices_reads_the_real_device_schema() {
             "the entity the device was listed under is carried"
         );
     }
+    assert_eq!(
+        devices[0].controller_id.as_deref(),
+        Some("d0000000-0000-4000-8000-000000000001"),
+        "the controllerUUID is read when the listing carries one"
+    );
+    assert_eq!(
+        devices[1].controller_id, None,
+        "a listing without a controllerUUID has none"
+    );
 }
 
 #[tokio::test]
