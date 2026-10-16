@@ -326,6 +326,7 @@ impl Supervisor {
         // consumer check keeps a watched one - a hero - alive regardless.
         let idle = self.pacing.stream_idle;
         let mut next_mint = Instant::now();
+        let mut failed = false;
         loop {
             let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
@@ -366,16 +367,21 @@ impl Supervisor {
             {
                 return;
             }
-            // An early wake - the idle window, not the re-mint cadence - is
-            // only a re-check: the mint waits for its own cadence, or for a
-            // person's retry, while a retired tile is dropped on its own
-            // window rather than on the mint's.
-            if !forced && Instant::now() < next_mint {
+            // A wake that is not due to mint is only a re-check: the mint
+            // waits for its own cadence, or for a person's Try again whose
+            // last mint failed - that one skips the backoff. A retry that
+            // arrived while a mint was already in flight is consumed when
+            // that mint succeeded: the person's wish is satisfied, and a
+            // stored permit must not mint again. A retired tile is dropped
+            // on its own window rather than on the mint's.
+            let retry_due = forced && failed;
+            if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
                 continue;
             }
             next_mint = match self.mint_and_swap(&device).await {
                 Ok(()) => {
+                    failed = false;
                     self.mark_live(&name).await;
                     self.reconcile_low(&name).await;
                     Instant::now() + self.pacing.remint
@@ -383,6 +389,7 @@ impl Supervisor {
                 Err(reason) => {
                     tracing::warn!(stream = %name, %reason, "stream re-mint failed");
                     self.mark_degraded(&name, reason).await;
+                    failed = true;
                     wait = if wait >= self.pacing.remint {
                         self.pacing.retry_base
                     } else {

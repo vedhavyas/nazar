@@ -549,6 +549,69 @@ async fn a_status_check_that_fails_keeps_the_stream() {
 }
 
 #[tokio::test]
+async fn a_retry_during_a_mint_does_not_mint_again() {
+    let h = harness(Duration::from_secs(30)).await;
+    // The camera refuses once, then answers slowly, so a second retry can
+    // land while the answering mint is still in flight.
+    mint_mock("high", 500, "boom".to_owned())
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(mint_body("high"))
+                .set_delay(Duration::from_millis(250)),
+        )
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let refused = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(refused, "a refused mint degrades the stream");
+
+    // The person's retry starts the slow answering mint...
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the retry");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // ...and a second retry lands while it is still in flight.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the second retry");
+
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "the answering mint landed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        2,
+        "a retry that landed during the mint is not a third mint"
+    );
+}
+
+#[tokio::test]
 async fn only_a_persons_retry_skips_the_backoff() {
     let h = harness(Duration::from_secs(30)).await;
     // The camera refuses once, then answers; the first mint takes the
