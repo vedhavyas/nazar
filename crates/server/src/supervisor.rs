@@ -346,9 +346,10 @@ pub struct Supervisor {
     prefer_p2p: Arc<HashSet<String>>,
     /// The armed fast-lane session per camera - one, never two.
     armed: Arc<RwLock<HashMap<String, Arc<dyn LaneSession>>>>,
-    /// Serializes arm-or-reuse decisions, so two streams for one camera
-    /// asking at the same moment cannot both arm.
-    arm_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes arm-or-reuse decisions per camera, so two streams for one
+    /// camera asking at the same moment cannot both arm - and one camera's
+    /// arm never queues behind another's.
+    arm_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// narar's own consumer on a stream, held for the loop's lifetime and
@@ -394,7 +395,7 @@ impl Supervisor {
             lane: None,
             prefer_p2p: Arc::new(HashSet::new()),
             armed: Arc::new(RwLock::new(HashMap::new())),
-            arm_lock: Arc::new(tokio::sync::Mutex::new(())),
+            arm_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -471,6 +472,17 @@ impl Supervisor {
         session.alive().then_some(session)
     }
 
+    /// The camera's own arm lock, created on first use.
+    async fn arm_lock_for(&self, device_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.arm_locks
+                .write()
+                .await
+                .entry(device_id.to_owned())
+                .or_default(),
+        )
+    }
+
     /// The camera's fast-lane session, arming one if none is live: one
     /// session per camera, and a second ask reuses it rather than stacking.
     async fn lane_session(
@@ -478,7 +490,11 @@ impl Supervisor {
         lane: &Arc<dyn Lane>,
         device: &Device,
     ) -> Result<Arc<dyn LaneSession>, String> {
-        let _serialized = self.arm_lock.lock().await;
+        let _serialized = self
+            .arm_lock_for(&device.device_id)
+            .await
+            .lock_owned()
+            .await;
         if let Some(session) = self.fast_lane_for(&device.device_id).await {
             return Ok(session);
         }

@@ -38,6 +38,7 @@ use server::supervisor::{Lane, LaneSession};
 pub struct FakeLane {
     session: Arc<FakeSession>,
     arms: Arc<AtomicUsize>,
+    armed_devices: Arc<Mutex<Vec<String>>>,
     outcome: Arc<Mutex<FakeOutcome>>,
 }
 
@@ -57,8 +58,14 @@ impl FakeLane {
                 alive: AtomicBool::new(true),
             }),
             arms: Arc::new(AtomicUsize::new(0)),
+            armed_devices: Arc::new(Mutex::new(Vec::new())),
             outcome: Arc::new(Mutex::new(outcome)),
         }
+    }
+
+    /// The devices whose arms were invoked, in order.
+    pub fn armed_devices(&self) -> Vec<String> {
+        self.armed_devices.lock().unwrap().clone()
     }
 
     /// An engine that arms instantly.
@@ -101,9 +108,10 @@ impl FakeSession {
 impl Lane for FakeLane {
     fn arm(
         &self,
-        _device: Device,
+        device: Device,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn LaneSession>, String>> + Send>> {
         self.arms.fetch_add(1, Ordering::SeqCst);
+        self.armed_devices.lock().unwrap().push(device.device_id);
         // A fresh arm hands back a live session, whatever a previous one's
         // fate was: the real engine never returns a dead one.
         self.session.alive.store(true, Ordering::SeqCst);

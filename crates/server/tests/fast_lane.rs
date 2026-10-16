@@ -29,6 +29,7 @@ const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const ENTITY: &str = "30000000-0000-4000-8000-000000000001";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const SECOND_CAMERA: &str = "7d2b4a11-9c3e-4f5a-b6d7-8e9f0a1b2c03";
 const CONTROLLER: &str = "d0000000-0000-4000-8000-000000000001";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
@@ -145,8 +146,11 @@ async fn mount_discovery(server: &MockServer) {
     mount_json(
         server,
         DEVICES_PATH,
-        json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01", "entityUUID": ENTITY, "controllerUUID": CONTROLLER }] })
-            .to_string(),
+        json!({ "data": [
+            { "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01", "entityUUID": ENTITY, "controllerUUID": CONTROLLER },
+            { "deviceUUID": SECOND_CAMERA, "deviceName": "Gate", "deviceType": "HCP01", "entityUUID": ENTITY },
+        ] })
+        .to_string(),
     )
     .await;
 }
@@ -297,6 +301,43 @@ async fn a_hanging_arm_falls_back_within_the_bound() {
         h.lane.arms(),
         1,
         "the fast lane was still only attempted once"
+    );
+}
+
+#[tokio::test]
+async fn one_cameras_slow_arm_does_not_hold_another_camera_back() {
+    // Camera A's arm hangs; camera B asks while it does. The arm lock is
+    // per camera, so B's arm is invoked promptly - a global lock would
+    // queue B behind A's whole attempt.
+    let h = harness(
+        FakeLane::hanging(Duration::from_secs(30)),
+        vec![DEVICE_ID.to_owned(), SECOND_CAMERA.to_owned()],
+        // Long enough that A's hanging attempt would hold a shared lock for
+        // the whole test window.
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the first camera's ensure accepts");
+    // Let A enter its attempt, then ask for B.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.supervisor
+        .ensure(SECOND_CAMERA, Quality::High, false)
+        .await
+        .expect("the second camera's ensure accepts");
+
+    let reached = common::eventually(|| async {
+        h.lane.armed_devices().iter().any(|id| id == SECOND_CAMERA)
+    })
+    .await;
+    assert!(
+        reached,
+        "camera B's arm ran while camera A's was still hanging: {:?}",
+        h.lane.armed_devices()
     );
 }
 
