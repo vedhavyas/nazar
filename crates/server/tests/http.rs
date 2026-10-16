@@ -274,6 +274,48 @@ async fn only_cameras_are_listed() {
 }
 
 #[tokio::test]
+async fn the_live_listing_shows_the_cameras_it_carries() {
+    let h = harness().await;
+    mount_json(
+        &h.qubo,
+        UNITS_PATH,
+        json!([{ "unitUUID": UNIT, "name": "Home" }]).to_string(),
+    )
+    .await;
+    // The 2026-10-16 capture verbatim: on the live wire the deviceType is
+    // the product family and the model rides aModelNo. A filter that reads
+    // the type alone renders this house empty - the bug this pins.
+    mount_json(
+        &h.qubo,
+        DEVICES_PATH,
+        include_str!("../../qubo/tests/fixtures/devices_live.json").to_owned(),
+    )
+    .await;
+
+    let page: Value = client()
+        .get(format!("{}/api/cameras", h.base))
+        .send()
+        .await
+        .expect("cameras")
+        .json()
+        .await
+        .expect("json");
+
+    let names: Vec<&str> = page["cameras"]
+        .as_array()
+        .expect("cameras")
+        .iter()
+        .map(|camera| camera["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Cam360 3MP", "First floor", "Second floor", "Front Door"],
+        "the live house shows its four cameras, not an empty page"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn watching_a_camera_starts_the_stream() {
     let h = harness().await;
     mount_discovery(&h.qubo).await;

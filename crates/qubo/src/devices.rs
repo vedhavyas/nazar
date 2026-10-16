@@ -14,16 +14,24 @@ pub struct Device {
     pub device_id: String,
     pub name: String,
     pub device_type: String,
+    pub model: String,
     pub unit_id: String,
     pub entity_id: String,
 }
 
 impl Device {
-    /// Whether this is one of the camera families. The model prefixes are
-    /// the reference client's (HCP, HCO, HCD: `qubopy/devices/camera.py`);
-    /// a listing that does not say what a device is keeps it, because
-    /// hiding a camera is far worse than showing a purifier.
+    /// Whether this is one of the camera families. The live wire's
+    /// `deviceType` is the product family (`ptzCamera3MP`,
+    /// `smartAirPurifierX4`, `mobile`), so the model - `aModelNo`, e.g.
+    /// `HCP01` - is what decides; the type only decides for older shapes
+    /// that carried the model in it. The model prefixes are the reference
+    /// client's (HCP, HCO, HCD: `qubopy/devices/camera.py`); a listing that
+    /// says nothing about the device keeps it, because hiding a camera is
+    /// far worse than showing a purifier.
     pub fn is_camera(&self) -> bool {
+        if !self.model.is_empty() {
+            return self.model.starts_with("HC");
+        }
         self.device_type.is_empty() || self.device_type.starts_with("HC")
     }
 }
@@ -124,6 +132,11 @@ fn device_of(value: &Value, unit_id: &str) -> Option<Device> {
     let name = string_of(value, &["deviceName", "name"])
         .unwrap_or_else(|| format!("Qubo {}", device_id.get(..6).unwrap_or(&device_id)));
     let device_type = string_of(value, &["deviceType", "type"]).unwrap_or_default();
+    // The live listing carries the model here; the older decompile-era
+    // shapes carried it in `deviceType`. Aliases match the reference
+    // client's (`qubopy`).
+    let model =
+        string_of(value, &["aModelNo", "modelNo", "model", "deviceModel"]).unwrap_or_default();
     // Shadow and command paths carry the entity; the placeholder is the
     // reference client's fallback for a listing that omits it.
     let entity_id =
@@ -132,6 +145,7 @@ fn device_of(value: &Value, unit_id: &str) -> Option<Device> {
         device_id,
         name,
         device_type,
+        model,
         unit_id: unit_id.to_owned(),
         entity_id,
     })

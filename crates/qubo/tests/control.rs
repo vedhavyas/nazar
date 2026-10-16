@@ -46,6 +46,7 @@ fn camera() -> Device {
         device_id: DEVICE_ID.into(),
         name: "Hall".into(),
         device_type: "HCP01".into(),
+        model: "HCP01".into(),
         unit_id: UNIT.into(),
         entity_id: ENTITY.into(),
     }

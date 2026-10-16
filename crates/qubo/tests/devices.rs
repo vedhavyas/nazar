@@ -5,6 +5,12 @@
 //! `deviceName`, `deviceType`, `aModelNo`, `extraData`), which the spec marks
 //! inferrable - the live listing was verified 2026-10-13 but its raw JSON was
 //! never recorded. `devices_alias.json` exercises the documented key aliases.
+//!
+//! `devices_live.json` is the 2026-10-16 live capture (7 devices: four
+//! `ptzCamera3MP`/`HCP01` cameras, an `smartAirPurifierX4`/`HPH04A`, a
+//! `smartAirPurifierQ200`/`HPH01A`, and the `mobile` app row). The wire's
+//! own `deviceType`, `aModelNo` and `deviceName` values are kept verbatim;
+//! the identities (uuids, MACs, serials) are synthesized.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -13,7 +19,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use qubo::client::QuboClient;
-use qubo::devices::list_devices;
+use qubo::devices::{Device, list_devices};
 use qubo::session::Session;
 
 const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
@@ -139,4 +145,71 @@ fn two_units() -> String {
     let mut extra = units[0].clone();
     extra["unitUUID"] = Value::String(SECOND_UNIT.to_owned());
     Value::Array(vec![units[0].clone(), extra]).to_string()
+}
+
+/// The live capture as the house sees it: the cameras of the family, and
+/// nothing else. The wire's `deviceType` is the product family there, so a
+/// filter that reads it finds no cameras at all and the house renders empty.
+#[tokio::test]
+async fn list_devices_sees_the_cameras_the_live_wire_carries() {
+    let server = MockServer::start().await;
+    mount_get(&server, UNITS_PATH, include_str!("fixtures/units.json")).await;
+    mount_get(
+        &server,
+        DEVICES_PATH,
+        include_str!("fixtures/devices_live.json"),
+    )
+    .await;
+
+    let client = client_for(&server);
+    let devices = list_devices(&client, &session())
+        .await
+        .expect("listing succeeds");
+    assert_eq!(devices.len(), 7, "every device in the live unit is listed");
+
+    let cameras: Vec<&str> = devices
+        .iter()
+        .filter(|device| device.is_camera())
+        .map(|device| device.name.as_str())
+        .collect();
+    assert_eq!(
+        cameras,
+        vec!["Cam360 3MP", "First floor", "Second floor", "Front Door"],
+        "the four ptzCamera3MP devices are the cameras; the purifiers and the app row are not"
+    );
+    for device in devices.iter().filter(|device| device.is_camera()) {
+        assert_eq!(device.model, "HCP01", "each camera's model is its aModelNo");
+    }
+}
+
+fn device(device_type: &str, model: &str) -> Device {
+    Device {
+        device_id: "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01".into(),
+        name: "Hall".into(),
+        device_type: device_type.into(),
+        model: model.into(),
+        unit_id: UNIT.into(),
+        entity_id: "default".into(),
+    }
+}
+
+/// The camera filter across every shape the wire has shown: the live family
+/// strings, the decompile-era shape that carried the model in the type, and
+/// the empty listing that must stay visible.
+#[test]
+fn is_camera_decides_on_the_model_the_wire_carries() {
+    for (device_type, model, want) in [
+        ("ptzCamera3MP", "HCP01", true),
+        ("smartAirPurifierX4", "HPH04A", false),
+        ("smartAirPurifierQ200", "HPH01A", false),
+        ("mobile", "", false),
+        ("HCP01", "", true),
+        ("", "", true),
+    ] {
+        assert_eq!(
+            device(device_type, model).is_camera(),
+            want,
+            "deviceType {device_type:?} / model {model:?}"
+        );
+    }
 }

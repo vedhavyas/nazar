@@ -47,6 +47,9 @@ fn device(device_type: &str) -> Device {
         device_id: DEVICE_ID.into(),
         name: "Hall".into(),
         device_type: device_type.into(),
+        // The mint carries the type; the model is not part of its wire
+        // shape, so the helper leaves it unset.
+        model: String::new(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
     }
