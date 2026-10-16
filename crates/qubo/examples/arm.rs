@@ -13,6 +13,13 @@
 //!     --camera-controller d0000000-0000-4000-8000-000000000001 \
 //!     --seconds 60
 //!
+//! `--talk <seconds>` chains a talk burst right after the arm: start_talk
+//! (the setStreamState update over the data channel), a 440 Hz tone pushed
+//! as 20 ms PT 97 frames for that long, then stop_talk. The objective
+//! capture is on the wire - the heartbeat's HTTP responses, the control
+//! datagrams the camera sends back (logged with RUST_LOG=qubo=debug), its
+//! own reporting; hearing the tone needs an ear in the house.
+//!
 //! The identity defaults are the capture's own (the phone's unit device),
 //! exactly what the Python reference ran with. Acceptance is the
 //! `relay engaged` debug line within ~1s of the register, then `extended
@@ -75,6 +82,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         args.seconds
     );
 
+    if args.talk > 0 {
+        hold_talk(&mut armed, args.talk).await?;
+    }
+
     let deadline = std::time::Instant::now() + Duration::from_secs(args.seconds);
     let mut datagrams = 0_u32;
     let mut payload_types = std::collections::BTreeSet::new();
@@ -124,6 +135,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Hold a talk burst: start_talk, `seconds` of 440 Hz tone pushed as 20 ms
+/// PT 97 frames, stop_talk.
+async fn hold_talk(armed: &mut qubo::ArmedSession, seconds: u64) -> Result<(), Box<dyn Error>> {
+    println!("[talk] holding a 440 Hz tone for {seconds}s (chained after the arm)");
+    armed.start_talk().await?;
+    let frames = seconds * 50;
+    let mut start_sample = 0_u32;
+    for index in 0..frames {
+        armed.push_audio(&tone_frame(start_sample)).await?;
+        start_sample = start_sample.saturating_add(320);
+        if index % 50 == 49 {
+            println!("[talk] {}s of tone pushed", (index + 1) / 50);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    armed.stop_talk().await?;
+    println!("[talk] burst done; the setStreamState off went out");
+    Ok(())
+}
+
+/// A 440 Hz square tone as 16-bit mono PCM: one 20 ms frame (320 samples at
+/// 16 kHz) starting at `start_sample` - integer-only, so the example holds
+/// no float casts.
+fn tone_frame(start_sample: u32) -> Vec<u8> {
+    const RATE: u32 = 16_000;
+    const TONE_HZ: u32 = 440;
+    const SAMPLES: u32 = 320;
+    const HALF_PERIOD: u32 = RATE / (TONE_HZ * 2);
+    let mut frame = Vec::new();
+    for sample in 0..SAMPLES {
+        let phase = (start_sample + sample) / HALF_PERIOD;
+        let amplitude: i16 = if phase.is_multiple_of(2) {
+            9_000
+        } else {
+            -9_000
+        };
+        frame.extend_from_slice(&amplitude.to_le_bytes());
+    }
+    frame
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut out, byte| {
@@ -142,6 +194,8 @@ struct Args {
     src_device_id: String,
     camera_controller: String,
     seconds: u64,
+    /// Seconds of 440 Hz tone to push after the arm; 0 = no talk burst.
+    talk: u64,
     aes_mode: AesMode,
     hold_beat: bool,
 }
@@ -156,6 +210,7 @@ impl Args {
             src_device_id: "<mobile-id>".to_owned(),
             camera_controller: "d0000000-0000-4000-8000-000000000001".to_owned(),
             seconds: 60,
+            talk: 0,
             aes_mode: AesMode::CtrCont,
             hold_beat: false,
         };
@@ -176,6 +231,7 @@ impl Args {
                 "--src-device-id" => args.src_device_id = value,
                 "--camera-controller" => args.camera_controller = value,
                 "--seconds" => args.seconds = value.parse()?,
+                "--talk" => args.talk = value.parse()?,
                 // The captures never proved the mode (protocol 6.5); switch
                 // it here when a run shows garbage plaintext.
                 "--aes-mode" => {

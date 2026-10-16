@@ -826,6 +826,14 @@ impl ArmedSession {
                         let _ = self.socket.send_to(&ack, from).await;
                     }
                 }
+                // The live windows' transcripts want every control datagram
+                // the peer sends mid-session, whatever it turns out to be.
+                tracing::debug!(
+                    len = data.len(),
+                    from = %from,
+                    head = %hex_head(data),
+                    "control datagram",
+                );
                 continue;
             }
             let header_len = media::rtp_header_len(data);
@@ -964,6 +972,16 @@ impl Drop for ArmedSession {
 
 fn peer_ack_of(txid: &[u8]) -> Option<[u8; 44]> {
     relay::peer_ack(txid, &random_nonce())
+}
+
+/// The first bytes of a datagram, hex, for the debug logs the live windows
+/// read.
+fn hex_head(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+    data.iter().take(32).fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 fn random_nonce() -> [u8; 20] {
