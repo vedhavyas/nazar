@@ -186,11 +186,13 @@ async fn an_arm_publishes_the_start_call_and_resubscribes_after_a_blip() {
         access_token: "token-abc".to_owned(),
         uuid: "user-uuid-1".to_owned(),
         email: None,
+        refresh_token: None,
     };
     let device = Device {
         device_id: CAMERA.to_owned(),
         name: "Hall".to_owned(),
         device_type: "HCP01".to_owned(),
+        model: "HCP01".to_owned(),
         unit_id: UNIT.to_owned(),
         entity_id: "default".to_owned(),
         controller_id: None,

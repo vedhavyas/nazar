@@ -200,6 +200,7 @@ fn device(device_type: &str, model: &str) -> Device {
         model: model.into(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
+        controller_id: None,
     }
 }
 

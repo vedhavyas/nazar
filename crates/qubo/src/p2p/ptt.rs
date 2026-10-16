@@ -192,6 +192,7 @@ mod tests {
                 access_token: "token".to_owned(),
                 uuid: "user".to_owned(),
                 email: None,
+                refresh_token: None,
             },
             unit_id: "unit".to_owned(),
             user_app_id: "self".to_owned(),

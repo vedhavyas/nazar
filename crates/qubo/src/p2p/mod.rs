@@ -1212,6 +1212,7 @@ mod tests {
                     access_token: "token".to_owned(),
                     uuid: "user".to_owned(),
                     email: None,
+                    refresh_token: None,
                 },
                 unit_id: "unit".to_owned(),
                 user_app_id: "self".to_owned(),
@@ -1285,6 +1286,7 @@ mod tests {
                     access_token: "token".to_owned(),
                     uuid: "user".to_owned(),
                     email: None,
+                    refresh_token: None,
                 },
                 unit_id: "unit".to_owned(),
                 user_app_id: "self".to_owned(),
@@ -1737,6 +1739,7 @@ mod tests {
             access_token: "t".to_owned(),
             uuid: "u".to_owned(),
             email: None,
+            refresh_token: None,
         };
         let broker = engine.connect_broker(&session, "unit", "/monitor/unit/cam/p2pStreaming");
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1757,6 +1760,7 @@ mod tests {
             device_id: "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01".to_owned(),
             name: "Hall".to_owned(),
             device_type: "HCP01".to_owned(),
+            model: "HCP01".to_owned(),
             unit_id: "unit".to_owned(),
             entity_id: "default".to_owned(),
             controller_id: controller.map(str::to_owned),

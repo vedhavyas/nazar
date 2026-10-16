@@ -570,7 +570,10 @@ fn streams_methods(
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
             let source = params.get("src").cloned().unwrap_or_default();
-            recorded.lock().unwrap().push((name.clone(), source.clone()));
+            recorded
+                .lock()
+                .unwrap()
+                .push((name.clone(), source.clone()));
             // A fresh source is a fresh URL. Attached consumers - viewers
             // or narar's own hold - ride the swap, as go2rtc swaps the
             // source under the stream's name: their producer restarts and

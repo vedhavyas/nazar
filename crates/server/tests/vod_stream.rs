@@ -83,6 +83,8 @@ async fn harness(stream_idle: Duration) -> Harness {
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
             warm_idle: Duration::from_secs(60),
+            arm_timeout: Duration::from_secs(15),
+            lane_cooldown: Duration::from_secs(600),
         },
     );
     let snapshots = Snapshots::new(

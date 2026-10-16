@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         device_id: args.camera.clone(),
         name: "camera".to_owned(),
         device_type: String::new(),
+        model: String::new(),
         unit_id: args.unit.clone(),
         entity_id: String::new(),
         controller_id: Some(args.camera_controller.clone()),

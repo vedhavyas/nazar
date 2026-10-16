@@ -20,6 +20,7 @@ use server::events::EventBus;
 use server::go2rtc::Go2rtc;
 use server::http::{AppState, ControlTiming, Wiring, app};
 use server::motion::MotionOrder;
+use server::notify::{NotificationStore, Snapshots};
 use server::supervisor::{LaneSession, Pacing, StreamState, Supervisor};
 use tokio::net::TcpListener;
 
@@ -72,6 +73,7 @@ async fn harness(
             access_token: "token-abc".to_owned(),
             uuid: "user-uuid-1".to_owned(),
             email: None,
+            refresh_token: None,
         })
         .expect("a stored session");
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
@@ -79,13 +81,18 @@ async fn harness(
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
         Pacing {
             remint,
             retry_base: Duration::from_millis(20),
             retry_max: Duration::from_millis(200),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
+            connect_grace: Duration::from_millis(50),
+            connect_window: Duration::from_millis(300),
+            liveness_poll: Duration::from_millis(50),
+            touch_ttl: Duration::from_millis(300),
+            warm_idle: Duration::from_secs(60),
             arm_timeout,
             lane_cooldown,
         },
@@ -104,6 +111,15 @@ async fn harness(
             go2rtc_api: go2rtc.base.to_string(),
             events: EventBus::new(),
             motion: Arc::new(std::sync::Mutex::new(MotionOrder::new())),
+            notifications: Arc::new(NotificationStore::open(
+                data_dir.join("notifications.json"),
+                Duration::from_secs(30),
+            )),
+            episodes: common::episodes_in(&data_dir),
+            snapshots: Snapshots::new(
+                Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+                data_dir.join("snaps"),
+            ),
         },
     );
     state.control = ControlTiming {
@@ -603,14 +619,18 @@ async fn a_second_stream_reuses_the_camera_session() {
         "one fast-lane session per camera, never two"
     );
     let puts = h.go2rtc.puts();
-    for quality in ["high", "low"] {
-        let name = format!("{DEVICE_ID}-{quality}");
-        assert!(
-            puts.iter()
-                .any(|(stream, source)| stream == &name && source.contains("nazar-fake.sdp")),
-            "the {quality} stream is fed by the one session: {puts:?}"
-        );
-    }
+    let high = format!("{DEVICE_ID}-high");
+    let low = format!("{DEVICE_ID}-low");
+    assert!(
+        puts.iter()
+            .any(|(stream, source)| stream == &high && source.contains("nazar-fake.sdp")),
+        "the high stream is fed by the one session: {puts:?}"
+    );
+    assert!(
+        puts.iter()
+            .any(|(stream, source)| stream == &low && source == &server::go2rtc::low_source(&high)),
+        "the low rides the high inside go2rtc: one session reader serves the camera: {puts:?}"
+    );
 }
 
 #[tokio::test]

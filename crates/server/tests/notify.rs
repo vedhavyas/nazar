@@ -385,6 +385,8 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
             warm_idle: Duration::from_secs(60),
+            arm_timeout: Duration::from_secs(15),
+            lane_cooldown: Duration::from_secs(600),
         },
     );
     let episodes = common::episodes_in(&data_dir);

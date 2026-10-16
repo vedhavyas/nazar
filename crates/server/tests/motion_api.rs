@@ -60,6 +60,24 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Long: a re-mint inside a window is the wake's doing.
+fn pacing() -> Pacing {
+    Pacing {
+        remint: Duration::from_secs(30),
+        retry_base: Duration::from_secs(30),
+        retry_max: Duration::from_secs(30),
+        discovery_retry: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(120),
+        connect_grace: Duration::from_millis(50),
+        connect_window: Duration::from_millis(300),
+        liveness_poll: Duration::from_millis(50),
+        touch_ttl: Duration::from_millis(300),
+        warm_idle: Duration::from_secs(60),
+        arm_timeout: Duration::from_secs(15),
+        lane_cooldown: Duration::from_secs(600),
+    }
+}
+
 async fn harness() -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
@@ -113,26 +131,7 @@ async fn harness() -> Harness {
         .await;
 
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
-    let supervisor = Supervisor::new(
-        client.clone(),
-        sessions.clone(),
-        attach(&go2rtc),
-        // Long: a re-mint inside a window is the wake's doing.
-        Pacing {
-            remint: Duration::from_secs(30),
-            retry_base: Duration::from_secs(30),
-            retry_max: Duration::from_secs(30),
-            discovery_retry: Duration::from_secs(30),
-            stream_idle: Duration::from_secs(120),
-            connect_grace: Duration::from_millis(50),
-            connect_window: Duration::from_millis(300),
-            liveness_poll: Duration::from_millis(50),
-            touch_ttl: Duration::from_millis(300),
-            warm_idle: Duration::from_secs(60),
-            arm_timeout: Duration::from_secs(15),
-            lane_cooldown: Duration::from_secs(600),
-        },
-    );
+    let supervisor = Supervisor::new(client.clone(), sessions.clone(), attach(&go2rtc), pacing());
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     server::motion::follow(&events, Arc::clone(&motion), &supervisor);

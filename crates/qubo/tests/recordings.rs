@@ -51,6 +51,7 @@ fn device() -> Device {
         model: "HCP01".into(),
         unit_id: UNIT.into(),
         entity_id: "default".into(),
+        controller_id: None,
     }
 }
 
