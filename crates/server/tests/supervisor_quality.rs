@@ -307,6 +307,52 @@ async fn an_idle_tile_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_request_landing_during_teardown_gets_a_fresh_stream() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    // The teardown's deletes are slow, so the request below lands inside
+    // them: the window is opened by hand, not waited for.
+    h.go2rtc.set_delete_delay(Duration::from_millis(300));
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream wakes");
+    // Nobody asks again, so past the idle window the loop walks into its
+    // teardown and blocks on the slow deletes.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let raced = h
+        .supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the race survives");
+    assert_eq!(
+        raced,
+        StreamState::Waking,
+        "a request during the teardown is told the truth: the stream is being started again, \
+         not Live onto a stream that is being deleted under it"
+    );
+
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "and a fresh stream lands");
+    let puts = h.go2rtc.puts();
+    assert!(
+        puts.iter()
+            .filter(|(name, _)| name == &format!("{DEVICE_ID}-high"))
+            .count()
+            >= 2,
+        "the fresh stream was handed to go2rtc after the teardown: {puts:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_retired_tile_is_dropped_while_the_hero_keeps_streaming() {
     let h = harness(Duration::from_millis(80)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;

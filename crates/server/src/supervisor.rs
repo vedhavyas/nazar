@@ -419,12 +419,35 @@ impl Supervisor {
     /// deciding belongs to somebody who is watching, and must not have its
     /// stream deleted under it. The last request is the entry's identity -
     /// an elapsed duration just keeps growing and can never be compared.
+    ///
+    /// The entry is claimed - removed from the state - and the state lock
+    /// is held until go2rtc has forgotten the stream: a request that lands
+    /// while the deletes are in flight waits for the claim, finds no
+    /// entry, and spawns a fresh stream, rather than being told Live about
+    /// one that is being deleted under it.
     async fn teardown_if_idle(&self, name: &str, seen_at: Instant) -> bool {
-        if self.last_request_at(name).await != Some(seen_at) {
-            tracing::debug!(stream = name, "a request landed; the stream is not idle");
-            return false;
+        let mut state = self.state.write().await;
+        match state.get(name) {
+            Some(tracked) if tracked.last_request == seen_at => {
+                state.remove(name);
+            }
+            _ => {
+                tracing::debug!(stream = name, "a request landed; the stream is not idle");
+                return false;
+            }
         }
-        self.teardown(name).await;
+        if let Some(low) = low_name_of(name) {
+            // Only the tile that is still tracked: one its own reconcile
+            // already retired is gone from go2rtc too.
+            let known = state.remove(&low).is_some();
+            if known && let Err(err) = self.go2rtc.delete_stream(&low).await {
+                tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
+            }
+        }
+        if let Err(err) = self.go2rtc.delete_stream(name).await {
+            tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+        }
+        tracing::info!(stream = name, "idle stream dropped");
         true
     }
 
@@ -435,24 +458,6 @@ impl Supervisor {
             .await
             .get(name)
             .map(|tracked| tracked.last_request)
-    }
-
-    /// Drop a stream nobody asked for: go2rtc's copy and the tracked
-    /// entry. The tile rendition rides this stream, so it goes with it. No
-    /// reference shows an API that releases a minted session - it expires
-    /// on its own - so dropping the stream is the whole release.
-    async fn teardown(&self, name: &str) {
-        if let Some(low) = low_name_of(name) {
-            let known = self.state.write().await.remove(&low).is_some();
-            if known && let Err(err) = self.go2rtc.delete_stream(&low).await {
-                tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
-            }
-        }
-        if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
-        }
-        self.state.write().await.remove(name);
-        tracing::info!(stream = name, "idle stream dropped");
     }
 
     /// Keep the tile rendition honest after a mint: re-assert its chain, or
@@ -466,11 +471,8 @@ impl Supervisor {
             return;
         };
         if last.elapsed() >= self.pacing.stream_idle {
-            // The same identity guard as the loop's own teardown: a tile
-            // asked for while this cycle was deciding must not be dropped
-            // under it.
-            if self.last_request_at(&low).await == Some(last) && !self.watched(&low).await {
-                self.drop_low(&low).await;
+            if !self.watched(&low).await {
+                self.drop_low_if_idle(&low, last).await;
             }
             return;
         }
@@ -487,13 +489,26 @@ impl Supervisor {
         }
     }
 
-    /// Drop a retired tile rendition: go2rtc's copy and the tracked entry.
-    async fn drop_low(&self, low: &str) {
+    /// Drop a retired tile rendition, if the entry this cycle decided
+    /// about is still the entry that is there: a tile asked for while the
+    /// cycle was deciding must not be dropped under it. The claim and the
+    /// delete both run under the state lock, the same shape as the cloud
+    /// stream's teardown: a tile asked for mid-drop waits and registers a
+    /// fresh chain, rather than having the chain it just asked for deleted
+    /// under it.
+    async fn drop_low_if_idle(&self, low: &str, seen_at: Instant) -> bool {
+        let mut state = self.state.write().await;
+        match state.get(low) {
+            Some(tracked) if tracked.last_request == seen_at => {
+                state.remove(low);
+            }
+            _ => return false,
+        }
         if let Err(err) = self.go2rtc.delete_stream(low).await {
             tracing::warn!(stream = low, %err, "the retired tile rendition could not be dropped");
         }
-        self.state.write().await.remove(low);
         tracing::info!(stream = low, "retired tile rendition dropped");
+        true
     }
 
     /// Whether go2rtc has a viewer on the stream, or - for a cloud stream -
@@ -620,7 +635,10 @@ fn redact(text: &str) -> String {
 mod tests {
     //! The idle teardown's decision window, which no integration test can
     //! land in: the loop's look and its teardown are microseconds apart.
-    //! Here the window is opened by hand, between the two calls.
+    //! Here the window is opened by hand, between the two calls. The other
+    //! half of the race - a request landing while the teardown's deletes
+    //! are in flight - is pinned in supervisor_quality, where the fake
+    //! go2rtc can be made slow to delete.
 
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -681,6 +699,14 @@ mod tests {
         assert!(
             !supervisor.state.read().await.contains_key(&name),
             "and forgotten"
+        );
+        // The entry is gone with the decision: a request arriving after
+        // the teardown finds nothing to be told Live about, and spawns a
+        // fresh stream instead.
+        assert_eq!(
+            supervisor.last_request_at(&name).await,
+            None,
+            "the claim takes the entry before the stream is deleted"
         );
     }
 }

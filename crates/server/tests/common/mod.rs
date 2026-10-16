@@ -5,7 +5,7 @@
 pub mod mqtt;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,9 @@ pub struct FakeApi {
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
+    /// How long a DELETE takes to answer, in milliseconds: a teardown that
+    /// can be caught mid-flight.
+    delete_delay: Arc<AtomicU64>,
 }
 
 impl FakeApi {
@@ -37,6 +40,7 @@ impl FakeApi {
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
+        let delete_delay = Arc::new(AtomicU64::new(0));
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
@@ -44,6 +48,7 @@ impl FakeApi {
             &streams_visible,
             &streams_error,
             &viewers,
+            &delete_delay,
         ));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -60,7 +65,17 @@ impl FakeApi {
             streams_visible,
             streams_error,
             viewers,
+            delete_delay,
         }
+    }
+
+    /// Make every DELETE take `delay` to answer, as a go2rtc under load
+    /// would: a teardown can then be caught mid-flight.
+    pub fn set_delete_delay(&self, delay: Duration) {
+        self.delete_delay.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     /// Report `count` viewers on the stream, as go2rtc does while a browser
@@ -105,6 +120,7 @@ fn streams_routes(
     streams_visible: &Arc<AtomicBool>,
     streams_error: &Arc<AtomicBool>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
+    delete_delay: &Arc<AtomicU64>,
 ) -> Router {
     Router::new().route("/api/ws", get(echo)).route(
         "/api/streams",
@@ -137,9 +153,15 @@ fn streams_routes(
         })
         .delete({
             let dropped = Arc::clone(deletes);
+            let delay = Arc::clone(delete_delay);
             move |Query(params): Query<HashMap<String, String>>| {
                 let dropped = Arc::clone(&dropped);
+                let delay = Arc::clone(&delay);
                 async move {
+                    let millis = delay.load(Ordering::SeqCst);
+                    if millis > 0 {
+                        tokio::time::sleep(Duration::from_millis(millis)).await;
+                    }
                     dropped
                         .lock()
                         .unwrap()
