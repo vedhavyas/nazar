@@ -175,11 +175,16 @@ pub enum Packet<'a> {
     Other,
 }
 
-/// Classify a datagram. Control packets are small and cookie-tagged; the
-/// length gate mirrors the reference's receive loop, which reads any
-/// cookie-tagged datagram under 100 bytes as control.
+/// Whether the datagram is a small cookie-tagged control packet - the
+/// reference's receive loop reads any such datagram as control and never
+/// decrypts it, which is exactly the accounting the media path needs.
+pub fn is_control(data: &[u8]) -> bool {
+    data.len() >= 8 && data.len() < 100 && data[4..8] == COOKIE
+}
+
+/// Classify a datagram.
 pub fn classify(data: &[u8]) -> Packet<'_> {
-    if data.len() >= 8 && data.len() < 100 && data[4..8] == COOKIE {
+    if is_control(data) {
         return match (data[0], data[1], data.len()) {
             (0x00, 0x01, 44) => Packet::Probe { txid: &data[8..20] },
             (0x01, 0x01, 44) => Packet::Echo { txid: &data[8..20] },
