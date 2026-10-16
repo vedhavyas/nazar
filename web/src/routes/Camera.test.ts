@@ -195,3 +195,55 @@ test('a tab that comes back asks the server for the stream again', async () => {
   });
   expect(document.querySelectorAll('video-rtc').length, 'one player, still').toBe(1);
 });
+
+test('a background re-ask that fails raises no banner', async () => {
+  // The first ask answers; the one after coming back does not - the server
+  // is mid-restart, say. The tile path lets the same failure pass: the
+  // picture's own stall is what tells the person, and a banner outliving
+  // it would read as the screen being broken.
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/cameras') {
+      return json({
+        cameras: [{ id: 'cam-1', name: 'Hall', state: 'live', reason: null }],
+        needsLogin: false,
+      });
+    }
+    if (url.startsWith('/api/cameras/cam-1/live')) {
+      if (url.includes('retry=true')) {
+        return new Response(JSON.stringify({ error: 'server is restarting' }), {
+          status: 502,
+        });
+      }
+      return json({ stream: 'cam-1-high' });
+    }
+    if (url === '/api/cameras/cam-1/privacy' && init?.method !== 'POST') {
+      return json({ privacy: false });
+    }
+    return json({});
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  open();
+
+  await vi.waitFor(() => expect(document.querySelector('video-rtc video')).toBeTruthy());
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement;
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 4;
+
+  setHidden(true);
+  setHidden(false);
+
+  await vi.waitFor(() => {
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).includes('/api/cameras/cam-1/live?quality=high&retry=true'),
+      ),
+      'the re-ask went out',
+    ).toBe(true);
+  });
+  // Let the refusal land before reading the screen.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(
+    screen.queryByRole('alert'),
+    'the failed background re-ask stays off the banner',
+  ).toBeNull();
+});

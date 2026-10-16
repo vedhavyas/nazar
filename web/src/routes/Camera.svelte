@@ -65,12 +65,15 @@
 
   /** The tab came back and the picture did not follow: a long absence can
    * outlive the stream itself, so ask the server again - the player has
-   * already rebuilt itself, and the retry is the person looking at it. */
+   * already rebuilt itself, and the retry is the person looking at it.
+   * A failed re-ask is best-effort and stays off the error banner, the
+   * same as the tile's own re-ask: the picture's own stall is what tells
+   * the person, and a banner would outlive it. */
   async function recover() {
     try {
       await api.watch(id, quality, true);
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+    } catch {
+      // Deliberately quiet.
     }
   }
 
