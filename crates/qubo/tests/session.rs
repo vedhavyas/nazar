@@ -20,6 +20,7 @@ fn save_then_load_round_trips_with_owner_only_permissions() {
         access_token: "token-abc".into(),
         uuid: "user-uuid-1".into(),
         email: Some("family@example.com".into()),
+        refresh_token: None,
     };
 
     store.save(&session).expect("save succeeds");

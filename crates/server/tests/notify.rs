@@ -365,6 +365,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             access_token: "token-abc".to_owned(),
             uuid: "user-uuid-1".to_owned(),
             email: None,
+            refresh_token: None,
         })
         .expect("a stored session");
     let events = EventBus::new();

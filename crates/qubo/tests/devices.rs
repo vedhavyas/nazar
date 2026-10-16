@@ -36,6 +36,7 @@ fn session() -> Session {
         access_token: "token-abc".into(),
         uuid: "user-uuid-1".into(),
         email: None,
+        refresh_token: None,
     }
 }
 

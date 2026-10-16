@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use qubo::{
     Device, Quality, QuboClient, QuboError, Session, SessionStore, read_shadow, request_otp,
-    verify_otp, write_service,
+    verify_google, verify_otp, write_service,
 };
 
 use crate::episodes::EpisodeStore;
@@ -212,6 +212,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/login/otp", post(login_otp))
         .route("/api/login/verify", post(login_verify))
+        .route("/api/login/google", post(login_google))
         .route("/api/cameras", get(cameras))
         .route("/api/cameras/{id}/live", post(camera_live))
         .route(
@@ -265,6 +266,29 @@ async fn login_verify(
     Json(body): Json<VerifyRequest>,
 ) -> Result<StatusCode, ApiError> {
     let session = verify_otp(&state.qubo, &body.phone, &body.code).await?;
+    let sessions = state.sessions.clone();
+    blocking(move || sessions.save(&session))
+        .await?
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if let Err(err) = state.supervisor.refresh_devices().await {
+        tracing::warn!(%err, "device discovery after login failed");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct GoogleLoginRequest {
+    id_token: String,
+}
+
+/// The Google route: fed with the Qubo app's own ID token (the recipe in
+/// `docs/qubo-google-login.md` - Google mints one for nothing else), it
+/// stores the durable session the phone route cannot give.
+async fn login_google(
+    State(state): State<AppState>,
+    Json(body): Json<GoogleLoginRequest>,
+) -> Result<StatusCode, ApiError> {
+    let session = verify_google(&state.qubo, &body.id_token).await?;
     let sessions = state.sessions.clone();
     blocking(move || sessions.save(&session))
         .await?

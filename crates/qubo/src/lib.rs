@@ -12,7 +12,7 @@ pub mod recordings;
 pub mod session;
 pub mod stream;
 
-pub use auth::{request_otp, verify_otp};
+pub use auth::{refresh_session, request_otp, verify_google, verify_otp};
 pub use client::{BASE_URL, QuboClient, ServiceProvider, Url};
 pub use control::{Attributes, Shadow, read_shadow, write_service};
 pub use devices::{Device, list_devices};

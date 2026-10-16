@@ -221,6 +221,29 @@ impl Supervisor {
         }
     }
 
+    /// Run a session-authenticated call; a refusal spends the stored refresh
+    /// token once and runs it again with the fresh session - the reference
+    /// client's own rule (spec §3.2). What the refresh heals is persisted,
+    /// so every later call starts from it.
+    async fn with_fresh_session<T, F, Fut>(&self, call: F) -> Result<T, qubo::QuboError>
+    where
+        F: Fn(qubo::Session) -> Fut,
+        Fut: std::future::Future<Output = Result<T, qubo::QuboError>>,
+    {
+        let session = self.sessions.load()?.ok_or(qubo::QuboError::Auth {
+            code: None,
+            message: "no Qubo session; log in".to_owned(),
+        })?;
+        match call(session.clone()).await {
+            Err(qubo::QuboError::Auth { .. }) if session.refresh_token.is_some() => {
+                let refreshed = qubo::auth::refresh_session(&self.qubo, &session).await?;
+                self.sessions.save(&refreshed)?;
+                call(refreshed).await
+            }
+            other => other,
+        }
+    }
+
     /// Remember that Qubo refused the session. The MQTT feed raises the
     /// same flag when its own reconnect is turned away.
     pub fn mark_needs_login(&self) {
@@ -350,12 +373,15 @@ impl Supervisor {
                 .cloned()
         }
         .ok_or_else(|| SupervisorError::UnknownDevice(device_id.to_owned()))?;
-        let session = self.sessions.load()?.ok_or(qubo::QuboError::Auth {
-            code: None,
-            message: "no Qubo session; log in".to_owned(),
-        })?;
         let name = vod_name(device_id);
-        let mint = match mint_vod(&self.qubo, &session, &device, timestamp_ms).await {
+        // A reference, so the retry after a refresh can run the same call.
+        let device = &device;
+        let mint = match self
+            .with_fresh_session(|session| async move {
+                mint_vod(&self.qubo, &session, device, timestamp_ms).await
+            })
+            .await
+        {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);
@@ -534,15 +560,17 @@ impl Supervisor {
     }
 
     /// One mint, handed straight to go2rtc. The source swaps under the
-    /// stream's own name, so a viewer's stream URL survives re-mints.
+    /// stream's own name, so a viewer's stream URL survives re-mints. A mint
+    /// the gateway turns away spends the stored refresh token once and runs
+    /// again before the refusal is believed.
     async fn mint_and_swap(&self, device: &Device) -> Result<(), String> {
         let name = stream_name(&device.device_id, Quality::High);
-        let session = self
-            .sessions
-            .load()
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "no Qubo session; log in".to_owned())?;
-        let mint = match mint_live(&self.qubo, &session, device, Quality::High).await {
+        let mint = match self
+            .with_fresh_session(|session| async move {
+                mint_live(&self.qubo, &session, device, Quality::High).await
+            })
+            .await
+        {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);

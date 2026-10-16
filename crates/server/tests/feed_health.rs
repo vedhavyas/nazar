@@ -47,6 +47,7 @@ fn session(token: &str) -> Session {
         access_token: token.to_owned(),
         uuid: "user-uuid-1".to_owned(),
         email: None,
+        refresh_token: None,
     }
 }
 

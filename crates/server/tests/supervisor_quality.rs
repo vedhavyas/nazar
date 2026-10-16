@@ -62,6 +62,7 @@ async fn harness_with(pacing: Pacing) -> Harness {
             access_token: "token-abc".to_owned(),
             uuid: "user-uuid-1".to_owned(),
             email: None,
+            refresh_token: None,
         })
         .expect("the session saves");
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
