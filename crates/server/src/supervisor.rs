@@ -1101,7 +1101,7 @@ impl Supervisor {
                     "re-minting a starved stream"
                 );
             }
-            next_mint = match self.mint_and_swap(&device).await {
+            next_mint = match self.mint_and_swap(&device, Quality::High).await {
                 Ok(()) => {
                     failed = false;
                     if held.is_none() {
@@ -1343,36 +1343,66 @@ impl Supervisor {
     /// and then never answers wedges a status read for one timeout, never
     /// for the process's lifetime.
     async fn teardown_if_idle(&self, name: &str, seen_at: Instant) -> bool {
-        let mut state = self.state.write().await;
-        match state.get(name) {
-            Some(tracked) if tracked.last_request == seen_at => {
-                state.remove(name);
+        {
+            let mut state = self.state.write().await;
+            match state.get(name) {
+                Some(tracked) if tracked.last_request == seen_at => {
+                    state.remove(name);
+                }
+                _ => {
+                    tracing::debug!(stream = name, "a request landed; the stream is not idle");
+                    return false;
+                }
             }
-            _ => {
-                tracing::debug!(stream = name, "a request landed; the stream is not idle");
-                return false;
+            // Only the tile that is still tracked: one its own reconcile
+            // already retired is gone from go2rtc too.
+            let tile = low_name_of(name).filter(|low| state.remove(low).is_some());
+            match tile {
+                Some(low) => {
+                    let (tile_deleted, dropped) = tokio::join!(
+                        self.go2rtc.delete_stream(&low),
+                        self.go2rtc.delete_stream(name),
+                    );
+                    if let Err(err) = tile_deleted {
+                        tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
+                    }
+                    if let Err(err) = dropped {
+                        tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+                    }
+                }
+                None => {
+                    if let Err(err) = self.go2rtc.delete_stream(name).await {
+                        tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+                    }
+                }
             }
         }
-        // Only the tile that is still tracked: one its own reconcile
-        // already retired is gone from go2rtc too.
-        let tile = low_name_of(name).filter(|low| state.remove(low).is_some());
-        match tile {
-            Some(low) => {
-                let (tile_deleted, dropped) = tokio::join!(
-                    self.go2rtc.delete_stream(&low),
-                    self.go2rtc.delete_stream(name),
-                );
-                if let Err(err) = tile_deleted {
-                    tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
-                }
-                if let Err(err) = dropped {
-                    tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
-                }
+        // The torn stream's reader leaves the session's fan-out whichever
+        // way the teardown lands, and the camera's fast-lane session ends
+        // with its last stream.
+        if let Some((device_id, _)) = name.rsplit_once('-') {
+            if let Some(session) = self.armed.read().await.get(device_id).cloned() {
+                session.release(name);
             }
-            None => {
-                if let Err(err) = self.go2rtc.delete_stream(name).await {
-                    tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
+            let prefix = format!("{device_id}-");
+            let remaining = self
+                .state
+                .read()
+                .await
+                .keys()
+                .any(|key| key.starts_with(&prefix));
+            if !remaining && let Some(session) = self.armed.write().await.remove(device_id) {
+                // A session already dead here ended without media; bench
+                // the lane so the next ask is not an arm into the same
+                // silence.
+                if !session.alive() {
+                    self.bench_lane(device_id);
                 }
+                session.shutdown();
+                tracing::info!(
+                    camera = device_id,
+                    "fast-lane session ended with its last stream"
+                );
             }
         }
         tracing::info!(stream = name, "idle stream dropped");
@@ -1429,45 +1459,6 @@ impl Supervisor {
                 tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
                 self.mark_degraded(&low, reason).await;
             }
-        }
-    }
-
-    /// Drop a stream nobody asked for: go2rtc's copy and the tracked
-    /// entry. No reference shows an API that releases a minted session -
-    /// it expires on its own - so dropping the stream is the whole release.
-    /// The camera's fast-lane session ends with its last stream.
-    async fn teardown(&self, name: &str) {
-        if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
-        }
-        self.state.write().await.remove(name);
-        tracing::info!(stream = name, "idle tile stream dropped");
-        let Some((device_id, _)) = name.rsplit_once('-') else {
-            return;
-        };
-        // The stream's reader leaves the session's fan-out whichever way
-        // the teardown lands.
-        if let Some(session) = self.armed.read().await.get(device_id).cloned() {
-            session.release(name);
-        }
-        let prefix = format!("{device_id}-");
-        let remaining = self
-            .state
-            .read()
-            .await
-            .keys()
-            .any(|key| key.starts_with(&prefix));
-        if !remaining && let Some(session) = self.armed.write().await.remove(device_id) {
-            // A session already dead here ended without media; bench the
-            // lane so the next ask is not an arm into the same silence.
-            if !session.alive() {
-                self.bench_lane(device_id);
-            }
-            session.shutdown();
-            tracing::info!(
-                camera = device_id,
-                "fast-lane session ended with its last stream"
-            );
         }
     }
 
@@ -1742,6 +1733,7 @@ mod tests {
             .await
             .insert("cam".to_owned(), session);
         let name = stream_name("cam", Quality::Low);
+        let seen = Instant::now();
         supervisor.state.write().await.insert(
             name.clone(),
             Tracked {
@@ -1749,11 +1741,14 @@ mod tests {
                     since: Instant::now(),
                 },
                 wake: Arc::new(Notify::new()),
-                last_request: Instant::now(),
+                last_request: seen,
             },
         );
 
-        supervisor.teardown(&name).await;
+        assert!(
+            supervisor.teardown_if_idle(&name, seen).await,
+            "the entry the decision was made about is torn down"
+        );
         assert!(
             ended.load(Ordering::SeqCst),
             "the camera's last stream going ends its fast-lane session"
@@ -1786,7 +1781,21 @@ mod tests {
                 last_request: Instant::now(),
             },
         );
-        supervisor.teardown(&name).await;
+        let seen = Instant::now();
+        supervisor.state.write().await.insert(
+            name.clone(),
+            Tracked {
+                state: StreamState::Live {
+                    since: Instant::now(),
+                },
+                wake: Arc::new(Notify::new()),
+                last_request: seen,
+            },
+        );
+        assert!(
+            supervisor.teardown_if_idle(&name, seen).await,
+            "the torn stream's entry is retired"
+        );
         assert!(
             !ended.load(Ordering::SeqCst),
             "a camera with another stream keeps its session"
@@ -1811,7 +1820,8 @@ mod tests {
             .write()
             .await
             .insert("cam".to_owned(), session);
-        let name = stream_name("cam", Quality::Low);
+        let name = stream_name("cam", Quality::High);
+        let seen = Instant::now();
         supervisor.state.write().await.insert(
             name.clone(),
             Tracked {
@@ -1819,11 +1829,14 @@ mod tests {
                     since: Instant::now(),
                 },
                 wake: Arc::new(Notify::new()),
-                last_request: Instant::now(),
+                last_request: seen,
             },
         );
 
-        supervisor.teardown(&name).await;
+        assert!(
+            supervisor.teardown_if_idle(&name, seen).await,
+            "the idle stream is torn down"
+        );
         assert!(
             supervisor.lane_benched("cam"),
             "a session that died without media benches the lane on its teardown"
