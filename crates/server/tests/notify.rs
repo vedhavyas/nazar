@@ -62,7 +62,10 @@ fn backups(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with(&format!("{stem}.")) && name.ends_with(".bak")
+                    name.starts_with(&format!("{stem}."))
+                        && std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
                 })
         })
         .collect();
@@ -283,11 +286,7 @@ fn a_bell_log_that_cannot_be_read_is_kept_aside_too() {
     assert!(store.list().is_empty(), "an unreadable log starts empty");
 
     let kept = backups(&dir, "notifications");
-    assert_eq!(
-        kept.len(),
-        1,
-        "the unreadable path is kept aside: {kept:?}"
-    );
+    assert_eq!(kept.len(), 1, "the unreadable path is kept aside: {kept:?}");
     assert_eq!(
         std::fs::read_to_string(kept[0].join("evidence.txt")).expect("the kept evidence"),
         "what was here",
@@ -356,7 +355,10 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
     let go2rtc = common::FakeApi::start().await;
     let data_dir = temp_dir("notify-harness");
     // The stills come from the same fake go2rtc the streams do.
-    let snapshots = Snapshots::new(Go2rtc::connect(go2rtc.base.clone()), data_dir.join("snaps"));
+    let snapshots = Snapshots::new(
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+        data_dir.join("snaps"),
+    );
     let sessions = SessionStore::new(data_dir.join("session.json"));
     sessions
         .save(&qubo::Session {
@@ -370,7 +372,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
     let supervisor = Supervisor::new(
         client.clone(),
         sessions.clone(),
-        Go2rtc::connect(go2rtc.base.clone()),
+        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
         Pacing {
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),

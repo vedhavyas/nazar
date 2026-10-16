@@ -43,7 +43,8 @@ async fn main() -> anyhow::Result<()> {
             .with_aqi(config.aqi_alert_at),
     );
     let snapshots = Snapshots::new(
-        Go2rtc::connect(server::go2rtc::API_BASE.parse().context("the go2rtc URL")?),
+        Go2rtc::connect(server::go2rtc::API_BASE.parse().context("the go2rtc URL")?)
+            .context("the go2rtc client")?,
         config.data_dir.join("snaps"),
     );
     let episodes = Arc::new(EpisodeStore::open(
