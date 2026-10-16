@@ -781,3 +781,9 @@ Ran the reference flow against the hub's own OTP login (fresh that morning, from
 - The relay never engaged in 10.0s despite a byte-faithful register; endP2pCall torn down cleanly.
 
 Read: the relay gate is still shut for our session class, even freshly minted by the server. The camera-side half demonstrably works up to the relay wait. The kill-switch decision (M6 Task 2 Step 3) runs with the ported Rust engine and the server's own arm path before any conclusion - this run is a strong early signal, not the verdict.
+
+### 2026-10-16, later: the ported engine's run - THE VERDICT
+
+The ported Rust engine (byte-vector-reviewed) ran against a second fresh hub login, with the SDK's SYN beat held for the whole window (`--hold-beat`). Same shape one layer down: allocation 200 (relay 13.204.183.153:48532), token 200, candidates offered, `startP2pCall` published, the camera answered `p2pCallStarted` in ~3s with its candidates - then `Handshake { timeout: 10s, relay_engaged: false }`. The beat did not move it.
+
+**Conclusion, three independent runs deep:** the relay pairs only sessions its own side recognises as the official SDK's - a server-side arming policy nothing reachable from outside the app reproduces, beating or no beating. The fast lane is closed for this client class; the cloud path stands as the design's primary and fully carries live view.
