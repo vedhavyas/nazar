@@ -1,12 +1,12 @@
-//! The stream supervisor: one mint-and-swap loop per live camera and
-//! quality.
+//! The stream supervisor: one mint-and-swap loop per live camera.
 //!
 //! Qubo sessions last about five minutes and cannot be refreshed (the OTP
 //! route issues no refresh token), so a live stream is re-minted on a
 //! cadence and the session is re-read from the store on every mint - a
-//! fresh login heals the streams without restarting the server. A camera
-//! may hold two streams at once: the hero's high one, and a tile's low one
-//! which is dropped once nobody has asked for it for a while.
+//! fresh login heals the streams without restarting the server. The cloud
+//! keeps one stream per camera (mints are last-mint-wins), so only the
+//! high stream is minted; a tile's low rides it as a chain inside go2rtc
+//! and is dropped once nobody has asked for it for a while.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live};
 use tokio::sync::{Notify, RwLock};
 
-use crate::go2rtc::{Go2rtc, live_source};
+use crate::go2rtc::{Go2rtc, live_source, low_source};
 
 /// How the supervisor paces itself.
 #[derive(Debug, Clone, Copy)]
@@ -182,10 +182,15 @@ impl Supervisor {
 
     /// The state of one quality class alone.
     pub async fn status_for(&self, device_id: &str, quality: Quality) -> StreamState {
+        self.status_for_name(&stream_name(device_id, quality)).await
+    }
+
+    /// The state of one tracked stream by its go2rtc name.
+    async fn status_for_name(&self, name: &str) -> StreamState {
         self.state
             .read()
             .await
-            .get(&stream_name(device_id, quality))
+            .get(name)
             .map_or(StreamState::Offline, |tracked| tracked.state.clone())
     }
 
@@ -216,7 +221,19 @@ impl Supervisor {
         quality: Quality,
         retry: bool,
     ) -> Result<StreamState, SupervisorError> {
-        let name = stream_name(device_id, quality);
+        match quality {
+            Quality::High => self.ensure_high(device_id, retry).await,
+            Quality::Low => self.ensure_low(device_id, retry).await,
+        }
+    }
+
+    /// Ensure the camera's cloud stream: the only stream minted.
+    async fn ensure_high(
+        &self,
+        device_id: &str,
+        retry: bool,
+    ) -> Result<StreamState, SupervisorError> {
+        let name = stream_name(device_id, Quality::High);
         {
             let mut state = self.state.write().await;
             if let Some(tracked) = state.get_mut(&name) {
@@ -252,11 +269,47 @@ impl Supervisor {
         }
         let supervisor = self.clone();
         tokio::spawn(async move {
-            supervisor
-                .remint_loop(device, quality, Duration::ZERO)
-                .await;
+            supervisor.remint_loop(device, Duration::ZERO).await;
         });
-        Ok(self.status_for(device_id, quality).await)
+        Ok(self.status_for(device_id, Quality::High).await)
+    }
+
+    /// Ensure the camera's tile rendition: a chain inside go2rtc off the
+    /// cloud stream, which is asked for here too - the tile rides it, so it
+    /// is what keeps the cloud stream alive.
+    async fn ensure_low(
+        &self,
+        device_id: &str,
+        retry: bool,
+    ) -> Result<StreamState, SupervisorError> {
+        let high_state = self.ensure_high(device_id, retry).await?;
+        let name = stream_name(device_id, Quality::Low);
+        let fresh = {
+            let mut state = self.state.write().await;
+            let fresh = !state.contains_key(&name);
+            state
+                .entry(name.clone())
+                .or_insert_with(new_waking)
+                .last_request = Instant::now();
+            fresh
+        };
+        // The chain lands with the first ask, not with the loop's next
+        // wake: the loop may be minutes into a re-mint cadence, and a tile
+        // nobody will look at until then is a tile that never starts. A
+        // re-ask re-asserts it too, which is what heals a chain go2rtc
+        // refused while it was down.
+        if fresh || retry {
+            let high = stream_name(device_id, Quality::High);
+            match self.go2rtc.put_stream(&name, &low_source(&high)).await {
+                Ok(()) => self.settle(&name, high_state).await,
+                Err(err) => {
+                    let reason = redact(&err.to_string());
+                    tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
+                    self.mark_degraded(&name, reason).await;
+                }
+            }
+        }
+        Ok(self.status_for(device_id, Quality::Low).await)
     }
 
     /// Reserved for M3: cloud-allocated VOD sessions for recordings. M1
@@ -265,8 +318,8 @@ impl Supervisor {
         Err(SupervisorError::VodUnavailable)
     }
 
-    async fn remint_loop(self, device: Device, quality: Quality, mut wait: Duration) {
-        let name = stream_name(&device.device_id, quality);
+    async fn remint_loop(self, device: Device, mut wait: Duration) {
+        let name = stream_name(&device.device_id, Quality::High);
         let wake = self.wake_signal(&name).await;
         // Every stream idles out when nobody is watching and nobody has
         // asked: a demoted hero's high stream must not run for ever. The
@@ -299,9 +352,10 @@ impl Supervisor {
             {
                 return;
             }
-            wait = match self.mint_and_swap(&device, quality).await {
+            wait = match self.mint_and_swap(&device).await {
                 Ok(()) => {
                     self.mark_live(&name).await;
+                    self.reconcile_low(&name).await;
                     self.pacing.remint
                 }
                 Err(reason) => {
@@ -323,14 +377,14 @@ impl Supervisor {
 
     /// One mint, handed straight to go2rtc. The source swaps under the
     /// stream's own name, so a viewer's stream URL survives re-mints.
-    async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), String> {
-        let name = stream_name(&device.device_id, quality);
+    async fn mint_and_swap(&self, device: &Device) -> Result<(), String> {
+        let name = stream_name(&device.device_id, Quality::High);
         let session = self
             .sessions
             .load()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "no Qubo session; log in".to_owned())?;
-        let mint = match mint_live(&self.qubo, &session, device, quality).await {
+        let mint = match mint_live(&self.qubo, &session, device, Quality::High).await {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);
@@ -384,23 +438,74 @@ impl Supervisor {
     }
 
     /// Drop a stream nobody asked for: go2rtc's copy and the tracked
-    /// entry. No reference shows an API that releases a minted session -
-    /// it expires on its own - so dropping the stream is the whole release.
+    /// entry. The tile rendition rides this stream, so it goes with it. No
+    /// reference shows an API that releases a minted session - it expires
+    /// on its own - so dropping the stream is the whole release.
     async fn teardown(&self, name: &str) {
+        if let Some(low) = low_name_of(name) {
+            let known = self.state.write().await.remove(&low).is_some();
+            if known && let Err(err) = self.go2rtc.delete_stream(&low).await {
+                tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
+            }
+        }
         if let Err(err) = self.go2rtc.delete_stream(name).await {
             tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
         }
         self.state.write().await.remove(name);
-        tracing::info!(stream = name, "idle tile stream dropped");
+        tracing::info!(stream = name, "idle stream dropped");
     }
 
-    /// Whether go2rtc has a viewer on the stream. An API that cannot say
-    /// keeps the stream: a late teardown beats a wrong one.
+    /// Keep the tile rendition honest after a mint: re-assert its chain, or
+    /// retire it once nobody asks for it and nobody watches it. The cloud
+    /// stream it rides may still be needed by a hero.
+    async fn reconcile_low(&self, high: &str) {
+        let Some(low) = low_name_of(high) else {
+            return;
+        };
+        let Some(last) = self.last_request_at(&low).await else {
+            return;
+        };
+        if last.elapsed() >= self.pacing.stream_idle {
+            // The same identity guard as the loop's own teardown: a tile
+            // asked for while this cycle was deciding must not be dropped
+            // under it.
+            if self.last_request_at(&low).await == Some(last) && !self.watched(&low).await {
+                self.drop_low(&low).await;
+            }
+            return;
+        }
+        match self.go2rtc.put_stream(&low, &low_source(high)).await {
+            Ok(()) => {
+                let live = self.status_for_name(high).await;
+                self.settle(&low, live).await;
+            }
+            Err(err) => {
+                let reason = redact(&err.to_string());
+                tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
+                self.mark_degraded(&low, reason).await;
+            }
+        }
+    }
+
+    /// Drop a retired tile rendition: go2rtc's copy and the tracked entry.
+    async fn drop_low(&self, low: &str) {
+        if let Err(err) = self.go2rtc.delete_stream(low).await {
+            tracing::warn!(stream = low, %err, "the retired tile rendition could not be dropped");
+        }
+        self.state.write().await.remove(low);
+        tracing::info!(stream = low, "retired tile rendition dropped");
+    }
+
+    /// Whether go2rtc has a viewer on the stream, or - for a cloud stream -
+    /// on the tile rendition that rides it. An API that cannot say keeps
+    /// the stream: a late teardown beats a wrong one.
     async fn watched(&self, name: &str) -> bool {
+        let low = low_name_of(name);
         self.go2rtc.streams().await.map_or(true, |streams| {
-            streams
-                .iter()
-                .any(|stream| stream.name == name && stream.consumers > 0)
+            streams.iter().any(|stream| {
+                stream.consumers > 0
+                    && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
+            })
         })
     }
 
@@ -424,7 +529,8 @@ impl Supervisor {
             .clone()
     }
 
-    /// `Live` keeps its original `since` through successful re-mints.
+    /// `Live` keeps its original `since` through successful re-mints. A
+    /// tile rendition has no life of its own: it mirrors the stream.
     async fn mark_live(&self, name: &str) {
         let mut state = self.state.write().await;
         let entry = state.entry(name.to_owned()).or_insert_with(new_tracked);
@@ -433,16 +539,44 @@ impl Supervisor {
                 since: Instant::now(),
             };
         }
+        let live = entry.state.clone();
+        if let Some(low) = low_name_of(name)
+            && let Some(tile) = state.get_mut(&low)
+        {
+            tile.state = live;
+        }
     }
 
     async fn mark_degraded(&self, name: &str, reason: String) {
+        let mut state = self.state.write().await;
+        state
+            .entry(name.to_owned())
+            .or_insert_with(new_tracked)
+            .state = StreamState::Degraded {
+            reason: reason.clone(),
+        };
+        if let Some(low) = low_name_of(name)
+            && let Some(tile) = state.get_mut(&low)
+        {
+            tile.state = StreamState::Degraded { reason };
+        }
+    }
+
+    /// Set a tracked stream's state to the state of the stream it mirrors.
+    async fn settle(&self, name: &str, state: StreamState) {
         self.state
             .write()
             .await
             .entry(name.to_owned())
             .or_insert_with(new_tracked)
-            .state = StreamState::Degraded { reason };
+            .state = state;
     }
+}
+
+/// The tile rendition's name for a cloud stream's name.
+fn low_name_of(high: &str) -> Option<String> {
+    high.strip_suffix("-high")
+        .map(|device| format!("{device}-low"))
 }
 
 fn new_tracked() -> Tracked {

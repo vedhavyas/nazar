@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use qubo::ServiceProvider;
 use server::config::Config;
-use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source};
+use server::go2rtc::{Go2rtc, Go2rtcError, StreamStatus, live_source, low_source};
 
 #[test]
 fn live_source_references_the_config_template() {
@@ -24,6 +24,15 @@ fn live_source_references_the_config_template() {
         live_source("rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc"),
         "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=h264#audio=aac",
         "the source names the config's ffmpeg template and asks for H.264"
+    );
+}
+
+#[test]
+fn low_source_chains_off_the_high_stream_by_name() {
+    assert_eq!(
+        low_source("cam-1-high"),
+        "ffmpeg:cam-1-high#input=nazar#video=h264#width=640#audio=copy",
+        "the tile rides the high stream inside go2rtc: no second mint, one cloud consumer"
     );
 }
 
@@ -140,6 +149,10 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
     assert!(
         config.contains("candidates:") && config.contains("198.51.100.1:8555"),
         "the configured WebRTC candidate reaches the generated config"
+    );
+    assert!(
+        config.contains("rtsp:") && config.contains("\"127.0.0.1:8554\""),
+        "the chain's rtsp listener is pinned to loopback: go2rtc's default exposes :8554 on every interface"
     );
 
     let argv = await_args(&args_path(go2rtc.config_path())).await;

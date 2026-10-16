@@ -1,5 +1,6 @@
-//! Quality classes: the hero streams high, tiles stream low, and a tile
-//! nobody watches is dropped after its idle window.
+//! Quality classes: one cloud stream per camera, the tile riding it as a
+//! chain inside go2rtc, and a tile nobody watches dropped after its idle
+//! window.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -124,10 +125,11 @@ async fn mount_json(server: &MockServer, route: &str, body: String) {
 }
 
 #[tokio::test]
-async fn the_hero_and_a_tile_are_two_streams() {
+async fn a_tile_rides_the_hero_stream_and_the_cloud_is_minted_once() {
     let h = harness(Duration::from_secs(30)).await;
+    // Only the high mint is mounted: a low mint would be a 404, and a 404
+    // is exactly the second cloud consumer this fix exists to prevent.
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
@@ -138,41 +140,108 @@ async fn the_hero_and_a_tile_are_two_streams() {
         .await
         .expect("the tile wakes");
 
-    // The mints run in each stream's own loop.
-    let mut names: Vec<String> = Vec::new();
-    for _ in 0..50 {
-        names = h
-            .go2rtc
-            .puts()
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
-        if names.len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        names,
-        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
-        "each quality gets its own go2rtc stream"
-    );
-    let bodies: Vec<String> = h
-        .qubo
-        .received_requests()
-        .await
-        .expect("recorded")
+    let up = common::eventually(|| async {
+        let puts = h.go2rtc.puts();
+        puts.iter()
+            .any(|(name, _)| name == &format!("{DEVICE_ID}-high"))
+            && puts
+                .iter()
+                .any(|(name, _)| name == &format!("{DEVICE_ID}-low"))
+    })
+    .await;
+    assert!(up, "both streams reached go2rtc: {:?}", h.go2rtc.puts());
+
+    let puts = h.go2rtc.puts();
+    let high_source = puts
         .iter()
-        .filter(|request| request.url.path() == MINT_PATH)
-        .map(|request| request.url.query().unwrap_or_default().to_owned())
-        .collect();
+        .find(|(name, _)| name == &format!("{DEVICE_ID}-high"))
+        .map(|(_, source)| source.clone())
+        .expect("the hero's source");
     assert!(
-        bodies.iter().any(|query| query.contains("type=high")),
-        "the hero mints high: {bodies:?}"
+        high_source.starts_with("ffmpeg:rtsps://"),
+        "the hero is the cloud mint: {high_source}"
+    );
+    let low_source = puts
+        .iter()
+        .find(|(name, _)| name == &format!("{DEVICE_ID}-low"))
+        .map(|(_, source)| source.clone())
+        .expect("the tile's source");
+    assert_eq!(
+        low_source,
+        format!("ffmpeg:{DEVICE_ID}-high#input=nazar#video=h264#width=640#audio=copy"),
+        "the tile chains off the hero's own stream, inside go2rtc"
+    );
+
+    let mints = mint_queries(&h.qubo).await;
+    assert!(
+        mints.iter().all(|query| !query.contains("type=low")),
+        "the tile never mints a cloud stream of its own: {mints:?}"
     );
     assert!(
-        bodies.iter().any(|query| query.contains("type=low")),
-        "the tile mints low: {bodies:?}"
+        mints.iter().any(|query| query.contains("type=high")),
+        "the hero mints high: {mints:?}"
+    );
+    let mirrored = common::eventually(|| async {
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await
+            == h.supervisor.status_for(DEVICE_ID, Quality::High).await
+    })
+    .await;
+    assert!(
+        mirrored,
+        "the tile's state is the state of the stream it rides"
+    );
+}
+
+#[tokio::test]
+async fn a_tile_carries_the_cloud_streams_trouble() {
+    let h = harness(Duration::from_secs(30)).await;
+    mount_mint(&h.qubo, "high", 500, "boom".to_owned()).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(degraded, "a refused cloud mint degrades the stream");
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Degraded { .. }
+        ),
+        "and the tile, which has nothing to ride, degrades with it"
+    );
+}
+
+#[tokio::test]
+async fn a_tiles_retirement_survives_a_camera_that_never_streams() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 500, "boom".to_owned()).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // No mint ever succeeds, so the loop's own reconcile never runs: the
+    // cloud stream's teardown is the only thing that can retire the tile.
+    let mut deleted = h.go2rtc.deletes();
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
+        "a camera that never streams still retires its idle tile"
     );
 }
 
@@ -207,7 +276,7 @@ async fn asking_again_reuses_the_stream() {
 #[tokio::test]
 async fn an_idle_tile_is_dropped() {
     let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::Low, false)
@@ -215,10 +284,12 @@ async fn an_idle_tile_is_dropped() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    let mut deleted = h.go2rtc.deletes();
+    deleted.sort();
     assert_eq!(
-        h.go2rtc.deletes(),
-        vec![format!("{DEVICE_ID}-low")],
-        "the idle tile is dropped from go2rtc"
+        deleted,
+        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
+        "the idle tile goes, and the cloud stream it alone was riding goes with it"
     );
     assert_eq!(
         h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
@@ -236,9 +307,51 @@ async fn an_idle_tile_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_retired_tile_is_dropped_while_the_hero_keeps_streaming() {
+    let h = harness(Duration::from_millis(80)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the hero wakes");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+
+    // The hero keeps being asked for; the tile is not asked for again.
+    for _ in 0..16 {
+        h.supervisor
+            .ensure(DEVICE_ID, Quality::High, false)
+            .await
+            .expect("the hero is still watched");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        h.go2rtc.deletes(),
+        vec![format!("{DEVICE_ID}-low")],
+        "the retired tile is dropped on its own"
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ),
+        "while the hero it rode keeps streaming"
+    );
+    assert_eq!(
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+        StreamState::Offline,
+        "and the tile is forgotten"
+    );
+}
+
+#[tokio::test]
 async fn a_tile_with_a_viewer_is_never_dropped() {
     let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
     h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 1);
 
     h.supervisor
@@ -246,7 +359,8 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
         .await
         .expect("the tile wakes");
     // Nobody asks again: a home that is watching holds the stream open,
-    // and the browser never tells this server about it.
+    // and the browser never tells this server about it. The viewer holds
+    // the cloud stream too, since the tile rides it.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
@@ -265,17 +379,19 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
     // The viewer leaves; now the idle rule applies again.
     h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut deleted = h.go2rtc.deletes();
+    deleted.sort();
     assert_eq!(
-        h.go2rtc.deletes(),
-        vec![format!("{DEVICE_ID}-low")],
-        "once nobody is watching, the tile is dropped"
+        deleted,
+        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
+        "once nobody is watching, the tile and its cloud stream are dropped"
     );
 }
 
 #[tokio::test]
 async fn a_watched_tile_is_kept() {
     let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
     for _ in 0..6 {
         h.supervisor
@@ -307,48 +423,9 @@ async fn a_watched_tile_is_kept() {
 }
 
 #[tokio::test]
-async fn a_failing_quality_leaves_the_other_stream_alone() {
-    let h = harness(Duration::from_secs(30)).await;
-    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    mount_mint(&h.qubo, "low", 500, "boom".to_owned()).await;
-
-    h.supervisor
-        .ensure(DEVICE_ID, Quality::High, false)
-        .await
-        .expect("the hero wakes");
-    h.supervisor
-        .ensure(DEVICE_ID, Quality::Low, false)
-        .await
-        .expect("a refused tile still registers");
-
-    let hero_live = common::eventually(|| async {
-        matches!(
-            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
-            StreamState::Live { .. }
-        )
-    })
-    .await;
-    assert!(hero_live, "the hero is untouched by the tile's failure");
-    assert!(
-        matches!(
-            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
-            StreamState::Degraded { .. }
-        ),
-        "the tile carries its own failure"
-    );
-    assert!(
-        matches!(
-            h.supervisor.status(DEVICE_ID).await,
-            StreamState::Live { .. }
-        ),
-        "and the camera reads as live while anything of it streams"
-    );
-}
-
-#[tokio::test]
 async fn a_status_check_that_fails_keeps_the_stream() {
     let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "low", 200, mint_body("low")).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
     h.go2rtc.set_streams_error(true);
 
     h.supervisor
@@ -368,10 +445,12 @@ async fn a_status_check_that_fails_keeps_the_stream() {
     // The status answers again; the idle rule applies as before.
     h.go2rtc.set_streams_error(false);
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut deleted = h.go2rtc.deletes();
+    deleted.sort();
     assert_eq!(
-        h.go2rtc.deletes(),
-        vec![format!("{DEVICE_ID}-low")],
-        "once the status answers, a quiet tile is dropped as usual"
+        deleted,
+        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
+        "once the status answers, a quiet tile and its cloud stream are dropped as usual"
     );
 }
 
@@ -449,6 +528,17 @@ async fn only_a_persons_retry_skips_the_backoff() {
         2,
         "one mint per ask, not a storm"
     );
+}
+
+async fn mint_queries(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("the requests")
+        .iter()
+        .filter(|request| request.url.path() == MINT_PATH)
+        .map(|request| request.url.query().unwrap_or_default().to_owned())
+        .collect()
 }
 
 async fn mint_calls(server: &MockServer) -> usize {

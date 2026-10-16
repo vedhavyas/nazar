@@ -200,6 +200,20 @@ pub fn live_source(mint_url: &str) -> String {
     format!("ffmpeg:{mint_url}#input={TEMPLATE}#video=h264#audio=aac")
 }
 
+/// The tile rendition's width: the cloud's own low profile, so a tile costs
+/// what the app's low stream did.
+const LOW_WIDTH: u32 = 640;
+
+/// The go2rtc source for a camera's tile rendition: the high stream's own
+/// name, chained and scaled inside go2rtc. The cloud stream is minted once
+/// per camera (mints are last-mint-wins), so the tile re-reads it locally
+/// rather than taking a second cloud consumer. Measured on go2rtc 1.9.14:
+/// the chain resolves to the loopback rtsp server and the tile's scaler
+/// reads the high stream from there.
+pub fn low_source(high_name: &str) -> String {
+    format!("ffmpeg:{high_name}#input={TEMPLATE}#video=h264#width={LOW_WIDTH}#audio=copy")
+}
+
 /// The generated config text.
 ///
 /// WebRTC media flows browser-to-go2rtc directly, so the candidate an env
@@ -214,6 +228,10 @@ fn config_yaml(ffmpeg_bin: &Path, webrtc_candidates: Option<&str>) -> String {
     format!(
         r#"api:
   listen: "127.0.0.1:1984"
+# The tile chain re-reads streams through this listener; pinned to
+# loopback because go2rtc's default binds every interface.
+rtsp:
+  listen: "127.0.0.1:8554"
 {webrtc}ffmpeg:
   bin: "{ffmpeg}"
   {TEMPLATE}: "{TEMPLATE_ARGS}"
