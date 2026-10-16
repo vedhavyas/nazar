@@ -22,37 +22,55 @@ pub struct RtpHeader {
     pub header_len: usize,
 }
 
-/// Parse an RTP datagram's fixed header, skipping a CSRC list and the
-/// extension header when present. `None` for anything that is not a v2
-/// datagram with a non-empty payload.
-pub fn unwrap_rtp(packet: &[u8]) -> Option<RtpHeader> {
-    if packet.len() < 12 || packet[0] >> 6 != 2 {
-        return None;
+/// The header length, CSRC list and extension header included; 0 when the
+/// datagram is too short to be RTP. Version-unchecked: the reference's
+/// receive loop gates and decrypts by exactly this arithmetic, and under a
+/// continuing keystream, skipping a datagram the reference processed would
+/// skew every later packet's plaintext.
+pub fn rtp_header_len(packet: &[u8]) -> usize {
+    if packet.len() < 12 {
+        return 0;
     }
     let csrcs = usize::from(packet[0] & 0x0F);
     let mut header_len = 12 + 4 * csrcs;
     if packet[0] & 0x10 != 0 {
-        // The extension header's own 4 bytes state how many words follow.
-        if packet.len() < header_len + 4 {
-            return None;
-        }
-        let words = usize::from(u16::from_be_bytes([
-            packet[header_len + 2],
-            packet[header_len + 3],
-        ]));
-        header_len += 4 + 4 * words;
+        // The extension header's own 4 bytes state how many words follow;
+        // a tail too short to carry them counts as zero words, which lands
+        // in the same skip the reference's clamped read produces.
+        let words = if packet.len() >= header_len + 4 {
+            u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]])
+        } else {
+            0
+        };
+        header_len += 4 + 4 * usize::from(words);
     }
-    if header_len >= packet.len() {
-        return None;
-    }
-    Some(RtpHeader {
+    header_len
+}
+
+/// The fixed header fields at `header_len`; the caller guarantees at least
+/// 12 bytes.
+pub fn parse_header(packet: &[u8], header_len: usize) -> RtpHeader {
+    RtpHeader {
         marker: packet[1] & 0x80 != 0,
         payload_type: packet[1] & 0x7F,
         sequence: u16::from_be_bytes([packet[2], packet[3]]),
         timestamp: u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
         ssrc: u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
         header_len,
-    })
+    }
+}
+
+/// Parse an RTP datagram's fixed header (v2 only, with a non-empty
+/// payload), skipping a CSRC list and the extension header when present.
+pub fn unwrap_rtp(packet: &[u8]) -> Option<RtpHeader> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    let header_len = rtp_header_len(packet);
+    if header_len == 0 || header_len >= packet.len() {
+        return None;
+    }
+    Some(parse_header(packet, header_len))
 }
 
 /// The AES modes the reference client offers for the media payloads. The
@@ -233,14 +251,16 @@ impl H264Assembler {
         match first & 0x1F {
             1..=23 => out.push(payload.to_vec()),
             24 => {
-                // STAP-A: 2-byte sizes, each NAL without its own header byte.
+                // STAP-A: 2-byte sizes, each NAL without its own header
+                // byte. A truncated tail emits the bytes that are there,
+                // as the reference's clamped slice read does.
                 let mut offset = 1;
                 while offset + 2 <= payload.len() {
                     let size =
                         usize::from(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
-                    if let Some(nal) = payload.get(offset + 2..offset + 2 + size)
-                        && !nal.is_empty()
-                    {
+                    let end = (offset + 2 + size).min(payload.len());
+                    let nal = &payload[offset + 2..end];
+                    if !nal.is_empty() {
                         out.push(nal.to_vec());
                     }
                     offset += 2 + size;

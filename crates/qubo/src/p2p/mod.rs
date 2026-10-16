@@ -712,6 +712,12 @@ impl ArmedSession {
 
     /// The next decrypted media packet. `Ok(None)` means the socket was idle
     /// for the read window - a liveness tick, not an end.
+    ///
+    /// The accounting is the reference's receive loop exactly: control
+    /// packets (small and cookie-tagged) are answered or skipped without
+    /// touching the keystream, and every other datagram whose header-length
+    /// arithmetic fits decrypts and is yielded - so under a continuing
+    /// keystream no packet the reference processed is ever skipped here.
     pub async fn recv_media(&mut self) -> Result<Option<MediaPacket>, P2pError> {
         let mut buf = vec![0_u8; 4096];
         loop {
@@ -722,28 +728,28 @@ impl ArmedSession {
                 Ok(Ok(pair)) => pair,
             };
             let data = &buf[..len];
-            match relay::classify(data) {
-                Packet::Rtp => {
-                    let Some(header) = media::unwrap_rtp(data) else {
-                        continue;
-                    };
-                    let mut packet = data.to_vec();
-                    self.decryptor.decrypt(&mut packet[header.header_len..]);
-                    return Ok(Some(MediaPacket {
-                        packet,
-                        header_len: header.header_len,
-                        header,
-                    }));
-                }
-                Packet::Probe { txid } => {
+            if relay::is_control(data) {
+                if let Packet::Probe { txid } = relay::classify(data) {
                     // A late probe mid-media: keep answering so the peer
                     // stays armed, as the reference's receive loop does.
                     if let Some(ack) = peer_ack_of(txid) {
                         let _ = self.socket.send_to(&ack, from).await;
                     }
                 }
-                Packet::Bye | Packet::Echo { .. } | Packet::ExtendedAck { .. } | Packet::Other => {}
+                continue;
             }
+            let header_len = media::rtp_header_len(data);
+            if header_len == 0 || header_len >= data.len() {
+                continue;
+            }
+            let mut packet = data.to_vec();
+            self.decryptor.decrypt(&mut packet[header_len..]);
+            let header = media::parse_header(&packet, header_len);
+            return Ok(Some(MediaPacket {
+                packet,
+                header_len,
+                header,
+            }));
         }
     }
 
@@ -954,6 +960,113 @@ mod tests {
         assert!(
             stopped.is_ok(),
             "a dropped session's teardown stops the pump"
+        );
+    }
+
+    /// A session reading a fresh loopback socket, its target address, and a
+    /// sender that can feed it datagrams.
+    async fn media_session(key: &str, iv: &str) -> (ArmedSession, SocketAddr, UdpSocket) {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a socket");
+        let target = socket.local_addr().expect("bound address");
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a sender");
+        let session = ArmedSession {
+            socket,
+            peer: target,
+            decryptor: MediaDecryptor::new(media::AesMode::CtrCont, key, iv).expect("a decryptor"),
+            names: relay::NameGen::new(),
+            broker: idle_broker(),
+            control_topic: "/control/unit/cam/p2pStreaming".to_owned(),
+            session_id: "session".to_owned(),
+            camera: "cam".to_owned(),
+            src_device_id: "src".to_owned(),
+            disarmed: false,
+        };
+        (session, target, sender)
+    }
+
+    /// A 44-byte cookie-tagged probe, the shape the camera sends mid-media.
+    fn media_probe() -> Vec<u8> {
+        let mut probe = vec![0x00, 0x01, 0x00, 0x18];
+        probe.extend_from_slice(&relay::COOKIE);
+        probe.extend_from_slice(b"T4inG06T1005");
+        probe.extend_from_slice(&[0x00, 0x08, 0x00, 0x14]);
+        probe.extend_from_slice(&[0xAB; 20]);
+        probe
+    }
+
+    fn fixture_bytes(value: &serde_json::Value) -> Vec<u8> {
+        let text = value.as_str().expect("hex text");
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("a hex byte"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recv_media_keeps_the_reference_accounting() {
+        // Which datagrams advance the ctr-cont keystream is the reference's
+        // receive loop's business: controls never do, anything else that
+        // passes the header-length gate does. The captured pair's
+        // plaintexts pin both halves.
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/p2p_byte_vectors.json"))
+                .expect("the vector fixture is JSON");
+        let key = v["aes"]["key"].as_str().expect("a key");
+        let iv = v["aes"]["iv"].as_str().expect("an iv");
+        let p1 = fixture_bytes(&v["rtp_frames"][0]["bytes"]);
+        let p2 = fixture_bytes(&v["rtp_frames"][1]["bytes"]);
+        let cont1 = fixture_bytes(&v["rtp_frames"][0]["plaintext_ctr_cont"]);
+        let cont2 = fixture_bytes(&v["rtp_frames"][1]["plaintext_ctr_cont"]);
+
+        // A control probe between the two captured packets must not
+        // advance the keystream.
+        let (mut session, target, sender) = media_session(key, iv).await;
+        sender.send_to(&p1, target).await.expect("send p1");
+        sender
+            .send_to(&media_probe(), target)
+            .await
+            .expect("send probe");
+        sender.send_to(&p2, target).await.expect("send p2");
+        let first = session.recv_media().await.expect("read").expect("a packet");
+        assert_eq!(
+            first.payload(),
+            cont1,
+            "the first captured packet decrypts as the fixture says"
+        );
+        let second = session.recv_media().await.expect("read").expect("a packet");
+        assert_eq!(
+            second.payload(),
+            cont2,
+            "a control probe between packets does not advance the keystream"
+        );
+
+        // A non-control datagram with a valid header length does advance
+        // it, exactly as the reference's loop would.
+        let (mut session, target, sender) = media_session(key, iv).await;
+        let garbage = vec![0x40_u8; 20];
+        sender.send_to(&p1, target).await.expect("send p1");
+        sender
+            .send_to(&garbage, target)
+            .await
+            .expect("send garbage");
+        sender.send_to(&p2, target).await.expect("send p2");
+        let first = session.recv_media().await.expect("read").expect("a packet");
+        assert_eq!(first.payload(), cont1, "a fresh keystream starts at p1");
+        let junk = session.recv_media().await.expect("read").expect("a packet");
+        assert_eq!(
+            junk.payload().len(),
+            8,
+            "the garbage datagram's payload was decrypt-streamed"
+        );
+        let second = session.recv_media().await.expect("read").expect("a packet");
+        assert_ne!(
+            second.payload(),
+            cont2,
+            "a datagram the reference processed advances the keystream here too"
         );
     }
 
