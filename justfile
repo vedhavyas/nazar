@@ -196,8 +196,10 @@ android-release version:
 
     # keytool prints the digest upper-case with colons and apksigner
     # lower-case without, so both sides are normalised before they are
-    # compared. The password rides argv here, which the threat model allows:
-    # one trusted user on their own machine.
+    # compared. The signer label depends on the apksigner version ("Signer
+    # #1" one build-tools release, "V2 Signer" another); the digest line is
+    # what counts. The password rides argv here, which the threat model
+    # allows: one trusted user on their own machine.
     want=$(keytool -list -v -keystore "$keystore" -alias "$keyalias" -storepass "$password" 2>/dev/null | sed -n 's/.*SHA256: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' || true)
     if [ -z "$want" ]; then
         echo "[ERROR] the release keystore could not be read - check key.properties' alias and password" >&2
@@ -209,7 +211,7 @@ android-release version:
         echo "        a regenerated keystore signs happily and every installed phone refuses it" >&2
         exit 1
     fi
-    signed=$("$apksigner" verify --print-certs "$built" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' || true)
+    signed=$("$apksigner" verify --print-certs "$built" | sed -n 's/^.*certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-Z' 'a-z' || true)
     if [ "$signed" != "$want" ]; then
         echo "[ERROR] the APK is not signed by the release keystore (signer ${signed:-none}, expected $want)" >&2
         exit 1
