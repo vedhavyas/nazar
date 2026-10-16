@@ -176,30 +176,29 @@ impl P2pEngine {
             .connect_broker(session, &device.unit_id, &monitor_topic)
             .await?;
 
-        if let Err(err) = self
-            .publish_start(
-                &broker,
-                &control_topic,
-                &allocation,
-                device,
-                identity,
-                &offer,
-            )
-            .await
-        {
-            broker.pump.abort();
-            return Err(err);
-        }
-
+        // From here on the camera may learn of this session, so every exit -
+        // an error return, or the caller's bound dropping this future
+        // mid-flight - must publish endP2pCall; the guard owns that.
         let session_id = allocation.app_session_id.clone();
-        let answer = match self.wait_for_answer(&mut broker.answers, &session_id).await {
-            Ok(answer) => answer,
-            Err(err) => {
-                return Err(broker
-                    .abort(&control_topic, device, identity, &session_id, err)
-                    .await);
-            }
-        };
+        let end = build_end_call(&device.device_id, &identity.src_device_id, &session_id);
+        let teardown = TeardownGuard::new(
+            &broker,
+            &control_topic,
+            serde_json::to_vec(&end).map_err(QuboError::from)?,
+        );
+
+        self.publish_start(
+            &broker,
+            &control_topic,
+            &allocation,
+            device,
+            identity,
+            &offer,
+        )
+        .await?;
+        let answer = self
+            .wait_for_answer(&mut broker.answers, &session_id)
+            .await?;
         tracing::debug!(
             event = %answer.event,
             handle = ?answer.handle_name,
@@ -208,36 +207,19 @@ impl P2pEngine {
         );
 
         let (targets, relay_endpoint) = handshake_targets(&answer, &allocation);
-        let established = if targets.is_empty() && relay_endpoint.is_none() {
-            return Err(broker
-                .abort(
-                    &control_topic,
-                    device,
-                    identity,
-                    &session_id,
-                    P2pError::NoTargets,
-                )
-                .await);
-        } else {
-            match relay::handshake(
-                &socket,
-                &targets,
-                &HandshakeConfig {
-                    relay: relay_endpoint,
-                    relay_gate: self.config.relay_gate,
-                    timeout: self.config.handshake_timeout,
-                },
-            )
-            .await
-            {
-                Ok(established) => established,
-                Err(err) => {
-                    return Err(broker
-                        .abort(&control_topic, device, identity, &session_id, err)
-                        .await);
-                }
-            }
-        };
+        if targets.is_empty() && relay_endpoint.is_none() {
+            return Err(P2pError::NoTargets);
+        }
+        let established = relay::handshake(
+            &socket,
+            &targets,
+            &HandshakeConfig {
+                relay: relay_endpoint,
+                relay_gate: self.config.relay_gate,
+                timeout: self.config.handshake_timeout,
+            },
+        )
+        .await?;
         let decryptor = media::MediaDecryptor::new(
             self.config.aes_mode,
             &allocation.aes_key,
@@ -245,6 +227,9 @@ impl P2pEngine {
         )?;
         tracing::debug!(peer = %established.addr, "fast lane armed");
 
+        // The session is real from here: the guard stands down and the
+        // armed session owns the broker and its pump.
+        teardown.disarm();
         Ok(ArmedSession {
             socket,
             peer: established.addr,
@@ -477,26 +462,61 @@ struct Broker {
     answers: mpsc::Receiver<(String, String)>,
 }
 
-impl Broker {
-    /// Tear the cloud side down before surfacing an arming failure, so the
-    /// camera never holds a half-open call.
-    async fn abort(
-        self,
-        control_topic: &str,
-        device: &Device,
-        identity: &P2pIdentity,
-        session_id: &str,
-        error: P2pError,
-    ) -> P2pError {
-        let end = build_end_call(&device.device_id, &identity.src_device_id, session_id);
-        if let Ok(payload) = serde_json::to_vec(&end) {
-            let _ = self
-                .client
-                .publish(control_topic, QoS::ExactlyOnce, false, payload)
-                .await;
+/// Cancellation safety for [`P2pEngine::arm`]: explicit error returns are
+/// not the only way out - a caller's bound (or any select) drops the arm
+/// future mid-flight, and the camera must not be left holding a half-open
+/// call. Every exit from the guarded section therefore publishes
+/// `endP2pCall`, and Drop covers the exits that error paths cannot see.
+/// The publish is async, so the drop spawns it on the current runtime and
+/// stops the pump only after a beat for it to reach the wire.
+struct TeardownGuard {
+    client: rumqttc::AsyncClient,
+    pump: tokio::task::AbortHandle,
+    control_topic: String,
+    payload: Vec<u8>,
+    armed: bool,
+}
+
+impl TeardownGuard {
+    fn new(broker: &Broker, control_topic: &str, payload: Vec<u8>) -> Self {
+        Self {
+            client: broker.client.clone(),
+            pump: broker.pump.abort_handle(),
+            control_topic: control_topic.to_owned(),
+            payload,
+            armed: true,
         }
-        self.pump.abort();
-        error
+    }
+
+    /// The session is being handed off alive: the guard stands down.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TeardownGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = self.client.clone();
+        let pump = self.pump.clone();
+        let control_topic = std::mem::take(&mut self.control_topic);
+        let payload = std::mem::take(&mut self.payload);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // No runtime to flush the teardown on (shutdown): stopping the
+            // pump is all that is left.
+            pump.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            let _ = client
+                .publish(&control_topic, QoS::ExactlyOnce, false, payload)
+                .await;
+            // A beat for the publish to reach the wire, then close.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pump.abort();
+        });
     }
 }
 
@@ -661,5 +681,54 @@ impl MediaPacket {
     /// `rtp:` source): the original header, the decrypted payload.
     pub fn to_rtp_bytes(&self) -> &[u8] {
         &self.packet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The arm cancellation guard, which no integration test can reach: it
+    //! only fires when the caller drops the arm future mid-flight.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    /// A broker that never connects: the pump stays pending, so only the
+    /// guard's abort can end it.
+    fn idle_broker() -> Broker {
+        let (client, _eventloop) = rumqttc::AsyncClient::new(
+            rumqttc::MqttOptions::new("guard-test", "192.0.2.1", 1883),
+            BROKER_CAPACITY,
+        );
+        Broker {
+            client,
+            pump: tokio::spawn(std::future::pending()),
+            answers: mpsc::channel(1).1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_arm_guard_stops_the_pump() {
+        let broker = idle_broker();
+        let guard = TeardownGuard::new(&broker, "/control/test/p2pStreaming", b"{}".to_vec());
+        drop(guard);
+        // The guard publishes the teardown, gives it a beat, then stops the
+        // pump; a pump still running after the window means the guard never
+        // fired.
+        let stopped = tokio::time::timeout(Duration::from_secs(2), broker.pump).await;
+        assert!(stopped.is_ok(), "a dropped guard stops the pump");
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_guard_leaves_the_session_alone() {
+        let broker = idle_broker();
+        TeardownGuard::new(&broker, "/control/test/p2pStreaming", b"{}".to_vec()).disarm();
+        // Well past the guard's teardown delay: the pump must still run.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !broker.pump.is_finished(),
+            "a disarmed guard never stops the pump"
+        );
+        broker.pump.abort();
     }
 }
