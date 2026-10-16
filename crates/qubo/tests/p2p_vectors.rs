@@ -497,6 +497,21 @@ fn start_call_envelope_carries_the_requested_settings() {
         "mobileUUID is the app-side device"
     );
     assert_eq!(
+        mine_params["sessionId"],
+        json!("d0000000-0000-4000-8000-000000000004"),
+        "sessionId is the caller's allocation id, never another identity"
+    );
+    assert_eq!(
+        mine_params["aesKey"],
+        json!("00000000000000000000000000000000"),
+        "aesKey is the caller's key verbatim"
+    );
+    assert_eq!(
+        mine_params["aesIV"],
+        json!("11111111111111111111111111111111"),
+        "aesIV is the caller's iv verbatim"
+    );
+    assert_eq!(
         mine["deviceUUID"],
         json!("c0000000-0000-4000-8000-000000000001"),
         "deviceUUID is the camera"
