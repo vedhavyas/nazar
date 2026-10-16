@@ -7,7 +7,7 @@ use qubo::{BASE_URL, QuboClient, SessionStore};
 use server::config::Config;
 use server::episodes::EpisodeStore;
 use server::events::EventBus;
-use server::go2rtc::Go2rtc;
+use server::go2rtc::{FfmpegHold, Go2rtc};
 use server::http::{AppState, Wiring, app};
 use server::motion::MotionOrder;
 use server::mqtt::{FeedConfig, MqttService};
@@ -34,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
         config.device_id(),
     );
     let sessions = SessionStore::new(config.data_dir.join("session.json"));
-    let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default());
+    let supervisor = Supervisor::new(qubo.clone(), sessions.clone(), go2rtc, Pacing::default())
+        .with_hold(Arc::new(FfmpegHold::new(config.ffmpeg_bin.clone())));
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);

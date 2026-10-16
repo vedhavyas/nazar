@@ -1182,17 +1182,91 @@ async fn an_unreadable_or_missing_producer_does_not_heal() {
     }
 
     // The stream entry is gone, as a go2rtc restart leaves it: still no
-    // recovery - the producer certainly is not up.
+    // recovery - the producer certainly is not up. Sampled finely, because
+    // the mint failures re-degrade the state and could mask a Live blip.
     h.go2rtc.set_streams_visible(false);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Live { .. }
+            ),
+            "a lost entry is not a recovery: {:?}",
+            h.supervisor.status(DEVICE_ID).await
+        );
+    }
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// narar's own consumer keeps the producer up between viewers: a client
+/// that connects finds a picture already flowing, not a dial.
+#[tokio::test]
+async fn a_held_stream_stays_warm_without_viewers() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor = h
+        .supervisor
+        .clone()
+        .with_hold(std::sync::Arc::new(common::FakeHold {
+            api: h.go2rtc.clone(),
+        }));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let warm = common::eventually(|| async {
+        let (consumers, connected) = h.go2rtc.stream_view(&name);
+        consumers == 1 && connected
+    })
+    .await;
     assert!(
-        matches!(
-            h.supervisor.status(DEVICE_ID).await,
-            StreamState::Degraded { .. }
-        ),
-        "a lost entry is not a recovery either: {:?}",
-        h.supervisor.status(DEVICE_ID).await
+        warm,
+        "the hold's consumer warmed the producer with no viewer: {:?}",
+        h.go2rtc.stream_view(&name)
     );
+    assert!(is_live(&h.supervisor).await, "and the state holds live");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// narar's own consumer never counts as a viewer: a stream nobody asks for
+/// and nobody watches still idles out, and the hold is released with it.
+#[tokio::test]
+async fn the_hold_does_not_keep_a_stream_alive() {
+    let mut h = harness(Pacing {
+        stream_idle: Duration::from_millis(150),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    h.supervisor = h
+        .supervisor
+        .clone()
+        .with_hold(std::sync::Arc::new(common::FakeHold {
+            api: h.go2rtc.clone(),
+        }));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
+    assert!(
+        retired,
+        "the idle window still retires the stream: {:?}",
+        h.go2rtc.deletes()
+    );
+    let released = common::eventually(|| async { h.go2rtc.stream_view(&name).0 == 0 }).await;
+    assert!(released, "and the hold is released with it");
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 

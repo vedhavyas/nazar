@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio::process::{Child, Command};
 
 use crate::config::Config;
+use crate::supervisor::{HoldLease, StreamHold};
 
 /// Where the generated config puts go2rtc's API.
 pub const API_BASE: &str = "http://127.0.0.1:1984";
@@ -313,4 +314,82 @@ fn parse_url(base: &str) -> Result<Url, Go2rtcError> {
 
 fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
+}
+
+/// Where the generated config's rtsp listener answers.
+pub const RTSP_BASE: &str = "rtsp://127.0.0.1:8554";
+
+/// How long a hold waits before reconnecting: long enough that a camera
+/// that is away is not dialled every second, short enough that a viewer
+/// arriving after a failure waits seconds, not minutes.
+const HOLD_RETRY: Duration = Duration::from_secs(5);
+
+/// narar's own consumer on a stream: an ffmpeg reading it over the
+/// loopback rtsp listener the generated config already runs. A consumer
+/// on that listener is a viewer as far as go2rtc is concerned, so the
+/// producer stays up between real viewers and a client connects to a
+/// flowing picture.
+pub struct FfmpegHold {
+    ffmpeg: PathBuf,
+}
+
+impl FfmpegHold {
+    pub fn new(ffmpeg: PathBuf) -> Self {
+        Self { ffmpeg }
+    }
+}
+
+impl StreamHold for FfmpegHold {
+    fn hold(&self, name: &str) -> Box<dyn HoldLease> {
+        let ffmpeg = self.ffmpeg.clone();
+        let target = format!("{RTSP_BASE}/{name}");
+        let stream = name.to_owned();
+        let worker = tokio::spawn(async move {
+            loop {
+                match Command::new(&ffmpeg)
+                    .args([
+                        "-v",
+                        "error",
+                        "-rtsp_transport",
+                        "tcp",
+                        "-i",
+                        &target,
+                        "-c",
+                        "copy",
+                        "-f",
+                        "null",
+                        "-",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        tracing::debug!(stream = %stream, "the hold consumer is up");
+                        let _ = child.wait().await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(stream = %stream, %err, "the hold consumer could not start");
+                    }
+                }
+                tokio::time::sleep(HOLD_RETRY).await;
+            }
+        });
+        Box::new(FfmpegLease { worker })
+    }
+}
+
+/// The running hold: aborting the worker kills its ffmpeg through
+/// `kill_on_drop`.
+struct FfmpegLease {
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl HoldLease for FfmpegLease {}
+
+impl Drop for FfmpegLease {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }

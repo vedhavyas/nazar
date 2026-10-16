@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 
 /// A fake go2rtc API: records the stream PUTs and DELETEs it receives and
 /// answers GETs with the shape measured from go2rtc 1.9.14.
+#[derive(Clone)]
 pub struct FakeApi {
     pub base: reqwest::Url,
     puts: Arc<Mutex<Vec<(String, String)>>>,
@@ -58,6 +59,10 @@ pub struct FakeApi {
     /// Per-stream delay between a consumer attaching and the producer
     /// connecting, for tests that need a slow source.
     connect_after: Arc<Mutex<HashMap<String, Duration>>>,
+    /// The streams narar itself holds a consumer on, by hold start: the
+    /// producer stays up exactly while some consumer - a viewer or a hold
+    /// - is attached.
+    held: Arc<Mutex<HashMap<String, Instant>>>,
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
@@ -77,6 +82,7 @@ impl FakeApi {
         let producers = Arc::new(AtomicBool::new(true));
         let unconnected = Arc::new(Mutex::new(HashSet::new()));
         let connect_after = Arc::new(Mutex::new(HashMap::new()));
+        let held = Arc::new(Mutex::new(HashMap::new()));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
         let url_state = Arc::new(Mutex::new(HashMap::new()));
         let dialed = Arc::new(Mutex::new(HashSet::new()));
@@ -97,6 +103,7 @@ impl FakeApi {
                 delete_delay: &delete_delay,
                 ops: &ops,
                 taken: &taken,
+                held: &held,
             },
             &viewers,
         ));
@@ -121,6 +128,7 @@ impl FakeApi {
             url_state,
             dialed,
             connect_after,
+            held,
             delete_delay,
             ops,
         }
@@ -177,7 +185,11 @@ impl FakeApi {
         let mut viewers = self.viewers.lock().unwrap();
         if count == 0 {
             viewers.remove(name);
-            self.dialed.lock().unwrap().remove(name);
+            // A hold on the stream keeps the producer's dial spent: the
+            // consumer never actually left.
+            if !self.held.lock().unwrap().contains_key(name) {
+                self.dialed.lock().unwrap().remove(name);
+            }
             return;
         }
         if let Some((seen, _)) = viewers.get_mut(name) {
@@ -219,6 +231,73 @@ impl FakeApi {
     pub fn deletes(&self) -> Vec<String> {
         self.deletes.lock().unwrap().clone()
     }
+
+    /// narar's own consumer on the stream, or its release: while held the
+    /// producer stays up exactly as it would for a viewer.
+    pub fn hold(&self, name: &str, on: bool) {
+        if on {
+            self.held
+                .lock()
+                .unwrap()
+                .entry(name.to_owned())
+                .or_insert_with(Instant::now);
+            self.dialed.lock().unwrap().insert(name.to_owned());
+            return;
+        }
+        self.held.lock().unwrap().remove(name);
+        if !self.viewers.lock().unwrap().contains_key(name) {
+            self.dialed.lock().unwrap().remove(name);
+        }
+    }
+
+    /// The stream's consumer count and producer state, as the listing
+    /// would report them.
+    pub fn stream_view(&self, name: &str) -> (usize, bool) {
+        let viewers = self.viewers.lock().unwrap().get(name).copied();
+        let held = self.held.lock().unwrap().get(name).copied();
+        let watching = viewers.map_or(0, |(count, _)| count) + usize::from(held.is_some());
+        let since = viewers.map(|(_, at)| at).or(held);
+        let delay = self
+            .connect_after
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or_default();
+        let connected = self.dialed.lock().unwrap().contains(name)
+            && since.is_some_and(|at| at.elapsed() >= delay)
+            && !self.unconnected.lock().unwrap().contains(name);
+        (watching, connected)
+    }
+}
+
+/// A stand-in for the production hold: narar's consumer registered on the
+/// fake, so the producer stays warm while it is held.
+pub struct FakeHold {
+    pub api: FakeApi,
+}
+
+impl server::supervisor::StreamHold for FakeHold {
+    fn hold(&self, name: &str) -> Box<dyn server::supervisor::HoldLease> {
+        self.api.hold(name, true);
+        Box::new(FakeLease {
+            api: self.api.clone(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+struct FakeLease {
+    api: FakeApi,
+    name: String,
+}
+
+impl server::supervisor::HoldLease for FakeLease {}
+
+impl Drop for FakeLease {
+    fn drop(&mut self) {
+        self.api.hold(&self.name, false);
+    }
 }
 
 /// The answer-mode knobs a test turns, bundled so the fake's surfaces take
@@ -235,6 +314,7 @@ struct Knobs<'a> {
     delete_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
     taken: &'a Arc<Mutex<Vec<(String, String)>>>,
+    held: &'a Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// The streams admin surface, as go2rtc 1.9.14 answers it.
@@ -284,6 +364,7 @@ fn streams_methods(
     let dialed = Arc::clone(knobs.dialed);
     let served = Arc::clone(viewers);
     let taken = Arc::clone(knobs.taken);
+    let held = Arc::clone(knobs.held);
     let put_stream = put(move |Query(params): Query<HashMap<String, String>>| {
         let recorded = Arc::clone(&recorded);
         let status = Arc::clone(&status);
@@ -292,19 +373,21 @@ fn streams_methods(
         let dialed = Arc::clone(&dialed);
         let served = Arc::clone(&served);
         let taken = Arc::clone(&taken);
+        let held = Arc::clone(&held);
         async move {
             let name = params.get("name").cloned().unwrap_or_default();
             recorded
                 .lock()
                 .unwrap()
                 .push((name.clone(), params.get("src").cloned().unwrap_or_default()));
-            // A fresh source is a fresh URL. Attached viewers ride the
-            // swap, as go2rtc swaps the source under the stream's name:
-            // their producer restarts and dials the new URL, spending its
-            // one dial for this generation. With nobody attached the URL
-            // stays unspent, and the next new attach is the one that
-            // dials it.
-            let riding = served.lock().unwrap().contains_key(&name);
+            // A fresh source is a fresh URL. Attached consumers - viewers
+            // or narar's own hold - ride the swap, as go2rtc swaps the
+            // source under the stream's name: their producer restarts and
+            // dials the new URL, spending its one dial for this
+            // generation. With nobody attached the URL stays unspent, and
+            // the next new attach is the one that dials it.
+            let riding = served.lock().unwrap().contains_key(&name)
+                || held.lock().unwrap().contains_key(&name);
             {
                 let mut urls = urls.lock().unwrap();
                 let state = urls.entry(name.clone()).or_insert((0, 0));
@@ -369,6 +452,7 @@ fn streams_methods(
         unconnected: Arc::clone(knobs.unconnected),
         dialed: Arc::clone(knobs.dialed),
         connect_after: Arc::clone(knobs.connect_after),
+        held: Arc::clone(knobs.held),
     });
     put_stream.delete(drop_stream).get(list_streams)
 }
@@ -385,6 +469,7 @@ struct StreamsAnswer {
     unconnected: Arc<Mutex<HashSet<String>>>,
     dialed: Arc<Mutex<HashSet<String>>>,
     connect_after: Arc<Mutex<HashMap<String, Duration>>>,
+    held: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// The `GET /api/streams` answer, as go2rtc 1.9.14 shapes it.
@@ -399,6 +484,7 @@ fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
             unconnected,
             dialed,
             connect_after,
+            held,
         } = state.clone();
         async move {
             // An unreadable status: what a go2rtc in trouble answers.
@@ -413,13 +499,20 @@ fn list_streams_handler(state: StreamsAnswer) -> axum::routing::MethodRouter {
                 return "{}".to_owned();
             }
             let viewers = viewers.lock().unwrap().clone();
+            let held = held.lock().unwrap().clone();
             let connect_after = connect_after.lock().unwrap().clone();
             // go2rtc materializes a producer as soon as the source is set.
             let mut streams = serde_json::Map::new();
             for (name, source) in recorded {
-                let (watching, since) = viewers
+                let (mut watching, mut since) = viewers
                     .get(&name)
                     .map_or((0, None), |(count, at)| (*count, Some(*at)));
+                // narar's own hold is a consumer to go2rtc: it counts, and
+                // its attach dials the producer like a viewer's would.
+                if let Some(at) = held.get(&name) {
+                    watching += 1;
+                    since = Some(since.map_or(*at, |viewer_at| viewer_at.min(*at)));
+                }
                 // Measured shape: no consumers is `null`.
                 let consumers = (watching > 0).then(|| {
                     (0..watching)

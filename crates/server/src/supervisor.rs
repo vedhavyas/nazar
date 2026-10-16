@@ -8,7 +8,7 @@
 //! high stream is minted; a tile's low rides it as a chain inside go2rtc
 //! and is dropped once nobody has asked for it for a while.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +17,20 @@ use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live, m
 use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, live_source, low_source};
+
+/// A consumer narar keeps on its own stream, so go2rtc's producer stays
+/// warm between viewers: a client that connects finds a picture already
+/// flowing instead of waiting out a mint and a dial. It lives exactly as
+/// long as the stream's loop, so the idle teardown still parks a stream
+/// nobody asks for and the hold goes cold with it - and it never counts
+/// as a viewer: `watched` subtracts it.
+pub trait StreamHold: Send + Sync {
+    /// Begin holding `name`; dropping the lease releases the consumer.
+    fn hold(&self, name: &str) -> Box<dyn HoldLease>;
+}
+
+/// A running hold; dropping it releases the consumer.
+pub trait HoldLease: Send + Sync {}
 
 /// The shortest wait between a playback stream's idle re-checks: a zero
 /// window would spin.
@@ -37,8 +51,12 @@ pub struct Pacing {
     /// is dropped. A stream anyone is watching is never idle.
     pub stream_idle: Duration,
     /// How long one minted URL is given for its producer to connect before
-    /// the stream is re-minted. A fresh mint connects in about a second
-    /// (measured 2026-10-16); this is several times that.
+    /// the stream is re-minted. A fresh dial takes 6-12s (measured
+    /// 2026-10-16), so the grace must clear the whole range: under it, a
+    /// merely-slow dial gets its in-flight attach killed by the re-mint,
+    /// the state flips to waking, and the tile's player unmounts. The
+    /// tradeoff: a genuinely spent URL's heal waits the grace. Still far
+    /// under `connect_window`.
     pub connect_grace: Duration,
     /// How long a watched producer may stay unconnected before the stream
     /// surfaces degraded - the camera's push can lag for minutes (measured
@@ -71,7 +89,7 @@ impl Default for Pacing {
             retry_max: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(5),
             stream_idle: Duration::from_secs(120),
-            connect_grace: Duration::from_secs(8),
+            connect_grace: Duration::from_secs(20),
             connect_window: Duration::from_secs(90),
             liveness_poll: Duration::from_secs(2),
             touch_ttl: Duration::from_secs(30),
@@ -206,6 +224,17 @@ impl Stall {
     }
 }
 
+/// What the liveness watch wants from the loop this slice.
+enum StallStep {
+    /// Nothing to do.
+    Idle,
+    /// The run wants its next attempt pulled forward.
+    Remint,
+    /// A run just closed: a deadline armed for its next attempt would fire
+    /// late and swap a working URL, so the pace must be re-armed.
+    Closed,
+}
+
 /// What the liveness watch can say about the stream's producer.
 enum ProducerWatch {
     /// The producer is up: any run of starvation is over.
@@ -240,6 +269,28 @@ pub struct Supervisor {
     /// only sighting that survives a failed attach, which go2rtc's API
     /// does not trace at all.
     touches: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The hold narar keeps on its own streams, when one is configured.
+    hold: Option<Arc<dyn StreamHold>>,
+    /// The streams this server currently holds a consumer on, so a viewer
+    /// count can subtract narar's own presence.
+    holds: Arc<Mutex<HashSet<String>>>,
+}
+
+/// narar's own consumer on a stream, held for the loop's lifetime and
+/// released on drop.
+struct HeldStream {
+    name: String,
+    holds: Arc<Mutex<HashSet<String>>>,
+    _lease: Box<dyn HoldLease>,
+}
+
+impl Drop for HeldStream {
+    fn drop(&mut self) {
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.name);
+    }
 }
 
 impl Supervisor {
@@ -254,7 +305,41 @@ impl Supervisor {
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
             touches: Arc::new(Mutex::new(HashMap::new())),
+            hold: None,
+            holds: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Keep a warm consumer on every tracked stream, so connecting clients
+    /// find the picture already flowing.
+    #[must_use]
+    pub fn with_hold(mut self, hold: Arc<dyn StreamHold>) -> Self {
+        self.hold = Some(hold);
+        self
+    }
+
+    /// Start narar's own consumer on `name`, registered so viewer counts
+    /// can subtract it. `None` without a configured hold.
+    fn start_hold(&self, name: &str) -> Option<HeldStream> {
+        let hold = self.hold.as_ref()?;
+        let lease = hold.hold(name);
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned());
+        Some(HeldStream {
+            name: name.to_owned(),
+            holds: Arc::clone(&self.holds),
+            _lease: lease,
+        })
+    }
+
+    /// Whether narar's own hold is (to be) counted on `name`.
+    fn held(&self, name: &str) -> bool {
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
     }
 
     /// A viewer's ask, as narar itself sees it. The ask is normalized to
@@ -616,6 +701,9 @@ impl Supervisor {
 
     async fn remint_loop(self, device: Device, mut wait: Duration) {
         let name = stream_name(&device.device_id, Quality::High);
+        // narar's own consumer: the producer stays warm between viewers,
+        // and goes cold with the loop when the idle teardown parks it.
+        let _held = self.start_hold(&name);
         let wake = self.wake_signal(&name).await;
         // Every stream idles out when nobody is watching and nobody has
         // asked: a demoted hero's high stream must not run for ever. The
@@ -677,15 +765,24 @@ impl Supervisor {
             let retry_due = forced && failed;
             if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
-                if self.stall_response(&name, &mut stall).await {
-                    failed = true;
-                    // Pulled forward, never pushed back: a starved stream
-                    // replaces its dead URL on the run's own backoff - so a
-                    // camera away for minutes is not hit with a mint a
-                    // second, and a backoff longer than the watch's own
-                    // poll still comes due.
-                    next_mint =
-                        next_mint.min(Instant::now() + stall.wait.max(self.pacing.retry_base));
+                match self.stall_response(&name, &mut stall).await {
+                    StallStep::Remint => {
+                        failed = true;
+                        // Pulled forward, never pushed back: a starved
+                        // stream replaces its dead URL on the run's own
+                        // backoff - so a camera away for minutes is not hit
+                        // with a mint a second, and a backoff longer than
+                        // the watch's own poll still comes due.
+                        next_mint =
+                            next_mint.min(Instant::now() + stall.wait.max(self.pacing.retry_base));
+                    }
+                    StallStep::Closed => {
+                        // The recovery itself clears the pace: the deadline
+                        // armed for the run's next attempt is stale.
+                        failed = false;
+                        next_mint = Instant::now() + self.pacing.remint;
+                    }
+                    StallStep::Idle => {}
                 }
                 continue;
             }
@@ -803,36 +900,37 @@ impl Supervisor {
         if let Some(at) = asked {
             return ProducerWatch::Stalled(at);
         }
-        if stream.is_some_and(|stream| stream.consumers > 0) {
+        if stream.is_some_and(|stream| stream.consumers > usize::from(self.held(name))) {
             return ProducerWatch::Stalled(Instant::now());
         }
         ProducerWatch::Quiet
     }
 
-    /// The liveness watch, once per loop slice: `true` asks the loop for a
-    /// fresh mint, on the run's own backoff and well before the next
+    /// The liveness watch, once per loop slice: `Remint` asks the loop for
+    /// a fresh mint, on the run's own backoff and well before the next
     /// remint's cadence. A run that is open stays open through silence -
     /// its window and its reason must still land - and only the producer
     /// connecting closes it; an unreadable or absent producer leaves it
     /// standing.
-    async fn stall_response(&self, name: &str, stall: &mut Stall) -> bool {
+    async fn stall_response(&self, name: &str, stall: &mut Stall) -> StallStep {
         match self.watch_producer(name).await {
             ProducerWatch::Up => {
-                if let Some((starved, attempts)) = stall.close() {
-                    tracing::info!(
-                        stream = %name,
-                        ?starved,
-                        attempts,
-                        "the producer connected; the stall is over"
-                    );
-                    self.mark_live(name).await;
-                }
-                false
+                let Some((starved, attempts)) = stall.close() else {
+                    return StallStep::Idle;
+                };
+                tracing::info!(
+                    stream = %name,
+                    ?starved,
+                    attempts,
+                    "the producer connected; the stall is over"
+                );
+                self.mark_live(name).await;
+                StallStep::Closed
             }
-            ProducerWatch::Unreadable => false,
+            ProducerWatch::Unreadable => StallStep::Idle,
             ProducerWatch::Quiet => {
                 let Some(since) = stall.since else {
-                    return false;
+                    return StallStep::Idle;
                 };
                 self.stall_cadence(name, stall, since).await
             }
@@ -846,11 +944,14 @@ impl Supervisor {
     /// The cadence a starved run keeps: waking past the grace, degraded
     /// past the window - the reason re-asserted every slice, so no later
     /// mint quietly returns the stream to waking. The UI offers Try again
-    /// only for degraded.
-    async fn stall_cadence(&self, name: &str, stall: &mut Stall, since: Instant) -> bool {
+    /// only for degraded. The grace is what covers a merely-slow dial: a
+    /// fresh camera push takes 6-12s (measured 2026-10-16), so the first
+    /// attempt is armed no earlier than the grace's end rather than on the
+    /// base backoff, which would swap the URL out from under the dial.
+    async fn stall_cadence(&self, name: &str, stall: &mut Stall, since: Instant) -> StallStep {
         let waiting = since.elapsed();
         if waiting < self.pacing.connect_grace {
-            return false;
+            return StallStep::Idle;
         }
         if waiting >= self.pacing.connect_window {
             if !stall.reported {
@@ -866,7 +967,7 @@ impl Supervisor {
         } else {
             self.mark_waking(name).await;
         }
-        true
+        StallStep::Remint
     }
 
     /// Drop the stream only if the entry this loop decided about is still
@@ -948,7 +1049,9 @@ impl Supervisor {
         }
         // Re-asserted only when go2rtc has lost it: every PUT rewrites
         // go2rtc's whole config on disk, and a healthy chain needs none of
-        // that on a per-slice heartbeat.
+        // that on a per-slice heartbeat. An entry that merely exists is
+        // trusted - it carries the chain's source from the PUT that made
+        // it, and a chain go2rtc refused never got an entry at all.
         let present = self
             .go2rtc
             .streams()
@@ -999,10 +1102,17 @@ impl Supervisor {
     /// the stream: a late teardown beats a wrong one.
     async fn watched(&self, name: &str) -> bool {
         let low = low_name_of(name);
+        // narar's own hold is not a viewer: only the consumers beyond it
+        // count.
+        let own = usize::from(self.held(name));
         self.go2rtc.streams().await.map_or(true, |streams| {
             streams.iter().any(|stream| {
-                stream.consumers > 0
-                    && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
+                let theirs = if stream.name == name {
+                    stream.consumers.saturating_sub(own)
+                } else {
+                    stream.consumers
+                };
+                theirs > 0 && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
             })
         })
     }

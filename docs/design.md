@@ -42,6 +42,7 @@ Interfaces are deliberately transport-thin: any client that can speak the protoc
 ## 5. Live viewing
 
 - Home screen: **adaptive hero** - the camera that most recently saw motion takes the large tile (full quality); the other cameras sit below it, live at low quality. Away from home the small tiles may drop to stills.
+- A tile renders its player only while the stream reads live: `waking` unmounts it, so the tile's asks stop until the state returns - the supervisor's starvation run is built to outlive its asker for exactly this reason.
 - Camera screen: live video; **drag on the video to pan/tilt** (direction overlay while dragging); privacy quick-toggle; quality selector; audio-listen toggle; client-side snapshot capture.
 - Latency: WebRTC (direct WG candidates; coturn as the documented fallback) - sub-second. HLS fallback where WebRTC cannot negotiate, owned by M2's player task.
 - Audio: listen works on the cloud path (AAC 16 kHz confirmed live). Talkback is in scope but gated on the fast lane (section 7).
