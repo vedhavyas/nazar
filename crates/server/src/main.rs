@@ -37,10 +37,10 @@ async fn main() -> anyhow::Result<()> {
     let events = EventBus::new();
     let motion = Arc::new(Mutex::new(MotionOrder::new()));
     let _motion = server::motion::follow(&events, Arc::clone(&motion), &supervisor);
-    let notifications = Arc::new(NotificationStore::open(
-        config.data_dir.join("notifications.json"),
-        COALESCE,
-    ));
+    let notifications = Arc::new(
+        NotificationStore::open(config.data_dir.join("notifications.json"), COALESCE)
+            .with_aqi(config.aqi_alert_at),
+    );
     let snapshots = Snapshots::new(
         Go2rtc::connect(server::go2rtc::API_BASE.parse().context("the go2rtc URL")?),
         config.data_dir.join("snaps"),
