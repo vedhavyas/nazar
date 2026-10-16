@@ -43,6 +43,7 @@ fn pacing(remint: Duration) -> Pacing {
         discovery_retry: Duration::from_millis(50),
         stream_idle: Duration::from_secs(30),
         arm_timeout: Duration::from_secs(15),
+        lane_cooldown: Duration::from_secs(600),
     }
 }
 
@@ -306,6 +307,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
         arm_timeout: Duration::from_secs(15),
+        lane_cooldown: Duration::from_secs(600),
     })
     .await;
     mount_discovery(&h.qubo).await;
