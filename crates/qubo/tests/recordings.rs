@@ -163,8 +163,8 @@ async fn a_vod_mint_asks_for_the_instant_and_carries_the_url_back() {
     let body: Value = serde_json::from_slice(&requests[0].body).expect("the body is JSON");
     assert_eq!(
         body["userAppID"],
-        client.device_id(),
-        "the client's device id is sent as userAppID"
+        device().device_id,
+        "the camera's own id is sent as userAppID, as the live mint does"
     );
 }
 

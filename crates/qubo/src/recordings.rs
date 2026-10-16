@@ -74,7 +74,10 @@ pub async fn mint_vod(
         ("streamSourceCamera", "primary"),
         ("singleRecord", "0"),
     ];
-    let body = json!({ "userAppID": client.device_id() });
+    // The gateway names the wowza stream after `userAppID`: the camera's
+    // own id, so two cameras' playback sessions cannot collide on one
+    // name (see `mint_live`).
+    let body = json!({ "userAppID": device.device_id });
     let response = client
         .post_json_query(&path, &query, &body, Some(session))
         .await?;

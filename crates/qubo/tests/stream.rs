@@ -44,8 +44,12 @@ fn session() -> Session {
 }
 
 fn device(device_type: &str) -> Device {
+    device_with(DEVICE_ID, device_type)
+}
+
+fn device_with(device_id: &str, device_type: &str) -> Device {
     Device {
-        device_id: DEVICE_ID.into(),
+        device_id: device_id.into(),
         name: "Hall".into(),
         device_type: device_type.into(),
         // The mint carries the type; the model is not part of its wire
@@ -121,9 +125,60 @@ async fn mint_live_returns_the_url_and_asks_with_the_documented_parameters() {
 
     let body = fixture(&String::from_utf8_lossy(&requests[0].body));
     assert_eq!(
-        body["userAppID"],
-        client.device_id(),
-        "the client's device id is sent as userAppID"
+        body["userAppID"], DEVICE_ID,
+        "the camera's own id is sent as userAppID: the gateway names the wowza stream after it"
+    );
+}
+
+/// Two cameras must never mint under one source id: the gateway names the
+/// wowza stream after `userAppID`, so a shared id gives every camera one
+/// shared picture (the hub's all-tiles-one-camera defect, 2026-10-16).
+#[tokio::test]
+async fn two_cameras_mint_with_distinct_source_ids() {
+    const SECOND_ID: &str = "c0000000-0000-4000-8000-000000000002";
+    let server = MockServer::start().await;
+    mount_mint(&server, 200, include_str!("fixtures/mint_live.json")).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH.replace(DEVICE_ID, SECOND_ID)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/mint_live.json")),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    mint_live(
+        &client,
+        &session(),
+        &device_with(DEVICE_ID, "HCP01"),
+        Quality::High,
+    )
+    .await
+    .expect("the first camera mints");
+    mint_live(
+        &client,
+        &session(),
+        &device_with(SECOND_ID, "HCP01"),
+        Quality::High,
+    )
+    .await
+    .expect("the second camera mints");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "two mints went out");
+    let sources: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            fixture(&String::from_utf8_lossy(&request.body))["userAppID"]
+                .as_str()
+                .expect("a string userAppID")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec![DEVICE_ID.to_owned(), SECOND_ID.to_owned()],
+        "each mint names its own camera, so the two wowza streams cannot collide"
     );
 }
 

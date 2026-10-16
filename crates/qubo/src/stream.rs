@@ -68,7 +68,12 @@ pub async fn mint_live(
         ("streamSourceCamera", "primary"),
         ("deviceType", device_type),
     ];
-    let body = json!({ "userAppID": client.device_id() });
+    // The gateway names the wowza stream after `userAppID`; the client's
+    // own id would give every camera one shared name and one shared
+    // picture. The camera's own id is stable, distinct per camera, and
+    // already a device row on the account, so nothing new is added
+    // (probed 2026-10-16).
+    let body = json!({ "userAppID": device.device_id });
 
     let response = client
         .post_json_query(&path, &query, &body, Some(session))
