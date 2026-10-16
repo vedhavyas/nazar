@@ -301,6 +301,40 @@ async fn a_hanging_arm_falls_back_within_the_bound() {
 }
 
 #[tokio::test]
+async fn a_refused_fast_lane_source_falls_back_in_the_same_pass() {
+    let h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .await;
+    h.go2rtc.set_put_refused_marker(Some("nazar-fake.sdp"));
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+
+    let up = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(up, "the cloud path served this pass");
+    let puts = h.go2rtc.puts();
+    assert!(
+        puts.iter()
+            .any(|(_, source)| source.contains("nazar-fake.sdp")),
+        "the fast-lane source was offered and refused: {puts:?}"
+    );
+    assert!(
+        puts.iter().any(|(_, source)| is_cloud_source(source)),
+        "and the cloud source took the same pass: {puts:?}"
+    );
+    assert!(
+        !h.lane.session().alive(),
+        "the refused session was ended, not retried blindly"
+    );
+    assert_eq!(h.lane.arms(), 1, "one arm, one cloud fallback");
+}
+
+#[tokio::test]
 async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
     let h = harness(
         FakeLane::new(),

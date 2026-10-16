@@ -142,6 +142,7 @@ pub struct FakeApi {
     puts: Arc<Mutex<Vec<(String, String)>>>,
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
+    put_refused_marker: Arc<Mutex<Option<String>>>,
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
     viewers: Arc<Mutex<HashMap<String, usize>>>,
@@ -152,6 +153,7 @@ impl FakeApi {
         let puts = Arc::new(Mutex::new(Vec::new()));
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
+        let put_refused_marker = Arc::new(Mutex::new(None));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
         let viewers = Arc::new(Mutex::new(HashMap::new()));
@@ -159,6 +161,7 @@ impl FakeApi {
             &puts,
             &deletes,
             &put_status,
+            &put_refused_marker,
             &streams_visible,
             &streams_error,
             &viewers,
@@ -175,10 +178,20 @@ impl FakeApi {
             puts,
             deletes,
             put_status,
+            put_refused_marker,
             streams_visible,
             streams_error,
             viewers,
         }
+    }
+
+    /// Refuse PUTs whose source contains `marker` (accept the rest as
+    /// configured), so a test can fail one source without failing all.
+    pub fn set_put_refused_marker(&self, marker: Option<&str>) {
+        *self
+            .put_refused_marker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = marker.map(str::to_owned);
     }
 
     /// Report `count` viewers on the stream, as go2rtc does while a browser
@@ -220,6 +233,7 @@ fn streams_routes(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
     put_status: &Arc<AtomicU16>,
+    put_refused_marker: &Arc<Mutex<Option<String>>>,
     streams_visible: &Arc<AtomicBool>,
     streams_error: &Arc<AtomicBool>,
     viewers: &Arc<Mutex<HashMap<String, usize>>>,
@@ -229,25 +243,32 @@ fn streams_routes(
         put({
             let recorded = Arc::clone(puts);
             let status = Arc::clone(put_status);
+            let refused = Arc::clone(put_refused_marker);
             move |Query(params): Query<HashMap<String, String>>| {
                 let recorded = Arc::clone(&recorded);
                 let status = Arc::clone(&status);
+                let refused = Arc::clone(&refused);
                 async move {
+                    let source = params.get("src").cloned().unwrap_or_default();
                     recorded.lock().unwrap().push((
                         params.get("name").cloned().unwrap_or_default(),
-                        params.get("src").cloned().unwrap_or_default(),
+                        source.clone(),
                     ));
-                    let code =
-                        StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+                    let marker = refused
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let code = if marker.is_some_and(|marker| source.contains(&marker)) {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status")
+                    };
                     // A rejected PUT quotes the source back, as
                     // go2rtc's own refusals do - token and all.
                     let body = if code.is_success() {
                         String::new()
                     } else {
-                        format!(
-                            "streams: source from insecure producer: {}",
-                            params.get("src").cloned().unwrap_or_default()
-                        )
+                        format!("streams: source from insecure producer: {source}")
                     };
                     (code, body)
                 }
