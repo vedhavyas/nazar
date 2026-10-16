@@ -326,6 +326,48 @@ fn aes_ctr_matches_the_reference_on_captured_packets() {
 }
 
 #[test]
+fn aes_cfb_ofb_and_plain_match_the_reference_on_captured_packets() {
+    let v = vectors();
+    let key = v["aes"]["key"].as_str().expect("a key field");
+    let iv = v["aes"]["iv"].as_str().expect("an iv field");
+    let frames: Vec<Value> = v["rtp_frames"]
+        .as_array()
+        .expect("a rtp_frames array")
+        .clone();
+
+    for (mode, field) in [
+        (AesMode::Cfb, "plaintext_cfb"),
+        (AesMode::Ofb, "plaintext_ofb"),
+    ] {
+        let mut decryptor =
+            MediaDecryptor::new(mode, key, iv).expect("the captured keys build a decryptor");
+        for (index, frame) in frames.iter().enumerate() {
+            let packet = case_bytes(frame);
+            let mut payload = packet[12..].to_vec();
+            decryptor.decrypt(&mut payload);
+            assert_eq!(
+                payload,
+                hex_bytes(frame[field].as_str().expect("a plaintext field")),
+                "{mode:?} packet {} matches the reference's plaintext",
+                index + 1
+            );
+        }
+    }
+
+    // Plain is the diagnostic passthrough: the ciphertext is the payload.
+    let packet = case_bytes(&frames[0]);
+    let mut payload = packet[12..].to_vec();
+    MediaDecryptor::new(AesMode::Plain, key, iv)
+        .expect("the captured keys build a decryptor")
+        .decrypt(&mut payload);
+    assert_eq!(
+        payload,
+        packet[12..],
+        "the plain mode passes the payload through untouched"
+    );
+}
+
+#[test]
 fn h264_depacketizes_single_stap_a_and_fu_a() {
     let mut assembler = H264Assembler::new();
     assert_eq!(

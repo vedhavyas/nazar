@@ -4,7 +4,7 @@
 //! `docs/qubo-protocol.md` 6.5.
 
 use aes::Aes128;
-use aes::cipher::{KeyIvInit as _, StreamCipher as _};
+use aes::cipher::{BlockEncrypt as _, KeyInit as _, KeyIvInit as _, StreamCipher as _};
 use base64::Engine as _;
 use ctr::Ctr128BE;
 
@@ -57,7 +57,8 @@ pub fn unwrap_rtp(packet: &[u8]) -> Option<RtpHeader> {
 
 /// The AES modes the reference client offers for the media payloads. The
 /// captures never proved which one the camera uses (protocol 6.5), so the
-/// mode is a switch the live verification settles.
+/// mode is a switch the live verification settles - all five exist so a
+/// live run can tell "wrong mode" from "not implemented".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AesMode {
     /// One keystream continued across packets - the reference's default.
@@ -65,15 +66,29 @@ pub enum AesMode {
     CtrCont,
     /// The keystream restarts at the session iv on every packet.
     CtrReset,
+    /// CFB128: the feedback is the ciphertext; the keystream is continuous
+    /// across packets (OpenSSL's EVP streaming, which the reference uses).
+    Cfb,
+    /// OFB: the feedback is the keystream itself; continuous across packets.
+    Ofb,
+    /// No encryption: the payload passes through (a diagnostic mode).
+    Plain,
 }
 
 /// A session's media decryptor: the stream `aesKey`/`aesIV` as hex or
-/// base64, the mode choosing whether the keystream runs on.
+/// base64, the mode choosing how the keystream runs.
 pub struct MediaDecryptor {
     mode: AesMode,
     key: [u8; 16],
     iv: [u8; 16],
-    stream: Ctr128BE<Aes128>,
+    aes: Aes128,
+    ctr: Ctr128BE<Aes128>,
+    /// CFB/OFB block state: the working keystream and the offset within it.
+    keystream: [u8; 16],
+    /// CFB's feedback register (the ciphertext); the keystream starts at
+    /// the iv.
+    feedback: [u8; 16],
+    position: usize,
 }
 
 impl MediaDecryptor {
@@ -84,20 +99,56 @@ impl MediaDecryptor {
             mode,
             key,
             iv,
-            stream: Ctr128BE::new(&key.into(), &iv.into()),
+            aes: Aes128::new(&key.into()),
+            ctr: Ctr128BE::new(&key.into(), &iv.into()),
+            keystream: iv,
+            feedback: iv,
+            position: 0,
         })
     }
 
-    /// Decrypt a payload in place. `CtrCont` keeps one keystream running
-    /// across calls; `CtrReset` restarts it at the iv on every call.
+    /// Decrypt a payload in place, byte-streamed across calls the way the
+    /// reference's one decryptor per session streams it.
     pub fn decrypt(&mut self, payload: &mut [u8]) {
         match self.mode {
-            AesMode::CtrCont => self.stream.apply_keystream(payload),
+            AesMode::CtrCont => self.ctr.apply_keystream(payload),
             AesMode::CtrReset => {
                 let mut stream = Ctr128BE::<Aes128>::new(&self.key.into(), &self.iv.into());
                 stream.apply_keystream(payload);
             }
+            AesMode::Cfb => {
+                // CFB128, byte-wise across calls as OpenSSL EVP streams it:
+                // the keystream refreshes every 16 bytes and the feedback is
+                // the ciphertext bytes.
+                for byte in payload {
+                    if self.position == 0 {
+                        self.keystream = self.encrypt_block(&self.feedback);
+                    }
+                    let cipher = *byte;
+                    *byte ^= self.keystream[self.position];
+                    self.feedback[self.position] = cipher;
+                    self.position = (self.position + 1) % 16;
+                }
+            }
+            AesMode::Ofb => {
+                // OFB: the feedback is the keystream itself, so the register
+                // starts at the iv and refreshes every 16 bytes.
+                for byte in payload {
+                    if self.position == 0 {
+                        self.keystream = self.encrypt_block(&self.keystream);
+                    }
+                    *byte ^= self.keystream[self.position];
+                    self.position = (self.position + 1) % 16;
+                }
+            }
+            AesMode::Plain => {}
         }
+    }
+
+    fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let mut out: aes::Block = (*block).into();
+        self.aes.encrypt_block(&mut out);
+        out.into()
     }
 }
 

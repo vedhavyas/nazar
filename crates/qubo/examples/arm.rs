@@ -21,7 +21,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use qubo::p2p::{P2pConfig, P2pEngine, P2pIdentity};
+use qubo::p2p::{AesMode, P2pConfig, P2pEngine, P2pIdentity};
 use qubo::{BASE_URL, Device, SessionStore};
 
 #[tokio::main]
@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client,
         P2pConfig {
             device_name: "nazar-arm".to_owned(),
+            aes_mode: args.aes_mode,
             ..P2pConfig::default()
         },
     );
@@ -119,6 +120,7 @@ struct Args {
     src_device_id: String,
     camera_controller: String,
     seconds: u64,
+    aes_mode: AesMode,
 }
 
 impl Args {
@@ -131,6 +133,7 @@ impl Args {
             src_device_id: "<mobile-id>".to_owned(),
             camera_controller: "d0000000-0000-4000-8000-000000000001".to_owned(),
             seconds: 60,
+            aes_mode: AesMode::CtrCont,
         };
         let mut items = std::env::args().skip(1);
         while let Some(flag) = items.next() {
@@ -145,6 +148,18 @@ impl Args {
                 "--src-device-id" => args.src_device_id = value,
                 "--camera-controller" => args.camera_controller = value,
                 "--seconds" => args.seconds = value.parse()?,
+                // The captures never proved the mode (protocol 6.5); switch
+                // it here when a run shows garbage plaintext.
+                "--aes-mode" => {
+                    args.aes_mode = match value.as_str() {
+                        "ctr-cont" => AesMode::CtrCont,
+                        "ctr-reset" => AesMode::CtrReset,
+                        "cfb" => AesMode::Cfb,
+                        "ofb" => AesMode::Ofb,
+                        "plain" => AesMode::Plain,
+                        other => return Err(format!("unknown aes mode {other}").into()),
+                    };
+                }
                 other => return Err(format!("unknown flag {other}").into()),
             }
         }
