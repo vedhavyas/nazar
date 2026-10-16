@@ -29,6 +29,7 @@ const SP: &str = "d10e4bfb0153496e8e8bb955f7ebe413";
 const UNIT: &str = "8f14e45f-ceea-467a-9f99-3a1e0f6d9a11";
 const ENTITY: &str = "30000000-0000-4000-8000-000000000001";
 const DEVICE_ID: &str = "3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
+const CONTROLLER: &str = "d0000000-0000-4000-8000-000000000001";
 const UNITS_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units";
 const DEVICES_PATH: &str = "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/devices";
 const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/stream/unit/8f14e45f-ceea-467a-9f99-3a1e0f6d9a11/device/3c9e1f22-5b7a-4d0e-8f21-6a2b7c8d9e01";
@@ -144,7 +145,7 @@ async fn mount_discovery(server: &MockServer) {
     mount_json(
         server,
         DEVICES_PATH,
-        json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01", "entityUUID": ENTITY }] })
+        json!({ "data": [{ "deviceUUID": DEVICE_ID, "deviceName": "Hall", "deviceType": "HCP01", "entityUUID": ENTITY, "controllerUUID": CONTROLLER }] })
             .to_string(),
     )
     .await;
@@ -195,6 +196,40 @@ async fn command_bodies(server: &MockServer) -> Vec<Value> {
         .filter(|request| request.method.as_str() == "PUT")
         .map(|request| serde_json::from_slice(&request.body).expect("a json body"))
         .collect()
+}
+
+/// The armed envelope's skeleton is captured frame 1886's own (qubo's
+/// byte-vector fixture): the wrapper's keys, and the device block's key set
+/// with handleName included.
+fn assert_envelope_skeleton(envelope: &Value) {
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../qubo/tests/fixtures/p2p_byte_vectors.json"
+    ))
+    .expect("the vector fixture is JSON");
+    let captured: Value = serde_json::from_str(
+        vectors["control_capture"]["json"]
+            .as_str()
+            .expect("the captured frame's json"),
+    )
+    .expect("the captured frame is JSON");
+    let keys = |value: &Value| -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        keys(envelope),
+        keys(&captured),
+        "the envelope's top level is the capture's"
+    );
+    assert_eq!(
+        keys(&envelope["command"]["devices"]),
+        keys(&captured["command"]["devices"]),
+        "the device block carries the capture's keys, handleName included"
+    );
 }
 
 async fn is_live(supervisor: &Supervisor) -> bool {
@@ -304,6 +339,18 @@ async fn control_rides_the_engine_when_armed_and_rest_otherwise() {
         json!("20,15"),
         "the envelope carries the same absolute position the REST path writes"
     );
+    assert_eq!(
+        controls[0]["command"]["devices"]["handleName"],
+        json!(CONTROLLER),
+        "handleName is the camera's controllerUUID, as the captured frame carries it"
+    );
+    assert_eq!(
+        controls[0]["command"]["devices"]["services"]["panTiltControl"]["instanceId"],
+        json!(0),
+        "instanceId sits with the service, the app's own absolute builder's placement"
+    );
+
+    assert_envelope_skeleton(&controls[0]);
     assert!(
         command_bodies(&h.qubo).await.is_empty(),
         "no REST write went out while the session was armed"
