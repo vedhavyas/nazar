@@ -19,15 +19,17 @@
       if (step === 'phone') {
         await api.requestOtp(phone);
         step = 'code';
-      } else {
-        // One account signs in here; several answer the accounts to pick
-        // between instead (a number can hold more than one).
+      } else if (step === 'code') {
+        // A 204 signs one account straight in; several answer the accounts
+        // to pick between instead (a number can hold more than one).
         const result = await api.verifyOtp(phone, code);
-        if (result?.profiles?.length) {
+        if (!result) {
+          onloggedin();
+        } else if (result.profiles.length) {
           choices = result.profiles;
           step = 'pick';
         } else {
-          onloggedin();
+          throw new Error('the server answered no accounts to pick from');
         }
       }
     } catch (err) {

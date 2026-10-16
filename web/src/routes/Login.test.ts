@@ -101,6 +101,23 @@ test('a single profile signs in without a pick', async () => {
   expect(screen.queryByText(/more than one/), 'no picker step appears').toBeNull();
 });
 
+test('a verify that answers no accounts does not sign in', async () => {
+  stubLogin({
+    '/api/login/otp': noContent(),
+    '/api/login/verify': jsonBody(200, { profiles: [] }),
+  });
+  const loggedin = vi.fn();
+
+  render(Login, { props: { onloggedin: loggedin } });
+  await signIn();
+
+  const failure = await screen.findByRole('alert');
+  expect(failure.textContent, 'the reason, verbatim').toBe(
+    'the server answered no accounts to pick from',
+  );
+  expect(loggedin, 'nothing signs in on an empty answer').not.toHaveBeenCalled();
+});
+
 test("a refused pick shows the server's words", async () => {
   stubLogin({
     '/api/login/otp': noContent(),
