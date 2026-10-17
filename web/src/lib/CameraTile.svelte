@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Camera } from './api';
   import Player from './Player.svelte';
+  import Speaker from './Speaker.svelte';
+  import { audioOn, rememberAudio } from './audio';
   import { rebuildSchedule } from './rebuild';
 
   let {
@@ -25,6 +27,8 @@
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
   let fallingBack = $state(false);
+  /** This camera's sound: off until asked for, remembered per camera. */
+  let listening = $state(audioOn(camera.id));
 
   // A stalled picture heals itself: rebuilt and re-asked on a bounded
   // backoff, with Try again left as the immediate escape.
@@ -88,7 +92,7 @@
         {stream}
         {attempt}
         waiting={camera.state === 'waking'}
-        muted
+        muted={!listening}
         onsettled={(state) => {
           if (state === 'hls' || state === 'recovered') {
             fallingBack = state === 'hls';
@@ -111,6 +115,13 @@
              refocus look like a restart. -->
         <div class="spinner" role="status" aria-label="Starting the stream"></div>
       {/if}
+      <Speaker
+        on={listening}
+        ontoggle={() => {
+          listening = !listening;
+          rememberAudio(camera.id, listening);
+        }}
+      />
     </div>
     {#if still && !stalled}
       <canvas class="still" bind:this={snapshot}></canvas>

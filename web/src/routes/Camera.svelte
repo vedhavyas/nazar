@@ -4,6 +4,8 @@
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
   import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
+  import Speaker from '../lib/Speaker.svelte';
+  import { audioOn, rememberAudio } from '../lib/audio';
   import { rebuildSchedule } from '../lib/rebuild';
 
   let {
@@ -24,8 +26,9 @@
   let error = $state('');
   /** The lens state the camera reports, never the ack. `null` is unknown. */
   let privacy = $state<boolean | null>(null);
-  /** Audio starts off: a browser only lets a gesture turn it on. */
-  let listening = $state(false);
+  /** Audio starts off: a browser only lets a gesture turn it on, and the
+   * choice is remembered per camera. */
+  let listening = $state(audioOn(id));
   /** What the last move did, from the shadow. */
   let move = $state('');
 
@@ -45,14 +48,7 @@
   });
   $effect(() => () => rebuild.cancel());
 
-  const audioKey = () => `nazar.audio.${id}`;
-
   onMount(() => {
-    try {
-      listening = localStorage.getItem(audioKey()) === '1';
-    } catch {
-      // No storage, no remembered setting.
-    }
     void load();
   });
 
@@ -201,14 +197,11 @@
     }
   }
 
-  /** Muting is the element's own video; the toggle is the gesture. */
+  /** Muting is the element's own video; the speaker is the gesture, and
+   * the choice is remembered per camera. */
   function toggleListen() {
     listening = !listening;
-    try {
-      localStorage.setItem(audioKey(), listening ? '1' : '0');
-    } catch {
-      // Not worth an error: the toggle still works for this visit.
-    }
+    rememberAudio(id, listening);
   }
 
   /** One frame of what is on screen, as a file. */
@@ -265,6 +258,7 @@
             if (state === 'recovered') void recover();
           }}
         />
+        <Speaker on={listening} ontoggle={toggleListen} />
       {/if}
     </div>
   </PtzDrag>
@@ -284,9 +278,6 @@
       {:else}
         Privacy off
       {/if}
-    </button>
-    <button class="btn" onclick={toggleListen} aria-pressed={listening}>
-      {listening ? 'Listening' : 'Listen'}
     </button>
     <button class="btn" onclick={snapshot}>Snapshot</button>
   </div>
@@ -313,6 +304,10 @@
   .meta {
     color: var(--muted);
     font-size: var(--fs-label);
+  }
+
+  .screen-stage {
+    position: relative;
   }
 
   .screen-stage :global(.stage) {

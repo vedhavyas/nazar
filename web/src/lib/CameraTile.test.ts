@@ -29,6 +29,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  localStorage.clear();
   // The player script lands in <head>, which cleanup does not empty.
   for (const script of document.querySelectorAll('script[src="/hls.min.js"]')) {
     script.remove();
@@ -264,6 +265,30 @@ test('leaving waking keeps the same player and opens the window', async () => {
     screen.getByText(/did not start/),
     'and the window runs from the moment the state is live',
   ).toBeTruthy();
+});
+
+test('a tile starts muted with a speaker on it, and remembers the choice', async () => {
+  vi.useFakeTimers();
+  liveTile();
+  const video = await videoOf();
+  await vi.advanceTimersByTimeAsync(600);
+
+  expect(video.muted, 'every tile starts muted').toBe(true);
+  const speaker = screen.getByTestId('speaker');
+  expect(speaker.getAttribute('aria-pressed'), 'the speaker starts off').toBe('false');
+  expect(
+    screen.queryByRole('button', { name: /^(Listen|Listening)$/ }),
+    'no separate Listen button on a tile',
+  ).toBeNull();
+
+  speaker.click();
+  await vi.advanceTimersByTimeAsync(600);
+
+  expect(video.muted, 'the speaker unmutes this camera').toBe(false);
+  expect(
+    localStorage.getItem('nazar.audio.cam-1'),
+    'and the choice is remembered per camera',
+  ).toBe('1');
 });
 
 test('a live tile carries no still', () => {

@@ -127,7 +127,7 @@ test('a stalled picture is asked for again on its own', async () => {
   expect(asked(), 'the screen re-asks the server on its own').toBe(before + 1);
 });
 
-test('the picture arrives muted, and the toggle is what unmutes it', async () => {
+test('the picture arrives muted, and the speaker on it is what unmutes it', async () => {
   vi.useFakeTimers();
   stubServer();
   open();
@@ -137,11 +137,44 @@ test('the picture arrives muted, and the toggle is what unmutes it', async () =>
   expect(video, 'the player is on the stage').toBeTruthy();
   expect(video?.muted, 'nothing plays sound before a gesture').toBe(true);
 
-  screen.getByRole('button', { name: 'Listen' }).click();
+  const speaker = screen.getByTestId('speaker');
+  expect(speaker.getAttribute('aria-pressed'), 'the speaker starts off').toBe('false');
+
+  speaker.click();
   await vi.advanceTimersByTimeAsync(600);
 
   expect(video?.muted, 'the toggle is the gesture that unmutes').toBe(false);
-  expect(screen.getByRole('button', { name: 'Listening' }), 'and it says so').toBeTruthy();
+  expect(speaker.getAttribute('aria-pressed'), 'and the speaker reads on').toBe('true');
+  expect(
+    localStorage.getItem('nazar.audio.cam-1'),
+    'the choice is remembered per camera',
+  ).toBe('1');
+});
+
+test('a remembered choice starts the camera unmuted', async () => {
+  vi.useFakeTimers();
+  localStorage.setItem('nazar.audio.cam-1', '1');
+  stubServer();
+  open();
+  await vi.advanceTimersByTimeAsync(600);
+
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement | null;
+  expect(video, 'the player is on the stage').toBeTruthy();
+  expect(video?.muted, 'the remembered choice is honored').toBe(false);
+  expect(screen.getByTestId('speaker').getAttribute('aria-pressed')).toBe('true');
+});
+
+test('the old Listen button is gone', async () => {
+  stubServer();
+  open();
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is up').toBeTruthy(),
+  );
+
+  expect(
+    screen.queryByRole('button', { name: /^(Listen|Listening)$/ }),
+    'the separate Listen button is removed entirely',
+  ).toBeNull();
 });
 
 test('a sustained drag lands every window, one write at a time', async () => {
