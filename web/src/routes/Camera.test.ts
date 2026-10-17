@@ -168,6 +168,29 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
   expect(screen.getByText('Try again'), 'and offers Try again').toBeTruthy();
 });
 
+test('a fallback on the camera screen is named, not left unexplained', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  class StubHls {
+    static isSupported = () => true;
+    loadSource() {}
+    attachMedia() {}
+    destroy() {}
+  }
+  vi.stubGlobal('Hls', StubHls);
+  stubServer();
+  open();
+  // The waking poll clears, the start window fires, the fallback takes the
+  // stage - the screen has to say what it is showing, the way the tile does.
+  await vi.advanceTimersByTimeAsync(4000);
+  await vi.advanceTimersByTimeAsync(13000);
+  expect(document.querySelector('video.hls'), 'the fallback took the stage').toBeTruthy();
+  expect(
+    screen.getByText(/compatibility stream/),
+    'the screen names the compatibility stream',
+  ).toBeTruthy();
+});
+
 test('a stalled picture is asked for again on its own', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');

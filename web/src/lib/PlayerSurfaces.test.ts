@@ -103,6 +103,74 @@ test('a frozen picture holds its last frame and never stacks a fallback', async 
   expect(document.querySelector('video-rtc'), 'still the same player').toBe(player);
 });
 
+test('a picture the element killed to zero says so instead of standing silent', async () => {
+  vi.useFakeTimers();
+  const { onwatch } = liveTile();
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement;
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 3;
+  await vi.advanceTimersByTimeAsync(5000);
+
+  // The vendored element's own teardown (src cleared): the clock resets to
+  // zero, playback pauses and the element stays empty. That pause is not a
+  // person's - it is the silent death: Live on the label, 0:00 on the
+  // element, and nothing on the screen.
+  video.dispatchEvent(new Event('pause'));
+  video.currentTime = 0;
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 0 });
+
+  await vi.advanceTimersByTimeAsync(5500);
+  await vi.waitFor(() => {
+    expect(screen.getByText(/stopped/), 'the death is said').toBeTruthy();
+  });
+  expect(screen.getByText('Try again'), 'with the escape').toBeTruthy();
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(onwatch, 'and the server is re-asked on the ladder').toHaveBeenCalled();
+});
+
+test('a person pausing a live picture is still not a stall', async () => {
+  vi.useFakeTimers();
+  liveTile();
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement;
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 2;
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 4 });
+  video.dispatchEvent(new Event('pause'));
+
+  await vi.advanceTimersByTimeAsync(16000);
+  expect(
+    screen.queryByText(/stopped/),
+    'a deliberate pause holds the frame and says nothing',
+  ).toBeNull();
+});
+
+test('a fallback that never paints says so too', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  class StubHls {
+    static isSupported = () => true;
+    loadSource() {}
+    attachMedia() {}
+    destroy() {}
+  }
+  vi.stubGlobal('Hls', StubHls);
+  liveTile();
+
+  // The stage never negotiates: the start window fires and the fallback
+  // takes the stage - and then the fallback itself sits at zero.
+  await vi.advanceTimersByTimeAsync(12500);
+  expect(document.querySelector('video.hls'), 'the fallback took the stage').toBeTruthy();
+
+  // Its own window fires next; stop before the ladder's remount step so
+  // this reads the note a person would be looking at.
+  await vi.advanceTimersByTimeAsync(12000);
+  expect(
+    screen.getByText(/did not start/),
+    'a fallback that never paints is said, not left standing',
+  ).toBeTruthy();
+  expect(screen.getByText('Try again'), 'with the escape').toBeTruthy();
+});
+
 test('a returning tab is given its beat before any rebuild', async () => {
   vi.useFakeTimers();
   const { onwatch } = liveTile();

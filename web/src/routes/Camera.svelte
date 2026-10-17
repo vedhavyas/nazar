@@ -34,6 +34,8 @@
   let waiting = $state(false);
   /** The picture is not moving: 'start' never negotiated, 'frozen' stopped. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
+  /** Whether the fallback stream is carrying the picture. */
+  let fallingBack = $state(false);
 
   // A stalled picture heals itself on a bounded backoff: a never-started
   // one re-asks and remounts, a frozen one only re-asks - its frame is
@@ -266,6 +268,7 @@
               return;
             }
             stalled = null;
+            fallingBack = state === 'hls';
             rebuild.settled();
             if (state === 'recovered') void recover();
           }}
@@ -285,6 +288,10 @@
   {:else if stalled === 'frozen'}
     <p class="note">The picture stopped. The camera link may have dropped.</p>
     <button class="btn" onclick={retry}>Try again</button>
+  {:else if fallingBack}
+    <!-- The tile already says this; a screen that swapped its picture for
+         another and explained nothing read as broken. -->
+    <p class="note">WebRTC could not connect here; showing the compatibility stream.</p>
   {:else if camera?.state === 'degraded'}
     <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
     <button class="btn" onclick={retry}>Try again</button>

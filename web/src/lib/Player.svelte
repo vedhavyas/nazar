@@ -178,9 +178,12 @@
     const tick = () => {
       const video = player.querySelector('video');
       if (!video) return;
-      if (paused) {
-        // A paused player is not a frozen one: the clock stands still
-        // because the person asked it to.
+      if (paused && (video.currentTime > 0 || video.readyState >= 2)) {
+        // A paused player that still holds its picture is the person's
+        // doing: the clock stands still because they asked it to. A pause
+        // with nothing behind it - the element's own teardown clears the
+        // src and drops the clock back to zero - is the silent death
+        // instead, and falls through to the clock check like any stall.
         lastTime = video.currentTime;
         return;
       }
@@ -300,10 +303,22 @@
     let started = false;
     let awayAt = -1;
     let grace: ReturnType<typeof setInterval> | null = null;
+    /** The fallback never painted in its window and the note went up. */
+    let announced = false;
+
+    // The fallback is a picture like the stage: one that never paints is
+    // said with the same escape - a compatibility stream sitting at zero
+    // is the same black screen by another name.
+    const startTimer = setTimeout(() => {
+      if (started) return;
+      announced = true;
+      onsettled?.('start');
+    }, START_WINDOW_MS);
 
     const tick = () => {
-      if (paused) {
-        // A deliberate pause is not a stall here either.
+      if (paused && (video.currentTime > 0 || video.readyState >= 2)) {
+        // A deliberate pause with the picture in hand is not a stall here
+        // either; a pause with nothing behind it is the element's teardown.
         lastTime = video.currentTime;
         return;
       }
@@ -322,6 +337,11 @@
     const onplaying = () => {
       started = true;
       paused = false;
+      if (announced) {
+        // The fallback painted after all: the note clears in place.
+        announced = false;
+        onsettled?.('recovered');
+      }
       watch();
     };
     const onpause = () => {
@@ -367,6 +387,7 @@
     video.addEventListener('pause', onpause);
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
+      clearTimeout(startTimer);
       if (watching) clearInterval(watching);
       if (grace) clearInterval(grace);
       video.removeEventListener('playing', onplaying);
