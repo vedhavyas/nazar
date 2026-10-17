@@ -274,6 +274,13 @@ pub fn live_source(mint_url: &str) -> String {
 /// what the app's low stream did.
 const LOW_WIDTH: u32 = 640;
 
+/// The window the 640 chain gets to start before go2rtc kills it. go2rtc's
+/// default is 30s (`starttimeout`), and a chain whose start an in-flight
+/// re-mint slowed gets killed mid-connect at churn - the hub logged those
+/// kills. 60s waits a churn-slow start out; a genuinely wedged process is
+/// still killed, a minute in.
+const LOW_START_TIMEOUT_SECS: u32 = 60;
+
 /// The go2rtc source for a camera's tile rendition: the high stream's own
 /// name, chained and scaled inside go2rtc. The cloud stream is minted once
 /// per camera (mints are last-mint-wins), so the tile re-reads it locally
@@ -281,7 +288,9 @@ const LOW_WIDTH: u32 = 640;
 /// the chain resolves to the loopback rtsp server and the tile's scaler
 /// reads the high stream from there.
 pub fn low_source(high_name: &str) -> String {
-    format!("ffmpeg:{high_name}#input={TEMPLATE}#video=h264#width={LOW_WIDTH}#audio=copy")
+    format!(
+        "ffmpeg:{high_name}#input={TEMPLATE}#video=h264#width={LOW_WIDTH}#audio=copy#starttimeout={LOW_START_TIMEOUT_SECS}"
+    )
 }
 
 /// The generated config text.

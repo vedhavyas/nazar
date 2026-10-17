@@ -32,8 +32,10 @@ fn live_source_references_the_config_template() {
 fn low_source_chains_off_the_high_stream_by_name() {
     assert_eq!(
         low_source("cam-1-high"),
-        "ffmpeg:cam-1-high#input=nazar#video=h264#width=640#audio=copy",
-        "the tile rides the high stream inside go2rtc: no second mint, one cloud consumer"
+        "ffmpeg:cam-1-high#input=nazar#video=h264#width=640#audio=copy#starttimeout=60",
+        "the tile rides the high stream inside go2rtc - no second mint, one cloud consumer - \
+         with a start window past the churn: go2rtc's default 30s kills a chain whose start \
+         an in-flight re-mint slowed (the hub logged those kills), 60s waits it out"
     );
 }
 
