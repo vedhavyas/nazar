@@ -48,7 +48,6 @@ fn pacing(remint: Duration) -> Pacing {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
-        warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
     }
@@ -323,7 +322,6 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
-        warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
     })
@@ -734,14 +732,13 @@ async fn a_late_discovery_still_warms_the_house() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A stream warmed by a login outlives the asking window - the warmth is
-/// bought so the next client finds pictures flowing - and is parked once
-/// nobody comes, at its own generous window.
+/// The warmth is permanent: a warmed stream re-mints on its cadence for
+/// as long as the session lives, and nobody asking for it parks nothing.
 #[tokio::test]
-async fn a_warmed_stream_outlives_the_asking_window() {
+async fn a_warmed_stream_never_parks() {
     let h = harness(Pacing {
+        remint: Duration::from_millis(200),
         stream_idle: Duration::from_millis(100),
-        warm_idle: Duration::from_millis(400),
         ..pacing(Duration::from_secs(30))
     })
     .await;
@@ -752,19 +749,21 @@ async fn a_warmed_stream_outlives_the_asking_window() {
     h.supervisor.warm_all().await;
     let minted = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
     assert!(minted, "the warm started the mint");
+    let started = h.go2rtc.puts().len();
 
-    // Past the asking window, still up: nobody asked, but the warmth is
-    // the point.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Well past both the asking and the old warm windows: still up, still
+    // re-minting on the cadence.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(
         h.go2rtc.deletes().is_empty(),
-        "the warmed stream outlives the asking window: {:?}",
+        "a warmed stream is never parked for going unasked: {:?}",
         h.go2rtc.deletes()
     );
-
-    // Past the warm window, parked - a stream nobody asks for still drops.
-    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
-    assert!(retired, "and is parked at its own window once nobody comes");
+    assert!(
+        h.go2rtc.puts().len() > started,
+        "and it keeps re-minting on its cadence: {:?}",
+        h.go2rtc.puts()
+    );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 

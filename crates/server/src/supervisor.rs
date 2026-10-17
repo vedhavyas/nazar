@@ -96,13 +96,6 @@ pub struct Pacing {
     /// watch's own polls with margin; silence minutes long opens nothing
     /// and closes nothing.
     pub touch_ttl: Duration,
-    /// How long a stream warmed by a login or a boot survives without
-    /// anyone asking. Generous on purpose: the warmth is bought so the
-    /// next client to load finds pictures already flowing, and a session
-    /// of browsing is shorter than this - while a stream nobody asks for
-    /// past the window still drops, which is the trade Ved named (warm on
-    /// access, dropped when unasked).
-    pub warm_idle: Duration,
     /// The bound on one fast-lane arm attempt; past it the cloud path
     /// takes over. The engine's stages can sum past this on a bad network,
     /// so the bound cancels rather than waits.
@@ -125,7 +118,6 @@ impl Default for Pacing {
             connect_window: Duration::from_secs(90),
             liveness_poll: Duration::from_secs(2),
             touch_ttl: Duration::from_secs(30),
-            warm_idle: Duration::from_mins(30),
             arm_timeout: Duration::from_secs(15),
             lane_cooldown: Duration::from_secs(600),
         }
@@ -763,17 +755,17 @@ impl Supervisor {
             state.insert(name.clone(), new_waking());
         }
         let supervisor = self.clone();
-        let idle = self.pacing.stream_idle;
+        let idle = Some(self.pacing.stream_idle);
         tokio::spawn(async move {
             supervisor.remint_loop(device, Duration::ZERO, idle).await;
         });
         Ok(self.status_for(device_id, Quality::High).await)
     }
 
-    /// Start the camera's stream in the background, on the generous idle a
-    /// warmed stream gets: the caller is a login or a boot, not a viewer.
-    /// Failures are the loop's to log - warming must never fail a login -
-    /// and an already-tracked stream is left where it is.
+    /// Start the camera's stream in the background, never to park: the
+    /// caller is a login or a boot, not a viewer. Failures are the loop's
+    /// to log - warming must never fail a login - and an already-tracked
+    /// stream is left where it is.
     pub async fn warm(&self, device_id: &str) {
         let name = stream_name(device_id, Quality::High);
         let device = self
@@ -795,9 +787,8 @@ impl Supervisor {
             state.insert(name.clone(), new_waking());
         }
         let supervisor = self.clone();
-        let idle = self.pacing.warm_idle;
         tokio::spawn(async move {
-            supervisor.remint_loop(device, Duration::ZERO, idle).await;
+            supervisor.remint_loop(device, Duration::ZERO, None).await;
         });
     }
 
@@ -1001,17 +992,20 @@ impl Supervisor {
         true
     }
 
-    async fn remint_loop(self, device: Device, mut wait: Duration, idle: Duration) {
+    async fn remint_loop(self, device: Device, mut wait: Duration, idle: Option<Duration>) {
         let name = stream_name(&device.device_id, Quality::High);
         // narar's own consumer starts with the first landed PUT, not with
         // the loop: a hold dialled against a stream go2rtc has not been
         // given yet 404s, counts as a young death, and delays the warmth.
-        // It goes cold with the loop when the idle teardown parks it.
+        // It goes cold with the loop when the loop ends.
         let mut held: Option<HeldStream> = None;
         let wake = self.wake_signal(&name).await;
-        // Every stream idles out when nobody is watching and nobody has
-        // asked: a demoted hero's high stream must not run for ever. The
-        // consumer check keeps a watched one - a hero - alive regardless.
+        // A viewer-started stream idles out when nobody is watching and
+        // nobody has asked: a demoted hero's high stream must not run for
+        // ever. The consumer check keeps a watched one - a hero - alive
+        // regardless. A warmed stream (no window) never idles out: the
+        // warmth is permanent, and the loop re-mints until the process
+        // ends.
         let mut next_mint = Instant::now();
         let mut failed = false;
         let mut stall = Stall::new();
@@ -1019,21 +1013,21 @@ impl Supervisor {
             let now = Instant::now();
             // A stream with a viewer is not idle, whatever this server was
             // last asked: the viewer holds it open through go2rtc.
-            let idle_since = if self.watched(&name).await {
-                None
-            } else {
-                self.idle_for(&name).await
+            let idle_since = match idle {
+                Some(_) if self.watched(&name).await => None,
+                Some(_) => self.idle_for(&name).await,
+                None => None,
             };
             // Waited until the mint is due, or until the idle window is
             // reached - whichever comes first, so a viewer who leaves is
             // noticed without waiting out a re-mint. Sliced, so the
             // producer's health is checked while waiting too, not only
             // when the next mint comes due.
-            let sleep_for = match idle_since {
-                Some(idle_for) => next_mint
+            let sleep_for = match (idle, idle_since) {
+                (Some(window), Some(idle_for)) => next_mint
                     .saturating_duration_since(now)
-                    .min(idle.saturating_sub(idle_for)),
-                None => next_mint.saturating_duration_since(now).min(idle),
+                    .min(window.saturating_sub(idle_for)),
+                _ => next_mint.saturating_duration_since(now),
             }
             .min(self.pacing.liveness_poll);
             let forced = tokio::select! {
@@ -1046,14 +1040,14 @@ impl Supervisor {
             // The decision is made on what is true now, not on what was
             // true before the wait: a stream that reached its idle window
             // during the wait must not mint once more on its way out.
-            let idle_since = if self.watched(&name).await {
-                None
-            } else {
-                self.idle_for(&name).await
+            let idle_since = match idle {
+                Some(_) if self.watched(&name).await => None,
+                Some(_) => self.idle_for(&name).await,
+                None => None,
             };
             let seen_at = self.last_request_at(&name).await;
-            if let (Some(idle_for), Some(seen_at)) = (idle_since, seen_at)
-                && idle_for >= idle
+            if let (Some(window), Some(idle_for), Some(seen_at)) = (idle, idle_since, seen_at)
+                && idle_for >= window
                 && self.teardown_if_idle(&name, seen_at).await
             {
                 return;

@@ -46,7 +46,6 @@ fn pacing(stream_idle: Duration) -> Pacing {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
-        warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
     }
@@ -332,7 +331,6 @@ async fn the_chain_is_re_asserted_after_a_mint() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
-        warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
     })
@@ -503,7 +501,6 @@ async fn a_recovered_camera_starts_its_backoff_over() {
         connect_window: Duration::from_millis(300),
         liveness_poll: Duration::from_millis(50),
         touch_ttl: Duration::from_millis(300),
-        warm_idle: Duration::from_secs(60),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
     })

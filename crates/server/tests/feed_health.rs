@@ -116,7 +116,6 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
             connect_window: Duration::from_millis(300),
             liveness_poll: Duration::from_millis(50),
             touch_ttl: Duration::from_millis(300),
-            warm_idle: Duration::from_secs(60),
             arm_timeout: Duration::from_secs(15),
             lane_cooldown: Duration::from_secs(600),
         },
