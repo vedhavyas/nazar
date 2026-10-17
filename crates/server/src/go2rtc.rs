@@ -305,11 +305,14 @@ pub fn low_source(high_name: &str) -> String {
 /// browser can only start decoding at a keyframe, so go2rtc's own preset
 /// (`-g 50` at 10fps = five seconds) would hide a first frame for up to
 /// five seconds behind the attach. The flags are go2rtc's own with the GOP
-/// shortened; a config `ffmpeg:` entry overrides the built-in preset of
-/// the same name.
+/// shortened and the speed turned up one notch: measured on a
+/// 2304x1296@10 source, `ultrafast` costs about a fifth less CPU per
+/// chain than `superfast`, and at this frame size the faster preset's
+/// quality step does not read. A config `ffmpeg:` entry overrides the
+/// built-in preset of the same name.
 const H264_PRESET: &str = "nazar-h264";
 
-const H264_PRESET_ARGS: &str = "-c:v libx264 -g 10 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p";
+const H264_PRESET_ARGS: &str = "-c:v libx264 -g 10 -profile:v high -level:v 4.1 -preset:v ultrafast -tune:v zerolatency -pix_fmt:v yuv420p";
 
 /// The generated config text.
 ///
