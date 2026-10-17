@@ -30,11 +30,20 @@
     const stopNotes = notes.follow();
     void boot();
     void notes.load();
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
+      document.removeEventListener('visibilitychange', onVisible);
       stop();
       stopNotes();
     };
   });
+
+  /** A login screen left standing by a transient refusal: coming back to
+   * the tab re-checks the session, and a clean answer goes home. */
+  function onVisible() {
+    if (document.hidden || screen !== 'login') return;
+    void boot();
+  }
 
   /** A stored session answers the camera list; anything else is login. */
   async function boot() {
