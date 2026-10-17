@@ -60,6 +60,11 @@ pub struct Pacing {
     /// The first retry delay after a failure; doubles up to `retry_max`.
     pub retry_base: Duration,
     pub retry_max: Duration,
+    /// How long a fresh mint is given to connect before a re-mint may
+    /// replace it. The camera's push to a fresh cloud session lags
+    /// (measured 52s on the hub), and replacing the URL under an in-flight
+    /// push starves it - the run waits the settle out instead of churning.
+    pub mint_settle: Duration,
     /// How often a refused session is re-discovered; the UI is already
     /// routed to login, so this is just how soon recovery is noticed.
     pub discovery_retry: Duration,
@@ -108,6 +113,7 @@ impl Default for Pacing {
             remint: Duration::from_secs(240),
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
+            mint_settle: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(5),
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_secs(20),
@@ -239,6 +245,10 @@ struct Stall {
     attempts: u32,
     /// The delay before the next attempt; compounds per attempt.
     wait: Duration,
+    /// Whether the producer has connected since the last mint: a proven
+    /// alive producer's death needs no dial grace, and the settle protects
+    /// only a fresh, unproven dial.
+    connected: bool,
 }
 
 impl Stall {
@@ -248,6 +258,7 @@ impl Stall {
             reported: false,
             attempts: 0,
             wait: Duration::ZERO,
+            connected: false,
         }
     }
 
@@ -994,6 +1005,7 @@ impl Supervisor {
         // given yet 404s, counts as a young death, and delays the warmth.
         // It goes cold with the process.
         let mut held: Option<HeldStream> = None;
+        let mut held_low: Option<HeldStream> = None;
         let wake = self.wake_signal(&name).await;
         // Nothing parks a tracked stream: nobody asking is not a reason to
         // release it, and the loop re-mints on its cadence until the
@@ -1001,6 +1013,7 @@ impl Supervisor {
         let mut next_mint = Instant::now();
         let mut failed = false;
         let mut stall = Stall::new();
+        let mut last_mint = Instant::now();
         loop {
             let now = Instant::now();
             // Waited until the mint is due - sliced, so the producer's
@@ -1025,16 +1038,28 @@ impl Supervisor {
             let retry_due = forced && failed;
             if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
+                // The tile chain is held warm like the high - born on the
+                // first ask, kept afterwards: a tab must never wait out its
+                // chain's spawn (measured through the hub: 30s cold).
+                if held_low.is_none()
+                    && let Some(low) = low_name_of(&name)
+                    && self.state.read().await.contains_key(&low)
+                {
+                    held_low = self.start_hold(&low);
+                }
                 match self.stall_response(&name, &mut stall).await {
                     StallStep::Remint => {
                         failed = true;
-                        // Pulled forward, never pushed back: a starved
-                        // stream replaces its dead URL on the run's own
-                        // backoff - so a camera away for minutes is not hit
-                        // with a mint a second, and a backoff longer than
-                        // the watch's own poll still comes due.
-                        next_mint =
-                            next_mint.min(Instant::now() + stall.wait.max(self.pacing.retry_base));
+                        // Pulled forward, never pushed back - but never
+                        // onto a mint too young to have connected: the
+                        // camera's push lags, and replacing the URL under
+                        // an in-flight push starves it. A producer proven
+                        // alive needs no settle; a fresh dial gets it.
+                        let mut due = Instant::now() + stall.wait.max(self.pacing.retry_base);
+                        if !stall.connected {
+                            due = due.max(last_mint + self.pacing.mint_settle);
+                        }
+                        next_mint = next_mint.min(due);
                     }
                     StallStep::Closed => {
                         // The recovery itself clears the pace: the deadline
@@ -1061,6 +1086,8 @@ impl Supervisor {
             next_mint = match self.mint_and_swap(&device, Quality::High).await {
                 Ok(()) => {
                     failed = false;
+                    stall.connected = false;
+                    last_mint = Instant::now();
                     if held.is_none() {
                         held = self.start_hold(&name);
                     }
@@ -1217,6 +1244,12 @@ impl Supervisor {
         if stream.is_some_and(|stream| stream.consumers > usize::from(self.held(name))) {
             return ProducerWatch::Stalled(Instant::now());
         }
+        if self.held(name) {
+            // The hold is a liveness watcher even though it is not a
+            // viewer: a held stream whose producer is down must heal on the
+            // run's own clock, or a dead session sits until the cadence.
+            return ProducerWatch::Stalled(Instant::now());
+        }
         ProducerWatch::Quiet
     }
 
@@ -1229,6 +1262,7 @@ impl Supervisor {
     async fn stall_response(&self, name: &str, stall: &mut Stall) -> StallStep {
         match self.watch_producer(name).await {
             ProducerWatch::Up => {
+                stall.connected = true;
                 let Some((starved, attempts)) = stall.close() else {
                     return StallStep::Idle;
                 };
@@ -1264,7 +1298,9 @@ impl Supervisor {
     /// base backoff, which would swap the URL out from under the dial.
     async fn stall_cadence(&self, name: &str, stall: &mut Stall, since: Instant) -> StallStep {
         let waiting = since.elapsed();
-        if waiting < self.pacing.connect_grace {
+        // The grace protects a fresh dial; a producer proven alive this
+        // mint died, and its replacement cannot trample anything.
+        if !stall.connected && waiting < self.pacing.connect_grace {
             return StallStep::Idle;
         }
         if waiting >= self.pacing.connect_window {

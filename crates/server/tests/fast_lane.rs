@@ -86,6 +86,7 @@ async fn harness(
             remint,
             retry_base: Duration::from_millis(20),
             retry_max: Duration::from_millis(200),
+            mint_settle: Duration::from_millis(50),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_millis(50),

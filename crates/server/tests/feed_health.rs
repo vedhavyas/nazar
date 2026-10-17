@@ -110,6 +110,7 @@ async fn harness_with(_broker: &common::mqtt::FakeBroker, config: FeedConfig) ->
             remint: Duration::from_secs(30),
             retry_base: Duration::from_secs(30),
             retry_max: Duration::from_secs(30),
+            mint_settle: Duration::from_secs(60),
             discovery_retry: Duration::from_secs(30),
             stream_idle: Duration::from_secs(120),
             connect_grace: Duration::from_millis(50),

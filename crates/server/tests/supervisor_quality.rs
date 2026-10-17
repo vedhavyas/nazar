@@ -40,6 +40,7 @@ fn pacing(stream_idle: Duration) -> Pacing {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
+        mint_settle: Duration::from_millis(50),
         discovery_retry: Duration::from_secs(30),
         stream_idle,
         connect_grace: Duration::from_millis(50),
@@ -182,7 +183,7 @@ async fn a_tile_rides_the_hero_stream_and_the_cloud_is_minted_once() {
     assert_eq!(
         low_source,
         format!(
-            "ffmpeg:{DEVICE_ID}-high#input=nazar#video=h264#width=640#audio=copy#starttimeout=60"
+            "ffmpeg:{DEVICE_ID}-high#input=nazar#video=nazar-h264#width=640#audio=copy#starttimeout=60"
         ),
         "the tile chains off the hero's own stream, inside go2rtc"
     );
@@ -229,12 +230,19 @@ async fn a_tile_carries_the_cloud_streams_trouble() {
     })
     .await;
     assert!(degraded, "a refused cloud mint degrades the stream");
-    assert!(
+    // The mirror lands on the loop's next reconcile slice, so the tile's
+    // state is waited for rather than read in the same breath.
+    let tile_degraded = common::eventually(|| async {
         matches!(
             h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
             StreamState::Degraded { .. }
-        ),
-        "and the tile, which has nothing to ride, degrades with it"
+        )
+    })
+    .await;
+    assert!(
+        tile_degraded,
+        "and the tile, which has nothing to ride, degrades with it: {:?}",
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await
     );
 }
 
@@ -329,6 +337,7 @@ async fn the_chain_is_re_asserted_after_a_mint() {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_millis(20),
         retry_max: Duration::from_millis(50),
+        mint_settle: Duration::from_millis(50),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),
@@ -511,6 +520,7 @@ async fn a_recovered_camera_starts_its_backoff_over() {
         remint: Duration::from_millis(300),
         retry_base: Duration::from_millis(100),
         retry_max: Duration::from_millis(400),
+        mint_settle: Duration::from_millis(50),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),

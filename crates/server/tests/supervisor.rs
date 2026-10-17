@@ -42,6 +42,7 @@ fn pacing(remint: Duration) -> Pacing {
         remint,
         retry_base: Duration::from_millis(20),
         retry_max: Duration::from_millis(200),
+        mint_settle: Duration::from_millis(50),
         discovery_retry: Duration::from_millis(50),
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),
@@ -182,7 +183,7 @@ async fn ensure_live_mints_once_and_reuses_the_stream() {
         "the stream carries the device and its quality"
     );
     assert!(
-        source.starts_with("ffmpeg:") && source.contains("#input=nazar#video=h264"),
+        source.starts_with("ffmpeg:") && source.contains("#input=nazar#video=nazar-h264"),
         "the minted URL rides the transcoding template: {source}"
     );
 
@@ -316,6 +317,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
+        mint_settle: Duration::from_millis(50),
         discovery_retry: Duration::from_secs(30),
         stream_idle: Duration::from_secs(30),
         connect_grace: Duration::from_millis(50),
@@ -478,7 +480,7 @@ async fn a_failed_swap_never_leaks_the_stream_token() {
                 "the token is visibly redacted: {reason}"
             );
             assert!(
-                reason.contains("#input=nazar#video=h264"),
+                reason.contains("#input=nazar#video=nazar-h264"),
                 "the redaction stops at the token and keeps the tail: {reason}"
             );
         }
@@ -1386,6 +1388,7 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         connect_window: Duration::from_millis(350),
         retry_base: Duration::from_millis(20),
         retry_max: Duration::from_millis(100),
+        mint_settle: Duration::from_millis(50),
         ..pacing(Duration::from_secs(30))
     })
     .await;
@@ -1697,6 +1700,37 @@ async fn a_held_stream_stays_warm_without_viewers() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// The tile chain is held warm like the high: born on the first ask, its
+/// producer stays up after every consumer leaves, so a tab never waits out
+/// its chain's spawn (measured through the hub: 30s cold).
+#[tokio::test]
+async fn the_tile_chain_is_held_warm() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let held = common::eventually(|| async { h.go2rtc.stream_view(&low).0 >= 1 }).await;
+    assert!(
+        held,
+        "the tile's chain carries narar's own consumer: {:?}",
+        h.go2rtc.stream_view(&low)
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// narar's own consumer never counts as a viewer: a stream nobody asks for
 /// keeps its picture and its own hold, however long it sits unasked.
 #[tokio::test]
@@ -1747,6 +1781,7 @@ async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
     let h = harness(Pacing {
         retry_base: Duration::from_millis(300),
         retry_max: Duration::from_secs(30),
+        mint_settle: Duration::from_millis(50),
         remint: Duration::from_millis(250),
         connect_window: Duration::from_secs(5),
         ..pacing(Duration::from_secs(30))
@@ -1800,10 +1835,12 @@ async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// narar's own hold alone never opens a stall run: a held stream whose
-/// producer is away, with no viewers, stays as it was.
+/// A held stream is watched for liveness even with nobody watching: its
+/// producer dying (the cloud session's death) opens the run, and the heal
+/// re-mints at once - the producer was proven alive this mint, so no dial
+/// grace applies, and the session is not left dead until the cadence.
 #[tokio::test]
-async fn a_held_stream_with_a_dead_producer_opens_no_run() {
+async fn a_held_stream_with_a_dead_producer_heals_at_once() {
     let mut h = harness(pacing(Duration::from_secs(30))).await;
     h.supervisor =
         h.supervisor
@@ -1823,23 +1860,58 @@ async fn a_held_stream_with_a_dead_producer_opens_no_run() {
         .expect("the stream registers");
     let warm = common::eventually(|| async { h.go2rtc.stream_view(&name).1 }).await;
     assert!(warm, "the hold warmed the producer");
-
-    // The camera goes away under the hold: the entry keeps its consumer
-    // (the hold) but the producer is not up. Nobody is watching.
-    h.go2rtc.disconnect_producer(&name);
     let mints = h.go2rtc.puts().len();
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            is_live(&h.supervisor).await,
-            "narar's own hold is not a viewer - no run opens: {:?}",
-            h.supervisor.status(DEVICE_ID).await
-        );
-    }
+
+    // The camera goes away under the hold: nobody is watching, and the
+    // hold alone notices - the run re-mints off its own clock.
+    h.go2rtc.disconnect_producer(&name);
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() > mints }).await;
+    assert!(
+        reminted,
+        "the held stream's death re-mints without a viewer: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A fresh mint is given its settle before any re-mint replaces it: the
+/// camera's push to a new session lags, and replacing the URL under an
+/// in-flight push starves it (the dead spiral measured on the hub).
+#[tokio::test]
+async fn a_young_mint_is_not_trampled_by_the_run() {
+    let h = harness(Pacing {
+        mint_settle: Duration::from_millis(600),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    // Inside the settle: the waiting viewer does not get the URL swapped
+    // out from under the dial.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         h.go2rtc.puts().len(),
-        mints,
-        "and no re-mint went out: {:?}",
+        1,
+        "one mint inside the settle: {:?}",
+        h.go2rtc.puts()
+    );
+
+    // The settle spent: the run re-mints for the waiting viewer.
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(
+        reminted,
+        "the settle spent, the run re-mints: {:?}",
         h.go2rtc.puts()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
@@ -1853,6 +1925,7 @@ async fn a_stall_re_mints_on_a_compounding_backoff() {
     let h = harness(Pacing {
         retry_base: Duration::from_millis(50),
         retry_max: Duration::from_millis(400),
+        mint_settle: Duration::from_millis(50),
         connect_window: Duration::from_secs(5),
         ..pacing(Duration::from_secs(30))
     })

@@ -271,7 +271,7 @@ impl Go2rtc {
 /// most.
 pub fn live_source(mint_url: &str) -> String {
     format!(
-        "ffmpeg:{mint_url}#input={TEMPLATE}#video=h264#audio=aac#starttimeout={START_TIMEOUT_SECS}"
+        "ffmpeg:{mint_url}#input={TEMPLATE}#video={H264_PRESET}#audio=aac#starttimeout={START_TIMEOUT_SECS}"
     )
 }
 
@@ -294,9 +294,19 @@ const START_TIMEOUT_SECS: u32 = 60;
 /// reads the high stream from there.
 pub fn low_source(high_name: &str) -> String {
     format!(
-        "ffmpeg:{high_name}#input={TEMPLATE}#video=h264#width={LOW_WIDTH}#audio=copy#starttimeout={START_TIMEOUT_SECS}"
+        "ffmpeg:{high_name}#input={TEMPLATE}#video={H264_PRESET}#width={LOW_WIDTH}#audio=copy#starttimeout={START_TIMEOUT_SECS}"
     )
 }
+
+/// The one-second-keyframe H.264 preset every served stream names: the
+/// browser can only start decoding at a keyframe, so go2rtc's own preset
+/// (`-g 50` at 10fps = five seconds) would hide a first frame for up to
+/// five seconds behind the attach. The flags are go2rtc's own with the GOP
+/// shortened; a config `ffmpeg:` entry overrides the built-in preset of
+/// the same name.
+const H264_PRESET: &str = "nazar-h264";
+
+const H264_PRESET_ARGS: &str = "-c:v libx264 -g 10 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p";
 
 /// The generated config text.
 ///
@@ -319,6 +329,7 @@ rtsp:
 {webrtc}ffmpeg:
   bin: "{ffmpeg}"
   {TEMPLATE}: "{TEMPLATE_ARGS}"
+  {H264_PRESET}: "{H264_PRESET_ARGS}"
 "#,
         ffmpeg = ffmpeg_bin.display(),
     )

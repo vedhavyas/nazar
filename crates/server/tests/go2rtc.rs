@@ -23,9 +23,9 @@ use server::supervisor::StreamHold;
 fn live_source_references_the_config_template() {
     assert_eq!(
         live_source("rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc"),
-        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=h264#audio=aac#starttimeout=60",
-        "the source names the config's ffmpeg template, asks for H.264, and gets the same \
-         churn-past start window the tile chain carries"
+        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=nazar-h264#audio=aac#starttimeout=60",
+        "the source names the config's ffmpeg template, selects the one-second-keyframe \
+         preset, and gets the same churn-past start window the tile chain carries"
     );
 }
 
@@ -33,10 +33,9 @@ fn live_source_references_the_config_template() {
 fn low_source_chains_off_the_high_stream_by_name() {
     assert_eq!(
         low_source("cam-1-high"),
-        "ffmpeg:cam-1-high#input=nazar#video=h264#width=640#audio=copy#starttimeout=60",
+        "ffmpeg:cam-1-high#input=nazar#video=nazar-h264#width=640#audio=copy#starttimeout=60",
         "the tile rides the high stream inside go2rtc - no second mint, one cloud consumer - \
-         with a start window past the churn: go2rtc's default 30s kills a chain whose start \
-         an in-flight re-mint slowed (the hub logged those kills), 60s waits it out"
+         with a one-second-keyframe preset and a start window past the churn"
     );
 }
 
@@ -196,6 +195,11 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
     assert!(
         config.contains("nazar:"),
         "the template live_source names exists"
+    );
+    assert!(
+        config.contains("nazar-h264:") && config.contains("-g 10"),
+        "the one-second-keyframe preset exists for both sources: a served stream's first \
+         frame waits at most one IDR interval"
     );
     assert!(
         config.contains("candidates:") && config.contains("198.51.100.1:8555"),
