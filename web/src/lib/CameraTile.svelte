@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Camera } from './api';
+  import { pictureWatch } from './liveness';
   import Player from './Player.svelte';
   import { rebuildSchedule } from './rebuild';
 
@@ -32,12 +33,31 @@
   // returns; Try again stays the immediate escape.
   const rebuild = rebuildSchedule((kind) => {
     if (kind === 'start') {
-      stalled = null;
+      // The note stays through the rebuild: it is the truth until a
+      // picture actually arrives, and the remount may not conjure one.
       attempt += 1;
     }
     onwatch(camera.id);
   });
   $effect(() => () => rebuild.cancel());
+
+  // The tile's own watch: player windows die with their player, and a
+  // house that keeps remounting players would never let one live long
+  // enough to say the picture is missing. This one lives with the tile.
+  const liveness = pictureWatch(
+    () => picture,
+    (state) => {
+      if (state === 'start') {
+        if (stalled === 'start') return;
+        stalled = 'start';
+        rebuild.schedule('start');
+        return;
+      }
+      if (stalled === 'start') stalled = null;
+    },
+    () => camera.state === 'waking',
+  );
+  $effect(() => () => liveness.cancel());
 
   const STATE_WORDS: Record<Camera['state'], string> = {
     live: 'Live',

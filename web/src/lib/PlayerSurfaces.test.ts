@@ -128,6 +128,30 @@ test('a picture the element killed to zero says so instead of standing silent', 
   expect(onwatch, 'and the server is re-asked on the ladder').toHaveBeenCalled();
 });
 
+test('a tile whose picture never paints says so, whatever the player did', async () => {
+  vi.useFakeTimers();
+  // No events, no fallback resolution: the silent player the acceptance
+  // photographed (Live, 0:00, blank, nothing said). The tile itself owns
+  // the window now - no remount resets it.
+  liveTile();
+  await vi.advanceTimersByTimeAsync(21_000);
+  expect(
+    screen.getByText(/did not start/),
+    'the tile says it, not the player',
+  ).toBeTruthy();
+  expect(screen.getByText('Try again'), 'with the escape').toBeTruthy();
+});
+
+test('stable props and no timers keep one player for good', async () => {
+  vi.useFakeTimers();
+  const camera = { id: 'cam-9', name: 'Hall', state: 'live' as const, reason: null };
+  render(CameraTile, { camera, stream: 'cam-9-low', onwatch: vi.fn() });
+  const first = document.querySelector('video-rtc');
+  expect(first).toBeTruthy();
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(document.querySelector('video-rtc'), 'one player, no churn').toBe(first);
+});
+
 test('a person pausing a live picture is still not a stall', async () => {
   vi.useFakeTimers();
   liveTile();

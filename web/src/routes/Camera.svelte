@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
 
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
+  import { pictureWatch } from '../lib/liveness';
   import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
   import { rebuildSchedule } from '../lib/rebuild';
@@ -45,13 +46,31 @@
       void recover();
       return;
     }
-    stalled = null;
+    // The note stays through the rebuild: it is the truth until a picture
+    // actually arrives, and the re-ask may not conjure one.
     waiting = false;
     void start().catch(() => {
       // Best-effort, like recover(): the stall itself is what shows.
     });
   });
   $effect(() => () => rebuild.cancel());
+
+  // The picture's own watch, above the player: remounts must not hand a
+  // dead stage back to silence (see liveness.ts). Waking holds the window.
+  const liveness = pictureWatch(
+    () => stage,
+    (state) => {
+      if (state === 'start') {
+        if (stalled === 'start') return;
+        stalled = 'start';
+        rebuild.schedule('start');
+        return;
+      }
+      if (stalled === 'start') stalled = null;
+    },
+    () => waiting,
+  );
+  $effect(() => () => liveness.cancel());
 
   onMount(() => {
     void load();

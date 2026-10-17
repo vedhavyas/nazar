@@ -407,9 +407,9 @@ test('a stalled picture is rebuilt on its own with a doubling backoff', async ()
   await vi.advanceTimersByTimeAsync(1000);
   expect(onwatch, 'the tile re-asks the server on its own').toHaveBeenCalledWith('cam-1');
   expect(
-    screen.queryByText(/did not start/),
-    'and the failure note clears for the fresh attempt',
-  ).toBeNull();
+    screen.getByText(/did not start/),
+    'and the note stands until a picture actually arrives',
+  ).toBeTruthy();
 
   // The fresh attempt stalls too: the next rebuild waits the second step.
   await vi.advanceTimersByTimeAsync(12000);

@@ -57,6 +57,9 @@
   }
 
   let host = $state<HTMLDivElement | null>(null);
+  /** The socket element, declared in the template and keyed on the signals
+   * that deserve a rebuild - so no other re-render can re-key it. */
+  let element = $state<VideoRtcElement | null>(null);
   /** Arms the start window once the server stops waking; installed by the
    * setup effect so the waiting flip never rebuilds the player. */
   let armStartFor = $state<(() => void) | null>(null);
@@ -120,20 +123,14 @@
   }
 
   $effect(() => {
-    const stage = host;
-    const name = stream;
-    if (!stage || !name || fallback) return;
-    void attempt; // retrying rebuilds the player
-    void rebuilt; // so does coming back to a picture that did not
-
-    const player = document.createElement('video-rtc') as VideoRtcElement;
-    player.className = 'player';
+    const player = element;
+    if (!player) return;
+    const name = untrack(() => stream);
     player.mode = 'webrtc';
     // Audio is negotiated with the stream and kept muted until a gesture
     // says otherwise; nothing re-negotiates when the mute flips.
     player.media = 'video,audio';
     player.src = `${serverBase()}/go2rtc/api/ws?src=${encodeURIComponent(name)}`;
-    stage.appendChild(player);
 
     // WebRTC fails quietly: a blocked ICE path leaves a black frame, and a
     // dead stream leaves the last one. No first frame inside the window,
@@ -277,7 +274,6 @@
       video?.removeEventListener('playing', onplaying);
       video?.removeEventListener('pause', onpause);
       document.removeEventListener('visibilitychange', onVisibility);
-      player.remove();
     };
   });
 
@@ -303,17 +299,6 @@
     let started = false;
     let awayAt = -1;
     let grace: ReturnType<typeof setInterval> | null = null;
-    /** The fallback never painted in its window and the note went up. */
-    let announced = false;
-
-    // The fallback is a picture like the stage: one that never paints is
-    // said with the same escape - a compatibility stream sitting at zero
-    // is the same black screen by another name.
-    const startTimer = setTimeout(() => {
-      if (started) return;
-      announced = true;
-      onsettled?.('start');
-    }, START_WINDOW_MS);
 
     const tick = () => {
       if (paused && (video.currentTime > 0 || video.readyState >= 2)) {
@@ -337,11 +322,6 @@
     const onplaying = () => {
       started = true;
       paused = false;
-      if (announced) {
-        // The fallback painted after all: the note clears in place.
-        announced = false;
-        onsettled?.('recovered');
-      }
       watch();
     };
     const onpause = () => {
@@ -387,7 +367,6 @@
     video.addEventListener('pause', onpause);
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      clearTimeout(startTimer);
       if (watching) clearInterval(watching);
       if (grace) clearInterval(grace);
       video.removeEventListener('playing', onplaying);
@@ -435,7 +414,16 @@
   });
 </script>
 
-<div class="stage" class:gone={fallback} bind:this={host} data-testid="player"></div>
+<div class="stage" class:gone={fallback} bind:this={host} data-testid="player">
+  {#if !fallback}
+    <!-- The socket is the template's, keyed on exactly the signals that
+         deserve a rebuild: the stream, a retry, a return to the tab. A
+         parent re-render that changes none of them cannot touch it. -->
+    {#key `${stream}|${attempt}|${rebuilt}`}
+      <video-rtc class="player" bind:this={element}></video-rtc>
+    {/key}
+  {/if}
+</div>
 
 {#if fallback}
   <video

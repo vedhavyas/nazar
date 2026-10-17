@@ -34,7 +34,23 @@
   async function refresh() {
     try {
       const page = await api.cameras();
-      cameras = page.cameras;
+      // The poll usually re-reads the same house: keep the objects when
+      // nothing changed, so a settled poll never re-renders a tile - and
+      // never remounts a player that is doing fine. The acceptance caught
+      // the other face of this: identities churning every tick left every
+      // player too short-lived to say the picture was missing.
+      const merged = page.cameras.map((next) => {
+        const current = cameras.find((camera) => camera.id === next.id);
+        return current &&
+          current.name === next.name &&
+          current.state === next.state &&
+          (current.reason ?? null) === (next.reason ?? null)
+          ? current
+          : next;
+      });
+      if (merged.length !== cameras.length || merged.some((camera, i) => camera !== cameras[i])) {
+        cameras = merged;
+      }
       error = '';
       // Qubo refused the session: only a fresh login revives the streams.
       if (page.needsLogin) {
