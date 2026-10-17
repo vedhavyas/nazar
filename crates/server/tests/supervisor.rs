@@ -147,6 +147,16 @@ async fn is_live(supervisor: &Supervisor) -> bool {
     matches!(supervisor.status(DEVICE_ID).await, StreamState::Live { .. })
 }
 
+/// Whether the wire's last streams operation was a release: a delete with
+/// no PUT after it. Every re-mint's swap deletes and then puts, so a swap
+/// never reads as one.
+fn released_last(h: &Harness) -> bool {
+    h.go2rtc
+        .ops()
+        .last()
+        .is_some_and(|op| op.starts_with("delete:"))
+}
+
 /// The stream's state once its loop has taken a position: the first mint
 /// runs in the loop, so `Waking` is what a fresh registration reads.
 async fn settled(supervisor: &Supervisor) -> StreamState {
@@ -757,9 +767,9 @@ async fn a_warmed_stream_never_parks() {
     // re-minting on the cadence.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "a warmed stream is never parked for going unasked: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         h.go2rtc.puts().len() > started,
@@ -1035,6 +1045,41 @@ async fn mount_mint_ladder(server: &MockServer, tokens: &[&str]) {
     }
 }
 
+/// A re-mint replaces a URL whose session is spent: the predecessor's
+/// chain must go with it, or its ffmpeg keeps encoding a session the cloud
+/// still serves (measured on the hub: a fresh pair beside a fifty-minute
+/// one, seven chains where four cameras live).
+#[tokio::test]
+async fn a_remint_reaps_the_predecessor_before_the_swap() {
+    let h = harness(Pacing {
+        connect_window: Duration::from_secs(5),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two", "three"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(reminted, "the loop re-mints: {:?}", h.go2rtc.puts());
+    let ops = h.go2rtc.ops();
+    assert!(
+        ops.windows(2)
+            .any(|pair| pair[0] == format!("delete:{name}") && pair[1] == format!("put:{name}")),
+        "the swap reaps the predecessor's chain before its PUT: {ops:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// A watched producer whose source never connects is re-minted with a
 /// fresh URL, fast: the URL is one-shot, and waiting for the four-minute
 /// remint would leave a viewer staring at a dead stream.
@@ -1107,9 +1152,9 @@ async fn a_dead_producer_re_mints_without_a_release_racing_it() {
     // idle window, the entry stays and nothing is released.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "an unasked dead stream is kept, not released: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert_ne!(
         h.supervisor.status(DEVICE_ID).await,
@@ -1127,9 +1172,9 @@ async fn a_dead_producer_re_mints_without_a_release_racing_it() {
         h.go2rtc.puts()
     );
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "no release raced the heal: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -1731,6 +1776,54 @@ async fn the_tile_chain_is_held_warm() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// Every re-PUT reaps its predecessor, the tile's re-asserts included: the
+/// retry re-arms the chain through the same swap, so the loopback side
+/// cannot fan out generations either.
+#[tokio::test]
+async fn a_tile_re_assert_reaps_the_predecessor_too() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let landed =
+        common::eventually(|| async { h.go2rtc.puts().iter().any(|(name, _)| name == &low) }).await;
+    assert!(landed, "the tile's chain landed: {:?}", h.go2rtc.puts());
+
+    // The person's Try again re-asserts the chain: a retry PUTs again.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, true)
+        .await
+        .expect("the re-assert lands");
+    let re_put = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &low)
+            .count()
+            >= 2
+    })
+    .await;
+    assert!(
+        re_put,
+        "the retry re-asserts the chain: {:?}",
+        h.go2rtc.puts()
+    );
+    let ops = h.go2rtc.ops();
+    assert!(
+        ops.windows(2)
+            .any(|pair| pair[0] == format!("delete:{low}") && pair[1] == format!("put:{low}")),
+        "the re-assert reaps the predecessor before its PUT: {ops:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// narar's own consumer never counts as a viewer: a stream nobody asks for
 /// keeps its picture and its own hold, however long it sits unasked.
 #[tokio::test]
@@ -1761,9 +1854,9 @@ async fn the_hold_lives_with_the_stream() {
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "the idle window retires nothing: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert_eq!(
         h.go2rtc.stream_view(&name).0,
@@ -2104,9 +2197,9 @@ async fn a_never_attaching_hold_does_not_shadow_a_viewer() {
     h.go2rtc.set_viewers(&name, 1);
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "the viewer holds the stream past the idle window: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

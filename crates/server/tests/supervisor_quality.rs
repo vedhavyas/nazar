@@ -87,6 +87,16 @@ async fn harness_with(pacing: Pacing) -> Harness {
     }
 }
 
+/// Whether the wire's last streams operation was a release: a delete with
+/// no PUT after it. Every re-mint's swap deletes and then puts, so a swap
+/// never reads as one.
+fn released_last(h: &Harness) -> bool {
+    h.go2rtc
+        .ops()
+        .last()
+        .is_some_and(|op| op.starts_with("delete:"))
+}
+
 fn temp_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "nazar-quality-{}-{}.json",
@@ -260,9 +270,9 @@ async fn a_failing_cameras_tile_is_kept() {
     // No mint ever succeeds; nobody asks for the tile again. Nothing is
     // released for it: the entry and its rendition stay.
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "a camera that never streams keeps its tile: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert_ne!(
         h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
@@ -311,9 +321,9 @@ async fn an_idle_tile_is_kept() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "an unasked tile is never dropped: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         matches!(
@@ -409,9 +419,9 @@ async fn a_watched_stream_waits_out_the_remint_cadence() {
         "a watched stream is re-checked on the idle window but minted on the re-mint cadence"
     );
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "and it is never retired while watched: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 }
 
@@ -428,9 +438,9 @@ async fn an_idle_stream_keeps_its_picture() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "an unasked stream is never released: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         matches!(
@@ -483,9 +493,9 @@ async fn a_re_asked_stream_is_reused() {
         .expect("the stream wakes");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "the stream is never retired: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 
     let again = h
@@ -499,9 +509,9 @@ async fn a_re_asked_stream_is_reused() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "and it keeps streaming after the re-ask: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 }
 
@@ -608,9 +618,9 @@ async fn a_tile_is_never_dropped_while_the_hero_keeps_streaming() {
     }
 
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "an unasked tile is never dropped: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         matches!(
@@ -644,9 +654,9 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "a viewed stream outlives the idle window: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         matches!(
@@ -660,9 +670,9 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
     h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "the tile is kept with or without a viewer: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 }
 
@@ -680,9 +690,9 @@ async fn a_watched_tile_is_kept() {
     }
 
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "a tile that keeps being asked for is never dropped: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
     assert!(
         matches!(
@@ -715,18 +725,18 @@ async fn a_status_check_that_fails_keeps_the_stream() {
     // An API that cannot say whether anyone is watching must not be read
     // as nobody: a wrong teardown kills a live picture.
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "an unreadable status is not an idle stream: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 
     // The status answers again; the stream is kept all the same.
     h.go2rtc.set_streams_error(false);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        h.go2rtc.deletes().is_empty(),
+        !released_last(&h),
         "the stream is kept whatever the status says: {:?}",
-        h.go2rtc.deletes()
+        h.go2rtc.ops()
     );
 }
 

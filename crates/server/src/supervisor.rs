@@ -885,10 +885,10 @@ impl Supervisor {
         // refused while it was down.
         if fresh || retry {
             let high = stream_name(device_id, Quality::High);
-            match self.go2rtc.put_stream(&name, &low_source(&high)).await {
+            match self.swap_source(&name, &low_source(&high)).await {
                 Ok(()) => self.settle(&name, high_state).await,
                 Err(err) => {
-                    let reason = redact(&err.to_string());
+                    let reason = redact(&err);
                     tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
                     self.mark_degraded(&name, reason).await;
                 }
@@ -1250,6 +1250,25 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Hand a fresh source to a stream that may already exist: the old
+    /// entry, and the ffmpeg go2rtc runs for it, is torn down first.
+    /// go2rtc's in-place update leaves the predecessor's process running
+    /// (measured on the hub: whole generations of chains beside the live
+    /// ones, on both the cloud pulls and the loopback re-encodes), and a
+    /// superseded session keeps serving the camera's push, so the old
+    /// ffmpeg never starves out on its own. Every re-PUT in this file goes
+    /// through here; an absent entry's delete finds nothing and is not an
+    /// error.
+    async fn swap_source(&self, name: &str, source: &str) -> Result<(), String> {
+        if let Err(err) = self.go2rtc.delete_stream(name).await {
+            tracing::debug!(stream = %name, %err, "no predecessor to reap on the swap");
+        }
+        self.go2rtc
+            .put_stream(name, source)
+            .await
+            .map_err(|err| redact(&err.to_string()))
+    }
+
     /// Hand the source to go2rtc and confirm the entry is held, or the
     /// source went nowhere. Whether the picture is actually up is the
     /// loop's liveness watch to judge, from the consumers' side: go2rtc
@@ -1258,10 +1277,7 @@ impl Supervisor {
     /// narar's own hold, which with a hold configured is the dial that
     /// makes the stream warm.
     async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), String> {
-        self.go2rtc
-            .put_stream(name, source)
-            .await
-            .map_err(|err| redact(&err.to_string()))?;
+        self.swap_source(name, source).await?;
         let held = self
             .go2rtc
             .streams()
@@ -1422,13 +1438,13 @@ impl Supervisor {
             self.settle(&low, live).await;
             return;
         }
-        match self.go2rtc.put_stream(&low, &low_source(high)).await {
+        match self.swap_source(&low, &low_source(high)).await {
             Ok(()) => {
                 let live = self.status_for_name(high).await;
                 self.settle(&low, live).await;
             }
             Err(err) => {
-                let reason = redact(&err.to_string());
+                let reason = redact(&err);
                 tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
                 self.mark_degraded(&low, reason).await;
             }
