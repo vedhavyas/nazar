@@ -23,8 +23,9 @@ use server::supervisor::StreamHold;
 fn live_source_references_the_config_template() {
     assert_eq!(
         live_source("rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc"),
-        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=h264#audio=aac",
-        "the source names the config's ffmpeg template and asks for H.264"
+        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=h264#audio=aac#starttimeout=60",
+        "the source names the config's ffmpeg template, asks for H.264, and gets the same \
+         churn-past start window the tile chain carries"
     );
 }
 
