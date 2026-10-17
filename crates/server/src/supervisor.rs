@@ -64,6 +64,9 @@ pub struct Pacing {
     /// replace it. The camera's push to a fresh cloud session lags
     /// (measured 52s on the hub), and replacing the URL under an in-flight
     /// push starves it - the run waits the settle out instead of churning.
+    /// Consecutive fresh mints that never connect double it, capped at
+    /// four times: a push stuck past the base settle gets longer windows,
+    /// not a metronome that keeps replacing the URL it is pushing to.
     pub mint_settle: Duration,
     /// How often a refused session is re-discovered; the UI is already
     /// routed to login, so this is just how soon recovery is noticed.
@@ -249,6 +252,11 @@ struct Stall {
     /// alive producer's death needs no dial grace, and the settle protects
     /// only a fresh, unproven dial.
     connected: bool,
+    /// Consecutive fresh mints that never connected: each doubles the
+    /// settle the next mint waits, so a push slower than the base settle
+    /// is given ever-longer windows instead of a metronome that replaces
+    /// its URL forever. A connect resets it.
+    mints_unconnected: u32,
 }
 
 impl Stall {
@@ -259,6 +267,7 @@ impl Stall {
             attempts: 0,
             wait: Duration::ZERO,
             connected: false,
+            mints_unconnected: 0,
         }
     }
 
@@ -1057,10 +1066,14 @@ impl Supervisor {
                         // onto a mint too young to have connected: the
                         // camera's push lags, and replacing the URL under
                         // an in-flight push starves it. A producer proven
-                        // alive needs no settle; a fresh dial gets it.
+                        // alive needs no settle; a fresh dial gets it, and
+                        // consecutive dials that never connect double it
+                        // (capped), so a stuck push gets ever-longer
+                        // windows instead of a metronome.
                         let mut due = Instant::now() + stall.wait.max(self.pacing.retry_base);
                         if !stall.connected {
-                            due = due.max(last_mint + self.pacing.mint_settle);
+                            let shift = stall.mints_unconnected.saturating_sub(1).min(2);
+                            due = due.max(last_mint + self.pacing.mint_settle * (1 << shift));
                         }
                         next_mint = next_mint.min(due);
                     }
@@ -1089,6 +1102,15 @@ impl Supervisor {
             next_mint = match self.mint_and_swap(&device, Quality::High).await {
                 Ok(()) => {
                     failed = false;
+                    // The ladder counts fresh mints that never connected;
+                    // a mint that replaced a connected producer starts it
+                    // over (this mint's own connect resets it too, in the
+                    // watch).
+                    stall.mints_unconnected = if stall.connected {
+                        0
+                    } else {
+                        stall.mints_unconnected + 1
+                    };
                     stall.connected = false;
                     last_mint = Instant::now();
                     if held.is_none() {
@@ -1266,6 +1288,7 @@ impl Supervisor {
         match self.watch_producer(name).await {
             ProducerWatch::Up => {
                 stall.connected = true;
+                stall.mints_unconnected = 0;
                 let Some((starved, attempts)) = stall.close() else {
                     return StallStep::Idle;
                 };

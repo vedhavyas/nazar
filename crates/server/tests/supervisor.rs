@@ -1917,6 +1917,50 @@ async fn a_young_mint_is_not_trampled_by_the_run() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// A stuck push backs the mints off: consecutive fresh mints that never
+/// connect double the settle each round. The camera's push to a new
+/// session can lag past the base settle (52s measured), and a metronomic
+/// re-mint at that cadence replaces the URL before the push can land -
+/// the hub starved for 17 minutes on exactly that ~62s metronome.
+#[tokio::test]
+async fn a_stuck_push_backs_the_mints_off() {
+    let h = harness(Pacing {
+        mint_settle: Duration::from_millis(250),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two", "three"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+    let second = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
+    assert!(second, "the stuck run re-mints after the first settle");
+
+    // The third waits the DOUBLED settle: past the base one, short of the
+    // doubled one, nothing goes out.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        2,
+        "the doubled settle holds the third mint: {:?}",
+        h.go2rtc.puts()
+    );
+    let third = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
+    assert!(
+        third,
+        "and the third lands when the doubled settle is spent"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// A run's re-mints pace on a compounding backoff: every mid-run mint is
 /// another attempt at a picture that has not arrived, not a reason to
 /// start the delay over.
