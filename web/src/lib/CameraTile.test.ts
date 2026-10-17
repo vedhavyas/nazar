@@ -382,6 +382,25 @@ test('a frozen picture asks for a retry', async () => {
   expect(onwatch, 'the retry asks for a fresh stream').toHaveBeenCalledWith('cam-1');
 });
 
+test('the fallback replaces the picture instead of stacking under it', async () => {
+  vi.useFakeTimers();
+  // This browser plays HLS by itself: the stall lands on the fallback.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('maybe');
+  liveTile();
+
+  await vi.advanceTimersByTimeAsync(12500);
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'the fallback took the picture',
+  ).toBeTruthy();
+  const stage = document.querySelector('[data-testid="player"]') as HTMLElement | null;
+  expect(stage, 'the player stage is still in the DOM').toBeTruthy();
+  expect(
+    stage?.classList.contains('gone'),
+    'the dead WebRTC stage is hidden, not stacked under the fallback - two dead players is what Ved saw',
+  ).toBe(true);
+});
+
 test('a stalled picture is rebuilt on its own with a doubling backoff', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');

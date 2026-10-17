@@ -99,6 +99,75 @@ test('the screen holds the player window while the server is waking', async () =
   ).toBeTruthy();
 });
 
+test('a stalled picture shows the note and Try again on the camera screen', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  vi.stubGlobal('Hls', undefined);
+  const mock = stubServer();
+  open();
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is mounted').toBeTruthy(),
+  );
+
+  // The picture never starts and the fallback cannot take it: the screen
+  // has to say so - black with no words is what Ved stared at.
+  await vi.advanceTimersByTimeAsync(16000);
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  scripts.item(scripts.length - 1)?.dispatchEvent(new Event('error'));
+
+  await vi.waitFor(() => {
+    expect(screen.getByText(/did not start/), 'the stall is named').toBeTruthy();
+  });
+  const before = mock.mock.calls.filter(([url]) =>
+    String(url).startsWith('/api/cameras/cam-1/live'),
+  ).length;
+  screen.getByText('Try again').click();
+  await vi.advanceTimersByTimeAsync(100);
+  const after = mock.mock.calls.filter(([url]) =>
+    String(url).startsWith('/api/cameras/cam-1/live'),
+  ).length;
+  expect(after, 'and Try again asks for the stream again').toBeGreaterThan(before);
+});
+
+test('a waking stream shows a spinner, and a degraded one its reason', async () => {
+  vi.useFakeTimers();
+  let state = 'waking';
+  const reason = 'the producer has not connected';
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            { id: 'cam-1', name: 'Hall', state, reason: state === 'degraded' ? reason : null },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      if (String(url) === '/api/cameras/cam-1/privacy') {
+        return json({ privacy: false });
+      }
+      return json({});
+    }),
+  );
+  open();
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(
+    screen.getByLabelText('Starting the stream'),
+    'a waking stream shows a spinner, not a bare black stage',
+  ).toBeTruthy();
+
+  state = 'degraded';
+  await vi.advanceTimersByTimeAsync(3500);
+  await vi.waitFor(() => {
+    expect(screen.getByText(reason), 'a degraded stream shows its reason').toBeTruthy();
+  });
+  expect(screen.getByText('Try again'), 'and offers Try again').toBeTruthy();
+});
+
 test('a stalled picture is asked for again on its own', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');

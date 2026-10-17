@@ -37,6 +37,8 @@
   /** The server is still waking this stream: the player's start window is
    * held until its own word says otherwise. */
   let waiting = $state(false);
+  /** The picture is not moving: 'start' never negotiated, 'frozen' stopped. */
+  let stalled = $state<null | 'start' | 'frozen'>(null);
 
   // A stalled picture heals itself: the screen asks the server again on a
   // bounded backoff, so a dead peer does not park the person on a still.
@@ -94,11 +96,25 @@
       if (!waiting) return;
       try {
         const page = await api.cameras();
-        waiting = page.cameras.find((entry) => entry.id === id)?.state === 'waking';
+        const found = page.cameras.find((entry) => entry.id === id) ?? null;
+        // The poll is also the screen's only look at the server's own
+        // word: a stream that leaves waking into trouble says so here.
+        if (found) camera = found;
+        waiting = found?.state === 'waking';
       } catch {
         waiting = false;
       }
     }
+  }
+
+  /** The person's Try again: a fresh ask, straight away. */
+  function retry() {
+    rebuild.settled();
+    stalled = null;
+    waiting = false;
+    void start().catch((err) => {
+      error = err instanceof Error ? err.message : String(err);
+    });
   }
 
   /** The tab came back and the picture did not follow: a long absence can
@@ -251,17 +267,35 @@
           onsettled={(state) => {
             waiting = false;
             if (state === 'start' || state === 'frozen') {
+              stalled = state;
               rebuild.schedule();
               return;
             }
+            stalled = null;
             rebuild.settled();
             if (state === 'recovered') void recover();
           }}
         />
         <Speaker on={listening} ontoggle={toggleListen} />
       {/if}
+      {#if waiting}
+        <!-- Waking is said, not just shown: a bare black stage with no
+             word is what made a stalled camera read as broken. -->
+        <div class="spinner" role="status" aria-label="Starting the stream"></div>
+      {/if}
     </div>
   </PtzDrag>
+
+  {#if stalled === 'start'}
+    <p class="note">The video did not start. The camera link may be blocked on this network.</p>
+    <button class="btn" onclick={retry}>Try again</button>
+  {:else if stalled === 'frozen'}
+    <p class="note">The picture stopped. The camera link may have dropped.</p>
+    <button class="btn" onclick={retry}>Try again</button>
+  {:else if camera?.state === 'degraded'}
+    <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
+    <button class="btn" onclick={retry}>Try again</button>
+  {/if}
 
   <div class="controls">
     <button class="btn" onclick={() => setQuality(quality === 'high' ? 'low' : 'high')}>
@@ -308,6 +342,38 @@
 
   .screen-stage {
     position: relative;
+  }
+
+  .spinner {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+
+  .spinner::after {
+    content: '';
+    width: 34px;
+    height: 34px;
+    border: 3px solid var(--line);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner::after {
+      animation: none;
+      border-color: var(--accent);
+    }
   }
 
   .screen-stage :global(.stage) {

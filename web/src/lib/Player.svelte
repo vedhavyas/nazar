@@ -351,7 +351,7 @@
   });
 </script>
 
-<div class="stage" bind:this={host} data-testid="player"></div>
+<div class="stage" class:gone={fallback} bind:this={host} data-testid="player"></div>
 
 {#if fallback}
   <video
@@ -372,6 +372,12 @@
     border-radius: 8px;
     overflow: hidden;
     background: #000;
+  }
+
+  /* The fallback replaces the picture: a dead WebRTC stage left visible
+     under it is two dead players on the screen at once. */
+  .stage.gone {
+    display: none;
   }
 
   .stage :global(video-rtc),
