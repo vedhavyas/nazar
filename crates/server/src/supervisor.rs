@@ -689,6 +689,9 @@ impl Supervisor {
                             let refreshed =
                                 qubo::auth::refresh_session(&self.qubo, &session).await?;
                             self.sessions.save(&refreshed)?;
+                            tracing::info!(
+                                "the stored session healed: a refused call spent the refresh"
+                            );
                             refreshed
                         }
                     }
@@ -1612,5 +1615,123 @@ mod tests {
             "a hold that never attached must not shadow a viewer"
         );
         drop(lease);
+    }
+
+    /// A spent refresh logs the heal: an acceptance run greps the log for
+    /// it, and the session file's new `iat` is the only other trace.
+    #[tokio::test]
+    async fn a_refresh_spend_logs_the_heal() {
+        const REFRESH_PATH: &str =
+            "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(REFRESH_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({ "accessToken": "token-new", "refreshToken": "refresh-2" })
+                        .to_string(),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("nazar-heal-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let sessions = SessionStore::new(dir.join("session.json"));
+        sessions
+            .save(&qubo::Session {
+                access_token: "token-dead".to_owned(),
+                uuid: "user-uuid-1".to_owned(),
+                email: None,
+                refresh_token: Some("refresh-1".to_owned()),
+            })
+            .expect("the durable session saves");
+        let supervisor = Supervisor::new(
+            QuboClient::new(
+                server.uri().parse().expect("a url"),
+                qubo::ServiceProvider::default(),
+            ),
+            sessions,
+            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")).expect("a client"),
+            Pacing::default(),
+        );
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Control: the capture sees an event at all, so the heal assertion
+        // below cannot pass on a dead writer.
+        tracing::info!("spend-log capture probe");
+
+        // The refused call spends the stored refresh; the retry rides the
+        // healed session.
+        let answered = supervisor
+            .with_fresh_session(|session| async move {
+                if session.access_token == "token-dead" {
+                    Err(qubo::QuboError::Auth {
+                        code: None,
+                        message: "refused".to_owned(),
+                    })
+                } else {
+                    Ok(session.access_token)
+                }
+            })
+            .await
+            .expect("the retry runs on the healed session");
+        assert_eq!(answered, "token-new", "the retry carries the fresh token");
+
+        let heals = |text: &str| text.matches("the stored session healed").count();
+        let logs = captured.text();
+        assert!(
+            logs.contains("capture probe"),
+            "the capture is live: {logs}"
+        );
+        assert_eq!(heals(&logs), 1, "the spend names the heal: {logs}");
+
+        // The line belongs to the spend alone: a call that answers first
+        // time leaves the log as it was.
+        supervisor
+            .with_fresh_session(|session| async move { Ok(session.access_token) })
+            .await
+            .expect("a healthy call answers");
+        assert_eq!(
+            heals(&captured.text()),
+            1,
+            "a call that never refused logs no heal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fmt subscriber's own writer, so a test can read what was logged.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("the buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }
