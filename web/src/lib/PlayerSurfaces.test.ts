@@ -103,6 +103,28 @@ test('a frozen picture holds its last frame and never stacks a fallback', async 
   expect(document.querySelector('video-rtc'), 'still the same player').toBe(player);
 });
 
+test('the first unmute through the native control is already audible', async () => {
+  vi.useFakeTimers();
+  liveTile();
+  await vi.advanceTimersByTimeAsync(600);
+
+  const video = document.querySelector('video-rtc video') as HTMLVideoElement;
+  expect(video.muted, 'the default mute rides the flag').toBe(true);
+  expect(
+    video.volume,
+    'and the volume is never wound down: a zero volume outlives the flag',
+  ).toBe(1);
+
+  // The native control's unmute: the flag clears and the element is audible
+  // with no slider drag (Ved's report: the click left it silent until the
+  // volume slider was opened).
+  video.muted = false;
+  video.dispatchEvent(new Event('volumechange'));
+  await vi.advanceTimersByTimeAsync(100);
+  expect(video.volume, 'no slider needed: the sound is there').toBe(1);
+  expect(video.muted, 'and the flag cleared').toBe(false);
+});
+
 test('a picture the element killed to zero says so instead of standing silent', async () => {
   vi.useFakeTimers();
   const { onwatch } = liveTile();

@@ -378,7 +378,10 @@
   // The video element arrives with the connection, so the default mute has
   // to be applied to whatever is on the stage - once per element: from
   // there the player's own control owns the volume, and a native unmute
-  // is never reverted under the person's finger.
+  // is never reverted under the person's finger. The flag is the whole
+  // mute: a mirror that also wrote `volume = muted ? 0 : 1` zeroed it once
+  // and never restored it, so the native unmute cleared the flag while the
+  // element stayed silent at volume 0 until the slider set a level.
   $effect(() => {
     const want = muted;
     const timer = setInterval(() => {
@@ -387,7 +390,6 @@
         | null;
       if (!video || video.nazarDefault) return;
       video.muted = want;
-      video.volume = want ? 0 : 1;
       video.nazarDefault = true;
     }, 500);
     return () => clearInterval(timer);
