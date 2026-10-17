@@ -1074,6 +1074,64 @@ async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// The warm-live interaction: a stream whose producer died is kept, never
+/// released, however long it sits unasked - and when a viewer arrives at
+/// the dead picture, the stall machinery re-mints it with no release
+/// racing the heal.
+#[tokio::test]
+async fn a_dead_producer_re_mints_without_a_release_racing_it() {
+    let h = harness(Pacing {
+        connect_window: Duration::from_secs(5),
+        stream_idle: Duration::from_millis(60),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let landed = common::eventually(|| async { !h.go2rtc.puts().is_empty() }).await;
+    assert!(landed, "the first mint landed");
+    let started = h.go2rtc.puts().len();
+
+    // Nobody asks again and the producer never connected: far past the old
+    // idle window, the entry stays and nothing is released.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "an unasked dead stream is kept, not released: {:?}",
+        h.go2rtc.deletes()
+    );
+    assert_ne!(
+        h.supervisor.status(DEVICE_ID).await,
+        StreamState::Offline,
+        "and its entry stays tracked"
+    );
+
+    // A viewer arrives at the dead picture: the stall machinery re-mints
+    // on its own, with no release racing the heal.
+    h.go2rtc.set_viewers(&name, 1);
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() > started }).await;
+    assert!(
+        reminted,
+        "the arrival's stall run re-mints: {:?}",
+        h.go2rtc.puts()
+    );
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "no release raced the heal: {:?}",
+        h.go2rtc.deletes()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// The state stays waking while a watched producer is away, and flips live
 /// when a fresh mint's source connects.
 #[tokio::test]
@@ -1640,9 +1698,9 @@ async fn a_held_stream_stays_warm_without_viewers() {
 }
 
 /// narar's own consumer never counts as a viewer: a stream nobody asks for
-/// and nobody watches still idles out, and the hold is released with it.
+/// keeps its picture and its own hold, however long it sits unasked.
 #[tokio::test]
-async fn the_hold_does_not_keep_a_stream_alive() {
+async fn the_hold_lives_with_the_stream() {
     let mut h = harness(Pacing {
         stream_idle: Duration::from_millis(150),
         ..pacing(Duration::from_secs(30))
@@ -1664,14 +1722,20 @@ async fn the_hold_does_not_keep_a_stream_alive() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
+    let held = common::eventually(|| async { h.go2rtc.stream_view(&name).0 >= 1 }).await;
+    assert!(held, "the hold's consumer attached");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
-        retired,
-        "the idle window still retires the stream: {:?}",
+        h.go2rtc.deletes().is_empty(),
+        "the idle window retires nothing: {:?}",
         h.go2rtc.deletes()
     );
-    let released = common::eventually(|| async { h.go2rtc.stream_view(&name).0 == 0 }).await;
-    assert!(released, "and the hold is released with it");
+    assert_eq!(
+        h.go2rtc.stream_view(&name).0,
+        1,
+        "and the hold stays attached with its stream"
+    );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 

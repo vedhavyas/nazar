@@ -237,7 +237,7 @@ async fn a_tile_carries_the_cloud_streams_trouble() {
 }
 
 #[tokio::test]
-async fn a_tiles_retirement_survives_a_camera_that_never_streams() {
+async fn a_failing_cameras_tile_is_kept() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 500, "boom".to_owned()).await;
 
@@ -247,14 +247,17 @@ async fn a_tiles_retirement_survives_a_camera_that_never_streams() {
         .expect("the tile registers");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // No mint ever succeeds, so the loop's own reconcile never runs: the
-    // cloud stream's teardown is the only thing that can retire the tile.
-    let mut deleted = h.go2rtc.deletes();
-    deleted.sort();
-    assert_eq!(
-        deleted,
-        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
-        "a camera that never streams still retires its idle tile"
+    // No mint ever succeeds; nobody asks for the tile again. Nothing is
+    // released for it: the entry and its rendition stay.
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "a camera that never streams keeps its tile: {:?}",
+        h.go2rtc.deletes()
+    );
+    assert_ne!(
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+        StreamState::Offline,
+        "and the tile is still tracked"
     );
 }
 
@@ -287,7 +290,7 @@ async fn asking_again_reuses_the_stream() {
 }
 
 #[tokio::test]
-async fn an_idle_tile_is_dropped() {
+async fn an_idle_tile_is_kept() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
@@ -297,25 +300,24 @@ async fn an_idle_tile_is_dropped() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let mut deleted = h.go2rtc.deletes();
-    deleted.sort();
-    assert_eq!(
-        deleted,
-        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
-        "the idle tile goes, and the cloud stream it alone was riding goes with it"
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "an unasked tile is never dropped: {:?}",
+        h.go2rtc.deletes()
     );
-    assert_eq!(
-        h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
-        StreamState::Offline,
-        "and the supervisor forgets it"
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        ),
+        "the tile stays live"
     );
-
-    let settled = h.go2rtc.puts().len();
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        h.go2rtc.puts().len(),
-        settled,
-        "the dropped tile's loop is gone, not re-minting"
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ),
+        "and the cloud stream it rides stays with it"
     );
 }
 
@@ -403,7 +405,7 @@ async fn a_watched_stream_waits_out_the_remint_cadence() {
 }
 
 #[tokio::test]
-async fn an_idle_stream_does_not_mint_once_more_before_dying() {
+async fn an_idle_stream_keeps_its_picture() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
@@ -411,16 +413,20 @@ async fn an_idle_stream_does_not_mint_once_more_before_dying() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream wakes");
+    // Several idle windows pass with nobody asking.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
-        !h.go2rtc.deletes().is_empty(),
-        "the idle stream was retired"
+        h.go2rtc.deletes().is_empty(),
+        "an unasked stream is never released: {:?}",
+        h.go2rtc.deletes()
     );
-    assert_eq!(
-        mint_calls(&h.qubo).await,
-        1,
-        "and it took its one mint to the grave: an idle stream must not mint once more on its way out"
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ),
+        "and it is still live"
     );
 }
 
@@ -453,11 +459,10 @@ async fn a_healthy_tile_chain_is_not_re_written_every_slice() {
     );
 }
 
-/// Everything the stream owned goes with it: a stream re-registered after
-/// its teardown gets its own full idle window again, not a shorter one
-/// inherited from the retired loop.
+/// A re-ask of a stream that has sat unasked for windows and windows
+/// reuses it where it stands: nothing was released in between.
 #[tokio::test]
-async fn a_re_registered_stream_is_retired_again() {
+async fn a_re_asked_stream_is_reused() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
@@ -465,17 +470,26 @@ async fn a_re_registered_stream_is_retired_again() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream wakes");
-    let retired = common::eventually(|| async { !h.go2rtc.deletes().is_empty() }).await;
-    assert!(retired, "the idle stream is retired");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "the stream is never retired: {:?}",
+        h.go2rtc.deletes()
+    );
 
-    h.supervisor
+    let again = h
+        .supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
-        .expect("a fresh stream wakes");
-    let again = common::eventually(|| async { h.go2rtc.deletes().len() >= 2 }).await;
+        .expect("the re-ask lands");
     assert!(
-        again,
-        "and the re-registered stream is retired on its own window: {:?}",
+        matches!(again, StreamState::Live { .. } | StreamState::Waking),
+        "the re-ask finds the stream in place, not gone: {again:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "and it keeps streaming after the re-ask: {:?}",
         h.go2rtc.deletes()
     );
 }
@@ -559,78 +573,7 @@ async fn a_recovered_camera_starts_its_backoff_over() {
 }
 
 #[tokio::test]
-async fn a_wedged_go2rtc_does_not_wedge_the_lock() {
-    let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    // The API takes the DELETE and answers far past the client's own bound.
-    h.go2rtc.set_delete_delay(Duration::from_secs(30));
-
-    h.supervisor
-        .ensure(DEVICE_ID, Quality::High, false)
-        .await
-        .expect("the stream wakes");
-    // The idle window passes and the loop walks into its teardown.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let read = tokio::time::timeout(
-        Duration::from_secs(9),
-        h.supervisor.status_for(DEVICE_ID, Quality::High),
-    )
-    .await;
-    assert!(
-        read.is_ok(),
-        "a status read answers while a wedged teardown is in flight"
-    );
-}
-
-#[tokio::test]
-async fn a_request_landing_during_teardown_gets_a_fresh_stream() {
-    let h = harness(Duration::from_millis(60)).await;
-    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    // The teardown's deletes are slow, so the request below lands inside
-    // them: the window is opened by hand, not waited for.
-    h.go2rtc.set_delete_delay(Duration::from_millis(300));
-
-    h.supervisor
-        .ensure(DEVICE_ID, Quality::High, false)
-        .await
-        .expect("the stream wakes");
-    // Nobody asks again, so past the idle window the loop walks into its
-    // teardown and blocks on the slow deletes.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    let raced = h
-        .supervisor
-        .ensure(DEVICE_ID, Quality::High, false)
-        .await
-        .expect("the race survives");
-    assert_eq!(
-        raced,
-        StreamState::Waking,
-        "a request during the teardown is told the truth: the stream is being started again, \
-         not Live onto a stream that is being deleted under it"
-    );
-
-    let live = common::eventually(|| async {
-        matches!(
-            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
-            StreamState::Live { .. }
-        )
-    })
-    .await;
-    assert!(live, "and a fresh stream lands");
-    let puts = h.go2rtc.puts();
-    assert!(
-        puts.iter()
-            .filter(|(name, _)| name == &format!("{DEVICE_ID}-high"))
-            .count()
-            >= 2,
-        "the fresh stream was handed to go2rtc after the teardown: {puts:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_retired_tile_is_dropped_while_the_hero_keeps_streaming() {
+async fn a_tile_is_never_dropped_while_the_hero_keeps_streaming() {
     let h = harness(Duration::from_millis(80)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
 
@@ -652,22 +595,24 @@ async fn a_retired_tile_is_dropped_while_the_hero_keeps_streaming() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    assert_eq!(
-        h.go2rtc.deletes(),
-        vec![format!("{DEVICE_ID}-low")],
-        "the retired tile is dropped on its own"
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "an unasked tile is never dropped: {:?}",
+        h.go2rtc.deletes()
     );
     assert!(
         matches!(
             h.supervisor.status_for(DEVICE_ID, Quality::High).await,
             StreamState::Live { .. }
         ),
-        "while the hero it rode keeps streaming"
+        "the hero keeps streaming"
     );
-    assert_eq!(
-        h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
-        StreamState::Offline,
-        "and the tile is forgotten"
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        ),
+        "and the tile stays with it"
     );
 }
 
@@ -699,15 +644,13 @@ async fn a_tile_with_a_viewer_is_never_dropped() {
         "and it is still live"
     );
 
-    // The viewer leaves; now the idle rule applies again.
+    // The viewer leaves; the tile is kept all the same.
     h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut deleted = h.go2rtc.deletes();
-    deleted.sort();
-    assert_eq!(
-        deleted,
-        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
-        "once nobody is watching, the tile and its cloud stream are dropped"
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "the tile is kept with or without a viewer: {:?}",
+        h.go2rtc.deletes()
     );
 }
 
@@ -765,15 +708,13 @@ async fn a_status_check_that_fails_keeps_the_stream() {
         h.go2rtc.deletes()
     );
 
-    // The status answers again; the idle rule applies as before.
+    // The status answers again; the stream is kept all the same.
     h.go2rtc.set_streams_error(false);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut deleted = h.go2rtc.deletes();
-    deleted.sort();
-    assert_eq!(
-        deleted,
-        vec![format!("{DEVICE_ID}-high"), format!("{DEVICE_ID}-low")],
-        "once the status answers, a quiet tile and its cloud stream are dropped as usual"
+    assert!(
+        h.go2rtc.deletes().is_empty(),
+        "the stream is kept whatever the status says: {:?}",
+        h.go2rtc.deletes()
     );
 }
 

@@ -7,8 +7,8 @@
 //! visible - a mint, a discovery, the feed's re-resolve. With no refresh
 //! left, a refusal routes the UI to login. The cloud
 //! keeps one stream per camera (mints are last-mint-wins), so only the
-//! high stream is minted; a tile's low rides it as a chain inside go2rtc
-//! and is dropped once nobody has asked for it for a while.
+//! high stream is minted; a tile's low rides it as a chain inside go2rtc.
+//! Nothing is released for going unasked: the warmth is permanent.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -24,11 +24,10 @@ use tokio::sync::{Notify, RwLock};
 use crate::go2rtc::{Go2rtc, live_source, low_source};
 
 /// A consumer narar keeps on its own stream, so go2rtc's producer stays
-/// warm between viewers: a client that connects finds a picture already
-/// flowing instead of waiting out a mint and a dial. It lives exactly as
-/// long as the stream's loop, so the idle teardown still parks a stream
-/// nobody asks for and the hold goes cold with it - and it never counts
-/// as a viewer: `watched` subtracts it.
+/// warm for every viewer: a client that connects finds a picture already
+/// flowing instead of waiting out a mint and a dial. It lives as long as
+/// the stream's loop - the process's life - and it never counts as a
+/// viewer: `watched` subtracts it.
 pub trait StreamHold: Send + Sync {
     /// Begin holding `name`; dropping the last reference to the lease
     /// releases the consumer.
@@ -64,8 +63,9 @@ pub struct Pacing {
     /// How often a refused session is re-discovered; the UI is already
     /// routed to login, so this is just how soon recovery is noticed.
     pub discovery_retry: Duration,
-    /// How long a stream may go both unasked-for and unwatched before it
-    /// is dropped. A stream anyone is watching is never idle.
+    /// How long a playback (VOD) stream may go both unasked-for and
+    /// unwatched before it is released. Live house streams are never
+    /// released for idleness: the warmth is permanent.
     pub stream_idle: Duration,
     /// How long one minted URL is given for its producer to connect before
     /// the stream is re-minted. A fresh dial takes 6-12s (measured
@@ -79,11 +79,7 @@ pub struct Pacing {
     /// surfaces degraded - the camera's push can lag for minutes (measured
     /// 52s on the hub 2026-10-16), so the window must outlast the lag. The
     /// watch evaluates it on every `liveness_poll` slice, so with the
-    /// defaults the reason lands about 90s into the stall. Deliberately
-    /// under `stream_idle`: a stream nobody watches is torn down on that
-    /// window and a reason that only appeared after the teardown would
-    /// reach nobody - while a watched stream is never torn down at all,
-    /// so the reason keeps its whole margin in front of it.
+    /// defaults the reason lands about 90s into the stall.
     pub connect_window: Duration,
     /// How often, while waiting between mints, the loop asks go2rtc
     /// whether a watched stream's producer is actually up. Cheap - the API
@@ -755,9 +751,8 @@ impl Supervisor {
             state.insert(name.clone(), new_waking());
         }
         let supervisor = self.clone();
-        let idle = Some(self.pacing.stream_idle);
         tokio::spawn(async move {
-            supervisor.remint_loop(device, Duration::ZERO, idle).await;
+            supervisor.remint_loop(device, Duration::ZERO).await;
         });
         Ok(self.status_for(device_id, Quality::High).await)
     }
@@ -788,7 +783,7 @@ impl Supervisor {
         }
         let supervisor = self.clone();
         tokio::spawn(async move {
-            supervisor.remint_loop(device, Duration::ZERO, None).await;
+            supervisor.remint_loop(device, Duration::ZERO).await;
         });
     }
 
@@ -992,44 +987,28 @@ impl Supervisor {
         true
     }
 
-    async fn remint_loop(self, device: Device, mut wait: Duration, idle: Option<Duration>) {
+    async fn remint_loop(self, device: Device, mut wait: Duration) {
         let name = stream_name(&device.device_id, Quality::High);
         // narar's own consumer starts with the first landed PUT, not with
         // the loop: a hold dialled against a stream go2rtc has not been
         // given yet 404s, counts as a young death, and delays the warmth.
-        // It goes cold with the loop when the loop ends.
+        // It goes cold with the process.
         let mut held: Option<HeldStream> = None;
         let wake = self.wake_signal(&name).await;
-        // A viewer-started stream idles out when nobody is watching and
-        // nobody has asked: a demoted hero's high stream must not run for
-        // ever. The consumer check keeps a watched one - a hero - alive
-        // regardless. A warmed stream (no window) never idles out: the
-        // warmth is permanent, and the loop re-mints until the process
-        // ends.
+        // Nothing parks a tracked stream: nobody asking is not a reason to
+        // release it, and the loop re-mints on its cadence until the
+        // process ends.
         let mut next_mint = Instant::now();
         let mut failed = false;
         let mut stall = Stall::new();
         loop {
             let now = Instant::now();
-            // A stream with a viewer is not idle, whatever this server was
-            // last asked: the viewer holds it open through go2rtc.
-            let idle_since = match idle {
-                Some(_) if self.watched(&name).await => None,
-                Some(_) => self.idle_for(&name).await,
-                None => None,
-            };
-            // Waited until the mint is due, or until the idle window is
-            // reached - whichever comes first, so a viewer who leaves is
-            // noticed without waiting out a re-mint. Sliced, so the
-            // producer's health is checked while waiting too, not only
-            // when the next mint comes due.
-            let sleep_for = match (idle, idle_since) {
-                (Some(window), Some(idle_for)) => next_mint
-                    .saturating_duration_since(now)
-                    .min(window.saturating_sub(idle_for)),
-                _ => next_mint.saturating_duration_since(now),
-            }
-            .min(self.pacing.liveness_poll);
+            // Waited until the mint is due - sliced, so the producer's
+            // health is checked while waiting too, not only when the next
+            // mint comes due.
+            let sleep_for = next_mint
+                .saturating_duration_since(now)
+                .min(self.pacing.liveness_poll);
             let forced = tokio::select! {
                 () = tokio::time::sleep(sleep_for) => false,
                 () = wake.notified() => {
@@ -1037,28 +1016,12 @@ impl Supervisor {
                     true
                 }
             };
-            // The decision is made on what is true now, not on what was
-            // true before the wait: a stream that reached its idle window
-            // during the wait must not mint once more on its way out.
-            let idle_since = match idle {
-                Some(_) if self.watched(&name).await => None,
-                Some(_) => self.idle_for(&name).await,
-                None => None,
-            };
-            let seen_at = self.last_request_at(&name).await;
-            if let (Some(window), Some(idle_for), Some(seen_at)) = (idle, idle_since, seen_at)
-                && idle_for >= window
-                && self.teardown_if_idle(&name, seen_at).await
-            {
-                return;
-            }
             // A wake that is not due to mint is only a re-check: the mint
             // waits for its own cadence, or for a person's Try again whose
             // last mint failed - that one skips the backoff. A retry that
             // arrived while a mint was already in flight is consumed when
             // that mint succeeded: the person's wish is satisfied, and a
-            // stored permit must not mint again. A retired tile is dropped
-            // on its own window rather than on the mint's.
+            // stored permit must not mint again.
             let retry_due = forced && failed;
             if !retry_due && Instant::now() < next_mint {
                 self.reconcile_low(&name).await;
@@ -1321,88 +1284,6 @@ impl Supervisor {
         StallStep::Remint
     }
 
-    /// Drop the stream only if the entry this loop decided about is still
-    /// the entry that is there: a request that landed while the loop was
-    /// deciding belongs to somebody who is watching, and must not have its
-    /// stream deleted under it. The last request is the entry's identity -
-    /// an elapsed duration just keeps growing and can never be compared.
-    ///
-    /// The entry is claimed - removed from the state - and the state lock
-    /// is held until go2rtc has forgotten the stream: a request that lands
-    /// while the deletes are in flight waits for the claim, finds no
-    /// entry, and spawns a fresh stream, rather than being told Live about
-    /// one that is being deleted under it. Every await under that lock is
-    /// bounded by the go2rtc client's own timeouts (and the two deletes run
-    /// together rather than one after the other), so an API that accepts
-    /// and then never answers wedges a status read for one timeout, never
-    /// for the process's lifetime.
-    async fn teardown_if_idle(&self, name: &str, seen_at: Instant) -> bool {
-        {
-            let mut state = self.state.write().await;
-            match state.get(name) {
-                Some(tracked) if tracked.last_request == seen_at => {
-                    state.remove(name);
-                }
-                _ => {
-                    tracing::debug!(stream = name, "a request landed; the stream is not idle");
-                    return false;
-                }
-            }
-            // Only the tile that is still tracked: one its own reconcile
-            // already retired is gone from go2rtc too.
-            let tile = low_name_of(name).filter(|low| state.remove(low).is_some());
-            match tile {
-                Some(low) => {
-                    let (tile_deleted, dropped) = tokio::join!(
-                        self.go2rtc.delete_stream(&low),
-                        self.go2rtc.delete_stream(name),
-                    );
-                    if let Err(err) = tile_deleted {
-                        tracing::warn!(stream = %low, %err, "the tile rendition could not be dropped");
-                    }
-                    if let Err(err) = dropped {
-                        tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
-                    }
-                }
-                None => {
-                    if let Err(err) = self.go2rtc.delete_stream(name).await {
-                        tracing::warn!(stream = name, %err, "the idle stream could not be dropped");
-                    }
-                }
-            }
-        }
-        // The torn stream's reader leaves the session's fan-out whichever
-        // way the teardown lands, and the camera's fast-lane session ends
-        // with its last stream.
-        if let Some((device_id, _)) = name.rsplit_once('-') {
-            if let Some(session) = self.armed.read().await.get(device_id).cloned() {
-                session.release(name);
-            }
-            let prefix = format!("{device_id}-");
-            let remaining = self
-                .state
-                .read()
-                .await
-                .keys()
-                .any(|key| key.starts_with(&prefix));
-            if !remaining && let Some(session) = self.armed.write().await.remove(device_id) {
-                // A session already dead here ended without media; bench
-                // the lane so the next ask is not an arm into the same
-                // silence.
-                if !session.alive() {
-                    self.bench_lane(device_id);
-                }
-                session.shutdown();
-                tracing::info!(
-                    camera = device_id,
-                    "fast-lane session ended with its last stream"
-                );
-            }
-        }
-        tracing::info!(stream = name, "idle stream dropped");
-        true
-    }
-
     /// When the stream was last asked for, if it is still known.
     async fn last_request_at(&self, name: &str) -> Option<Instant> {
         self.state
@@ -1412,20 +1293,16 @@ impl Supervisor {
             .map(|tracked| tracked.last_request)
     }
 
-    /// Keep the tile rendition honest after a mint: re-assert its chain, or
-    /// retire it once nobody asks for it and nobody watches it. The cloud
-    /// stream it rides may still be needed by a hero.
+    /// Keep the tile rendition honest after a mint: re-assert its chain for
+    /// every tile that exists. The cloud stream it rides may still be
+    /// needed by a hero.
     async fn reconcile_low(&self, high: &str) {
         let Some(low) = low_name_of(high) else {
             return;
         };
-        let Some(last) = self.last_request_at(&low).await else {
-            return;
-        };
-        if last.elapsed() >= self.pacing.stream_idle {
-            if !self.watched(&low).await {
-                self.drop_low_if_idle(&low, last).await;
-            }
+        // Only for a tile someone has asked for at least once: nothing
+        // chains a rendition nobody opened.
+        if !self.state.read().await.contains_key(&low) {
             return;
         }
         // Re-asserted only when go2rtc has lost it: every PUT rewrites
@@ -1456,31 +1333,9 @@ impl Supervisor {
         }
     }
 
-    /// Drop a retired tile rendition, if the entry this cycle decided
-    /// about is still the entry that is there: a tile asked for while the
-    /// cycle was deciding must not be dropped under it. The claim and the
-    /// delete both run under the state lock, the same shape as the cloud
-    /// stream's teardown: a tile asked for mid-drop waits and registers a
-    /// fresh chain, rather than having the chain it just asked for deleted
-    /// under it.
-    async fn drop_low_if_idle(&self, low: &str, seen_at: Instant) -> bool {
-        let mut state = self.state.write().await;
-        match state.get(low) {
-            Some(tracked) if tracked.last_request == seen_at => {
-                state.remove(low);
-            }
-            _ => return false,
-        }
-        if let Err(err) = self.go2rtc.delete_stream(low).await {
-            tracing::warn!(stream = low, %err, "the retired tile rendition could not be dropped");
-        }
-        tracing::info!(stream = low, "retired tile rendition dropped");
-        true
-    }
-
     /// Whether go2rtc has a viewer on the stream, or - for a cloud stream -
     /// on the tile rendition that rides it. An API that cannot say keeps
-    /// the stream: a late teardown beats a wrong one.
+    /// the stream.
     async fn watched(&self, name: &str) -> bool {
         let low = low_name_of(name);
         // narar's own hold is not a viewer: only the consumers beyond it
@@ -1496,15 +1351,6 @@ impl Supervisor {
                 theirs > 0 && (stream.name == name || low.as_deref() == Some(stream.name.as_str()))
             })
         })
-    }
-
-    /// How long since the stream was last asked for, if it is still known.
-    async fn idle_for(&self, name: &str) -> Option<Duration> {
-        self.state
-            .read()
-            .await
-            .get(name)
-            .map(|tracked| tracked.last_request.elapsed())
     }
 
     /// The tracked entry's wake handle, created if the entry is missing.
@@ -1635,12 +1481,10 @@ fn redact(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! The idle teardown's decision window, which no integration test can
-    //! land in: the loop's look and its teardown are microseconds apart.
-    //! Here the window is opened by hand, between the two calls. The other
-    //! half of the race - a request landing while the teardown's deletes
-    //! are in flight - is pinned in supervisor_quality, where the fake
-    //! go2rtc can be made slow to delete.
+    //! The pure seams: the defaults' ordering, the hold registry's
+    //! identity rules, and the spend's log line. The loop-level behavior -
+    //! warmth, stalls, the never-release rule - lives in the integration
+    //! suites, where the fake go2rtc can be driven.
 
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -1661,231 +1505,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_window_lands_before_the_idle_teardown() {
+    fn the_default_windows_land_in_order() {
         let pacing = Pacing::default();
         assert!(
             pacing.connect_grace < pacing.connect_window,
             "the first attempt waits out a whole slow dial before the window can end it"
-        );
-        assert!(
-            pacing.connect_window < pacing.stream_idle,
-            "the degradation must surface while a stream nobody asks for is still alive"
-        );
-    }
-
-    /// A session that only records what it was told.
-    struct RecordingSession {
-        ended: Arc<AtomicBool>,
-        released: Arc<Mutex<Vec<String>>>,
-        alive: AtomicBool,
-    }
-
-    impl LaneSession for RecordingSession {
-        fn source_for(&self, _name: &str) -> Result<String, String> {
-            Ok("ffmpeg:/tmp/x.sdp#input=nazar".to_owned())
-        }
-
-        fn control(&self, _envelope: Value) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn alive(&self) -> bool {
-            self.alive.load(Ordering::SeqCst)
-        }
-
-        fn release(&self, name: &str) {
-            self.released.lock().unwrap().push(name.to_owned());
-        }
-
-        fn shutdown(&self) {
-            self.ended.store(true, Ordering::SeqCst);
-        }
-    }
-
-    fn recorded_session() -> (
-        Arc<RecordingSession>,
-        Arc<AtomicBool>,
-        Arc<Mutex<Vec<String>>>,
-    ) {
-        let ended = Arc::new(AtomicBool::new(false));
-        let released = Arc::new(Mutex::new(Vec::new()));
-        let session = Arc::new(RecordingSession {
-            ended: Arc::clone(&ended),
-            released: Arc::clone(&released),
-            alive: AtomicBool::new(true),
-        });
-        (session, ended, released)
-    }
-
-    #[tokio::test]
-    async fn the_last_streams_teardown_ends_the_cameras_session() {
-        let supervisor = quiet_supervisor();
-        let (session, ended, released) = recorded_session();
-        supervisor
-            .armed
-            .write()
-            .await
-            .insert("cam".to_owned(), session);
-        let name = stream_name("cam", Quality::Low);
-        let seen = Instant::now();
-        supervisor.state.write().await.insert(
-            name.clone(),
-            Tracked {
-                state: StreamState::Live {
-                    since: Instant::now(),
-                },
-                wake: Arc::new(Notify::new()),
-                last_request: seen,
-            },
-        );
-
-        assert!(
-            supervisor.teardown_if_idle(&name, seen).await,
-            "the entry the decision was made about is torn down"
-        );
-        assert!(
-            ended.load(Ordering::SeqCst),
-            "the camera's last stream going ends its fast-lane session"
-        );
-        assert_eq!(
-            released.lock().unwrap().as_slice(),
-            [name.as_str()],
-            "and the stream's reader was released from the session"
-        );
-        assert!(
-            !supervisor.lane_benched("cam"),
-            "the teardown of a healthy session leaves the lane free"
-        );
-
-        // With another stream left, the session stays - but its reader
-        // still leaves.
-        let (session, ended, released) = recorded_session();
-        supervisor
-            .armed
-            .write()
-            .await
-            .insert("cam".to_owned(), session);
-        supervisor.state.write().await.insert(
-            stream_name("cam", Quality::High),
-            Tracked {
-                state: StreamState::Live {
-                    since: Instant::now(),
-                },
-                wake: Arc::new(Notify::new()),
-                last_request: Instant::now(),
-            },
-        );
-        let seen = Instant::now();
-        supervisor.state.write().await.insert(
-            name.clone(),
-            Tracked {
-                state: StreamState::Live {
-                    since: Instant::now(),
-                },
-                wake: Arc::new(Notify::new()),
-                last_request: seen,
-            },
-        );
-        assert!(
-            supervisor.teardown_if_idle(&name, seen).await,
-            "the torn stream's entry is retired"
-        );
-        assert!(
-            !ended.load(Ordering::SeqCst),
-            "a camera with another stream keeps its session"
-        );
-        assert_eq!(
-            released.lock().unwrap().as_slice(),
-            [name.as_str()],
-            "the torn stream's reader is released even when the session stays"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_dead_sessions_teardown_benches_the_lane() {
-        // The session died on its own (no media) before its last stream
-        // idled out; its teardown must bench the lane so the next ask is
-        // not an arm into the same silence.
-        let supervisor = quiet_supervisor();
-        let (session, _, _) = recorded_session();
-        session.alive.store(false, Ordering::SeqCst);
-        supervisor
-            .armed
-            .write()
-            .await
-            .insert("cam".to_owned(), session);
-        let name = stream_name("cam", Quality::High);
-        let seen = Instant::now();
-        supervisor.state.write().await.insert(
-            name.clone(),
-            Tracked {
-                state: StreamState::Live {
-                    since: Instant::now(),
-                },
-                wake: Arc::new(Notify::new()),
-                last_request: seen,
-            },
-        );
-
-        assert!(
-            supervisor.teardown_if_idle(&name, seen).await,
-            "the idle stream is torn down"
-        );
-        assert!(
-            supervisor.lane_benched("cam"),
-            "a session that died without media benches the lane on its teardown"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_teardown_stands_down_for_a_request_that_landed_meanwhile() {
-        let supervisor = quiet_supervisor();
-        let name = stream_name("cam", Quality::Low);
-        let seen = Instant::now();
-        supervisor.state.write().await.insert(
-            name.clone(),
-            Tracked {
-                state: StreamState::Live { since: seen },
-                wake: Arc::new(Notify::new()),
-                last_request: seen,
-            },
-        );
-
-        // The person asks again while the loop is deciding.
-        supervisor
-            .state
-            .write()
-            .await
-            .get_mut(&name)
-            .expect("the entry")
-            .last_request = seen + Duration::from_millis(5);
-
-        assert!(
-            !supervisor.teardown_if_idle(&name, seen).await,
-            "a request that landed in the window stands the teardown down"
-        );
-        assert!(
-            supervisor.state.read().await.contains_key(&name),
-            "and the stream survives it"
-        );
-
-        // Nothing new since: the same decision drops the stream.
-        let settled = supervisor.last_request_at(&name).await.expect("the entry");
-        assert!(
-            supervisor.teardown_if_idle(&name, settled).await,
-            "a stream with no new request is dropped"
-        );
-        assert!(
-            !supervisor.state.read().await.contains_key(&name),
-            "and forgotten"
-        );
-        // The entry is gone with the decision: a request arriving after
-        // the teardown finds nothing to be told Live about, and spawns a
-        // fresh stream instead.
-        assert_eq!(
-            supervisor.last_request_at(&name).await,
-            None,
-            "the claim takes the entry before the stream is deleted"
         );
     }
 
