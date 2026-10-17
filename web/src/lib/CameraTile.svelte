@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Camera } from './api';
   import Player from './Player.svelte';
+  import { rebuildSchedule } from './rebuild';
 
   let {
     camera,
@@ -24,6 +25,15 @@
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
   let fallingBack = $state(false);
+
+  // A stalled picture heals itself: rebuilt and re-asked on a bounded
+  // backoff, with Try again left as the immediate escape.
+  const rebuild = rebuildSchedule(() => {
+    stalled = null;
+    attempt += 1;
+    onwatch(camera.id);
+  });
+  $effect(() => () => rebuild.cancel());
 
   const STATE_WORDS: Record<Camera['state'], string> = {
     live: 'Live',
@@ -55,6 +65,7 @@
   });
 
   function retry() {
+    rebuild.settled();
     stalled = null;
     attempt += 1;
     onwatch(camera.id);
@@ -82,15 +93,16 @@
           if (state === 'hls' || state === 'recovered') {
             fallingBack = state === 'hls';
             stalled = null;
+            rebuild.settled();
             // The local rebuild is the fast step; the server is asked too,
-            // because a long absence can outlive the stream itself (an idle
-            // one is retired) and the rebuilt player would reconnect to
-            // nothing.
+            // because a long absence can outlive the stream itself and the
+            // rebuilt player would reconnect to nothing.
             if (state === 'recovered') onwatch(camera.id);
             return;
           }
           fallingBack = false;
           stalled = state;
+          rebuild.schedule();
         }}
       />
       {#if camera.state === 'waking'}

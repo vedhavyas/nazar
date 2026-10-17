@@ -99,6 +99,34 @@ test('the screen holds the player window while the server is waking', async () =
   ).toBeTruthy();
 });
 
+test('a stalled picture is asked for again on its own', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  vi.stubGlobal('Hls', undefined);
+  const mock = stubServer();
+  open();
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is mounted').toBeTruthy(),
+  );
+
+  const asked = () =>
+    mock.mock.calls.filter(([url]) =>
+      String(url).startsWith('/api/cameras/cam-1/live'),
+    ).length;
+  const before = asked();
+
+  // The picture never starts (no first frame in the window) and the
+  // fallback cannot take it: the screen re-asks on its own after the
+  // first backoff step, with nobody clicking.
+  await vi.advanceTimersByTimeAsync(16000);
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  expect(scripts.length, 'the fallback was attempted').toBeGreaterThan(0);
+  scripts.item(scripts.length - 1)?.dispatchEvent(new Event('error'));
+
+  await vi.advanceTimersByTimeAsync(1100);
+  expect(asked(), 'the screen re-asks the server on its own').toBe(before + 1);
+});
+
 test('the picture arrives muted, and the toggle is what unmutes it', async () => {
   vi.useFakeTimers();
   stubServer();

@@ -357,6 +357,53 @@ test('a frozen picture asks for a retry', async () => {
   expect(onwatch, 'the retry asks for a fresh stream').toHaveBeenCalledWith('cam-1');
 });
 
+test('a stalled picture is rebuilt on its own with a doubling backoff', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const { onwatch } = liveTile();
+
+  await vi.advanceTimersByTimeAsync(12000);
+  await failVendoredPlayer();
+  expect(screen.getByText(/did not start/), 'the stall is named').toBeTruthy();
+
+  // Nobody clicks: the rebuild follows on the first backoff step.
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(onwatch, 'the tile re-asks the server on its own').toHaveBeenCalledWith('cam-1');
+  expect(
+    screen.queryByText(/did not start/),
+    'and the failure note clears for the fresh attempt',
+  ).toBeNull();
+
+  // The fresh attempt stalls too: the next rebuild waits the second step.
+  await vi.advanceTimersByTimeAsync(12000);
+  await failVendoredPlayer();
+  onwatch.mockClear();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(
+    onwatch,
+    'the backoff doubled: nothing at the first step',
+  ).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(onwatch, 'the second step fires at two seconds').toHaveBeenCalledWith('cam-1');
+});
+
+test('a fallback that takes over cancels the pending rebuild', async () => {
+  vi.useFakeTimers();
+  // This browser plays HLS by itself: the stall lands on the fallback.
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('maybe');
+  const { onwatch } = liveTile();
+
+  await vi.advanceTimersByTimeAsync(12500);
+  expect(
+    document.querySelector('[data-testid=hls]'),
+    'the fallback took the picture',
+  ).toBeTruthy();
+
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(onwatch, 'a picture that settled is not rebuilt').not.toHaveBeenCalled();
+  expect(screen.queryByText(/did not start/), 'and nothing is called a failure').toBeNull();
+});
+
 /** Hide or show the page, as a browser tab switch does. */
 function setHidden(hidden: boolean) {
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });

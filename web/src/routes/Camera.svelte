@@ -4,6 +4,7 @@
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
   import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
+  import { rebuildSchedule } from '../lib/rebuild';
 
   let {
     id,
@@ -33,6 +34,16 @@
   /** The server is still waking this stream: the player's start window is
    * held until its own word says otherwise. */
   let waiting = $state(false);
+
+  // A stalled picture heals itself: the screen asks the server again on a
+  // bounded backoff, so a dead peer does not park the person on a still.
+  const rebuild = rebuildSchedule(() => {
+    waiting = false;
+    void start().catch(() => {
+      // Best-effort, like recover(): the stall itself is what shows.
+    });
+  });
+  $effect(() => () => rebuild.cancel());
 
   const audioKey = () => `nazar.audio.${id}`;
 
@@ -246,6 +257,11 @@
           muted={!listening}
           onsettled={(state) => {
             waiting = false;
+            if (state === 'start' || state === 'frozen') {
+              rebuild.schedule();
+              return;
+            }
+            rebuild.settled();
             if (state === 'recovered') void recover();
           }}
         />
