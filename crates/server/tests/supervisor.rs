@@ -1917,6 +1917,80 @@ async fn a_young_mint_is_not_trampled_by_the_run() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// The hold's own consumer is the early witness of a spent session: it
+/// dies with the frames while go2rtc still reports the producer connected
+/// (the hub's death sat invisible ~58s until the producer's own read
+/// timeout). A death well into the session's life re-mints at once, with
+/// no viewer and no run to wait on.
+#[tokio::test]
+async fn a_hold_death_re_mints_at_once() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    let hold = std::sync::Arc::new(common::FakeHold::attaching(h.go2rtc.clone()));
+    h.supervisor = h.supervisor.clone().with_hold(hold.clone());
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one", "two"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let warm = common::eventually(|| async { h.go2rtc.stream_view(&name).1 }).await;
+    assert!(warm, "the hold warmed the producer");
+    // The producer stays CONNECTED throughout: the illusion is the point.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mints = h.go2rtc.puts().len();
+
+    hold.report_death();
+    let reminted = common::eventually(|| async { h.go2rtc.puts().len() > mints }).await;
+    assert!(
+        reminted,
+        "the hold's death re-mints without a viewer: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A hold death inside a mint's settle is a swap's own churn, not a
+/// witness: it must not start a mint of its own.
+#[tokio::test]
+async fn a_young_mints_hold_death_does_not_churn() {
+    // A settle long enough for the death to land inside it.
+    let mut h = harness(Pacing {
+        mint_settle: Duration::from_secs(2),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    let hold = std::sync::Arc::new(common::FakeHold::attaching(h.go2rtc.clone()));
+    h.supervisor = h.supervisor.clone().with_hold(hold.clone());
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(200, &mint_body("repeat")).mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let warm = common::eventually(|| async { h.go2rtc.stream_view(&name).1 }).await;
+    assert!(warm, "the hold warmed the producer");
+
+    // The death lands inside the mint's settle: a swap's churn, not a
+    // witness.
+    hold.report_death();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        h.go2rtc.puts().len(),
+        1,
+        "a swap-churn death mints nothing: {:?}",
+        h.go2rtc.puts()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// A stuck push backs the mints off: consecutive fresh mints that never
 /// connect double the settle each round. The camera's push to a new
 /// session can lag past the base settle (52s measured), and a metronomic

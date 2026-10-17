@@ -442,22 +442,47 @@ impl FakeApi {
 pub struct FakeHold {
     pub api: FakeApi,
     attach: bool,
+    died: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl FakeHold {
     /// A hold whose consumer attaches, as the ffmpeg does.
     pub fn attaching(api: FakeApi) -> Self {
-        Self { api, attach: true }
+        Self {
+            api,
+            attach: true,
+            died: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// A hold that never attaches - a wrong binary, a dead listener: the
     /// registration exists, no consumer does.
     pub fn never_attaching(api: FakeApi) -> Self {
-        Self { api, attach: false }
+        Self {
+            api,
+            attach: false,
+            died: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Report the hold's consumer as having just exited, as the real one
+    /// records for every child death.
+    pub fn report_death(&self) {
+        *self
+            .died
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
     }
 }
 
 impl server::supervisor::StreamHold for FakeHold {
+    fn died_at(&self, _name: &str) -> Option<std::time::Instant> {
+        *self
+            .died
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn hold(&self, name: &str) -> std::sync::Arc<dyn server::supervisor::HoldLease> {
         if self.attach {
             self.api.hold(name, true);

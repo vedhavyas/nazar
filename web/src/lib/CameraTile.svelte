@@ -1,8 +1,6 @@
 <script lang="ts">
   import type { Camera } from './api';
   import Player from './Player.svelte';
-  import Speaker from './Speaker.svelte';
-  import { audioOn, rememberAudio } from './audio';
   import { rebuildSchedule } from './rebuild';
 
   let {
@@ -27,14 +25,16 @@
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
   let fallingBack = $state(false);
-  /** This camera's sound: off until asked for, remembered per camera. */
-  let listening = $state(audioOn(camera.id));
 
-  // A stalled picture heals itself: rebuilt and re-asked on a bounded
-  // backoff, with Try again left as the immediate escape.
-  const rebuild = rebuildSchedule(() => {
-    stalled = null;
-    attempt += 1;
+  // A stalled picture heals itself on a bounded backoff: a never-started
+  // picture is rebuilt, a frozen one only re-asked - its frame is held and
+  // a remount would blank it. The quiet note stays until the picture
+  // returns; Try again stays the immediate escape.
+  const rebuild = rebuildSchedule((kind) => {
+    if (kind === 'start') {
+      stalled = null;
+      attempt += 1;
+    }
     onwatch(camera.id);
   });
   $effect(() => () => rebuild.cancel());
@@ -92,7 +92,7 @@
         {stream}
         {attempt}
         waiting={camera.state === 'waking'}
-        muted={!listening}
+        muted
         onsettled={(state) => {
           if (state === 'hls' || state === 'recovered') {
             fallingBack = state === 'hls';
@@ -106,7 +106,7 @@
           }
           fallingBack = false;
           stalled = state;
-          rebuild.schedule();
+          rebuild.schedule(state);
         }}
       />
       {#if camera.state === 'waking'}
@@ -115,13 +115,6 @@
              refocus look like a restart. -->
         <div class="spinner" role="status" aria-label="Starting the stream"></div>
       {/if}
-      <Speaker
-        on={listening}
-        ontoggle={() => {
-          listening = !listening;
-          rememberAudio(camera.id, listening);
-        }}
-      />
     </div>
     {#if still && !stalled}
       <canvas class="still" bind:this={snapshot}></canvas>

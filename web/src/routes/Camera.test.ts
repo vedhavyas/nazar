@@ -196,32 +196,9 @@ test('a stalled picture is asked for again on its own', async () => {
   expect(asked(), 'the screen re-asks the server on its own').toBe(before + 1);
 });
 
-test('the picture arrives muted, and the speaker on it is what unmutes it', async () => {
+test('the picture arrives muted, and the player control is the one unmute', async () => {
   vi.useFakeTimers();
-  stubServer();
-  open();
-  await vi.advanceTimersByTimeAsync(600);
-
-  const video = document.querySelector('video-rtc video') as HTMLVideoElement | null;
-  expect(video, 'the player is on the stage').toBeTruthy();
-  expect(video?.muted, 'nothing plays sound before a gesture').toBe(true);
-
-  const speaker = screen.getByTestId('speaker');
-  expect(speaker.getAttribute('aria-pressed'), 'the speaker starts off').toBe('false');
-
-  speaker.click();
-  await vi.advanceTimersByTimeAsync(600);
-
-  expect(video?.muted, 'the toggle is the gesture that unmutes').toBe(false);
-  expect(speaker.getAttribute('aria-pressed'), 'and the speaker reads on').toBe('true');
-  expect(
-    localStorage.getItem('nazar.audio.cam-1'),
-    'the choice is remembered per camera',
-  ).toBe('1');
-});
-
-test('a remembered choice starts the camera unmuted', async () => {
-  vi.useFakeTimers();
+  // A remembered ON from the older build must not bring back the sound.
   localStorage.setItem('nazar.audio.cam-1', '1');
   stubServer();
   open();
@@ -229,8 +206,15 @@ test('a remembered choice starts the camera unmuted', async () => {
 
   const video = document.querySelector('video-rtc video') as HTMLVideoElement | null;
   expect(video, 'the player is on the stage').toBeTruthy();
-  expect(video?.muted, 'the remembered choice is honored').toBe(false);
-  expect(screen.getByTestId('speaker').getAttribute('aria-pressed')).toBe('true');
+  expect(video?.muted, 'every load starts muted').toBe(true);
+  expect(screen.queryByTestId('speaker'), 'no separate audio button').toBeNull();
+
+  // What the native control does: the mute flips on the element itself and
+  // is never reverted from above.
+  video!.muted = false;
+  video!.dispatchEvent(new Event('volumechange'));
+  await vi.advanceTimersByTimeAsync(1200);
+  expect(video?.muted, 'the native unmute sticks').toBe(false);
 });
 
 test('the old Listen button is gone', async () => {
@@ -342,6 +326,7 @@ function setHidden(hidden: boolean) {
 }
 
 test('a tab that comes back asks the server for the stream again', async () => {
+  vi.useFakeTimers();
   const fetchMock = stubServer();
   open();
 
@@ -351,10 +336,12 @@ test('a tab that comes back asks the server for the stream again', async () => {
   video.currentTime = 4;
 
   // Away, and the peer drops while we are not looking: the clock is where
-  // it was on return. A hidden camera may outlive its server stream, so
-  // the re-ask must reach the server, not just rebuild the player.
+  // it was on return. The player gives the unthrottled tab its resumption
+  // grace first; a peer still stuck after it is asked for again - the
+  // re-ask must reach the server, not just rebuild the player.
   setHidden(true);
   setHidden(false);
+  await vi.advanceTimersByTimeAsync(5000);
 
   await vi.waitFor(() => {
     expect(
@@ -393,6 +380,7 @@ test('a background re-ask that fails raises no banner', async () => {
     return json({});
   });
   vi.stubGlobal('fetch', fetchMock);
+  vi.useFakeTimers();
   open();
 
   await vi.waitFor(() => expect(document.querySelector('video-rtc video')).toBeTruthy());
@@ -402,6 +390,7 @@ test('a background re-ask that fails raises no banner', async () => {
 
   setHidden(true);
   setHidden(false);
+  await vi.advanceTimersByTimeAsync(5000);
 
   await vi.waitFor(() => {
     expect(
@@ -412,7 +401,7 @@ test('a background re-ask that fails raises no banner', async () => {
     ).toBe(true);
   });
   // Let the refusal land before reading the screen.
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await vi.advanceTimersByTimeAsync(50);
   expect(
     screen.queryByRole('alert'),
     'the failed background re-ask stays off the banner',

@@ -4,8 +4,6 @@
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
   import Player from '../lib/Player.svelte';
   import PtzDrag from '../lib/PtzDrag.svelte';
-  import Speaker from '../lib/Speaker.svelte';
-  import { audioOn, rememberAudio } from '../lib/audio';
   import { rebuildSchedule } from '../lib/rebuild';
 
   let {
@@ -26,9 +24,6 @@
   let error = $state('');
   /** The lens state the camera reports, never the ack. `null` is unknown. */
   let privacy = $state<boolean | null>(null);
-  /** Audio starts off: a browser only lets a gesture turn it on, and the
-   * choice is remembered per camera. */
-  let listening = $state(audioOn(id));
   /** What the last move did, from the shadow. */
   let move = $state('');
 
@@ -40,9 +35,15 @@
   /** The picture is not moving: 'start' never negotiated, 'frozen' stopped. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
 
-  // A stalled picture heals itself: the screen asks the server again on a
-  // bounded backoff, so a dead peer does not park the person on a still.
-  const rebuild = rebuildSchedule(() => {
+  // A stalled picture heals itself on a bounded backoff: a never-started
+  // one re-asks and remounts, a frozen one only re-asks - its frame is
+  // held, and the quiet note stays until the picture returns.
+  const rebuild = rebuildSchedule((kind) => {
+    if (kind === 'frozen') {
+      void recover();
+      return;
+    }
+    stalled = null;
     waiting = false;
     void start().catch(() => {
       // Best-effort, like recover(): the stall itself is what shows.
@@ -213,13 +214,6 @@
     }
   }
 
-  /** Muting is the element's own video; the speaker is the gesture, and
-   * the choice is remembered per camera. */
-  function toggleListen() {
-    listening = !listening;
-    rememberAudio(id, listening);
-  }
-
   /** One frame of what is on screen, as a file. */
   function snapshot() {
     const video = stage?.querySelector('video');
@@ -238,9 +232,9 @@
     link.click();
   }
 
-  // Audio is negotiated with the stream from the start and kept muted: a
-  // browser only lets a gesture unmute it, and the toggle is that gesture.
-  // Nothing is re-negotiated when it flips; the player owns that.
+  // Audio is negotiated with the stream from the start and starts muted:
+  // the player's own control is the one unmute, and nothing is
+  // re-negotiated when it is used.
 </script>
 
 <main class="screen">
@@ -263,12 +257,12 @@
           {stream}
           {attempt}
           {waiting}
-          muted={!listening}
+          muted
           onsettled={(state) => {
             waiting = false;
             if (state === 'start' || state === 'frozen') {
               stalled = state;
-              rebuild.schedule();
+              rebuild.schedule(state);
               return;
             }
             stalled = null;
@@ -276,7 +270,6 @@
             if (state === 'recovered') void recover();
           }}
         />
-        <Speaker on={listening} ontoggle={toggleListen} />
       {/if}
       {#if waiting}
         <!-- Waking is said, not just shown: a bare black stage with no

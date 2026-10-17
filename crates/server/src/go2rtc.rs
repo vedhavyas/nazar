@@ -5,11 +5,11 @@
 //! lives in the generated config as a named template that camera sources
 //! reference with `#input=`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::Url;
@@ -404,23 +404,40 @@ fn drain_tail(mut stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandl
 /// loopback rtsp listener the generated config already runs. A consumer
 /// on that listener is a viewer as far as go2rtc is concerned, so the
 /// producer stays up between real viewers and a client connects to a
-/// flowing picture.
+/// flowing picture. The consumer's own exit is also the earliest witness
+/// of a spent session: go2rtc keeps reporting the producer connected long
+/// after the frames stopped (measured on the hub: a session death sat
+/// invisible for ~58s until the producer's own read timeout fired).
 pub struct FfmpegHold {
     ffmpeg: PathBuf,
+    /// When each stream's consumer last exited, by stream name.
+    deaths: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl FfmpegHold {
     pub fn new(ffmpeg: PathBuf) -> Self {
-        Self { ffmpeg }
+        Self {
+            ffmpeg,
+            deaths: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
 impl StreamHold for FfmpegHold {
+    fn died_at(&self, name: &str) -> Option<Instant> {
+        self.deaths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .copied()
+    }
+
     fn hold(&self, name: &str) -> Arc<dyn HoldLease> {
         let ffmpeg = self.ffmpeg.clone();
         let target = format!("{RTSP_BASE}/{name}");
         let stream = name.to_owned();
         let attached = Arc::new(AtomicBool::new(false));
+        let deaths = Arc::clone(&self.deaths);
         let worker = {
             let attached = Arc::clone(&attached);
             tokio::spawn(async move {
@@ -463,6 +480,10 @@ impl StreamHold for FfmpegHold {
                                 child.wait().await
                             };
                             attached.store(false, Ordering::SeqCst);
+                            deaths
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(stream.clone(), Instant::now());
                             let reason = match drain {
                                 Some(handle) => {
                                     String::from_utf8_lossy(&handle.await.unwrap_or_default())

@@ -32,6 +32,14 @@ pub trait StreamHold: Send + Sync {
     /// Begin holding `name`; dropping the last reference to the lease
     /// releases the consumer.
     fn hold(&self, name: &str) -> Arc<dyn HoldLease>;
+
+    /// When the hold's own consumer last exited for `name`: the earliest
+    /// honest witness of a spent session, since go2rtc keeps reporting the
+    /// producer connected long after the frames stopped. `None` when the
+    /// hold keeps no such record.
+    fn died_at(&self, _name: &str) -> Option<Instant> {
+        None
+    }
 }
 
 /// A running hold: it releases on drop, and reports whether a real
@@ -436,6 +444,29 @@ impl Supervisor {
 
     /// Start narar's own consumer on `name`, registered so viewer counts
     /// can subtract it. `None` without a configured hold.
+    /// When the hold's own consumer last exited for `name`, if the hold
+    /// keeps such a record.
+    fn hold_died(&self, name: &str) -> Option<Instant> {
+        self.hold.as_ref()?.died_at(name)
+    }
+
+    /// A fresh hold-consumer death is the earliest honest witness of a
+    /// spent session: go2rtc keeps reporting the producer connected long
+    /// after the frames stopped (the hub's death sat invisible ~58s until
+    /// the producer's own read timeout), while the consumer dies with the
+    /// frames. A death well into the session's life re-mints at once; a
+    /// young one is a swap's own churn and is only recorded.
+    fn hold_witness(&self, name: &str, seen: &mut Option<Instant>, last_mint: Instant) -> bool {
+        let Some(died) = self.hold_died(name) else {
+            return false;
+        };
+        if Some(died) == *seen {
+            return false;
+        }
+        *seen = Some(died);
+        last_mint.elapsed() >= self.pacing.mint_settle
+    }
+
     fn start_hold(&self, name: &str) -> Option<HeldStream> {
         let hold = self.hold.as_ref()?;
         let lease = hold.hold(name);
@@ -1026,6 +1057,7 @@ impl Supervisor {
         let mut failed = false;
         let mut stall = Stall::new();
         let mut last_mint = Instant::now();
+        let mut seen_hold_death: Option<Instant> = None;
         loop {
             let now = Instant::now();
             // Waited until the mint is due - sliced, so the producer's
@@ -1058,6 +1090,14 @@ impl Supervisor {
                     && self.state.read().await.contains_key(&low)
                 {
                     held_low = self.start_hold(&low);
+                }
+                if self.hold_witness(&name, &mut seen_hold_death, last_mint) {
+                    tracing::info!(
+                        stream = %name,
+                        "the hold consumer died; re-minting at once"
+                    );
+                    stall.connected = true;
+                    next_mint = Instant::now();
                 }
                 match self.stall_response(&name, &mut stall).await {
                     StallStep::Remint => {

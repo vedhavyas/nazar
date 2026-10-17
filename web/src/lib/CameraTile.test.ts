@@ -267,28 +267,18 @@ test('leaving waking keeps the same player and opens the window', async () => {
   ).toBeTruthy();
 });
 
-test('a tile starts muted with a speaker on it, and remembers the choice', async () => {
+test('a tile starts muted and carries no separate audio control', async () => {
   vi.useFakeTimers();
   liveTile();
   const video = await videoOf();
   await vi.advanceTimersByTimeAsync(600);
 
-  expect(video.muted, 'every tile starts muted').toBe(true);
-  const speaker = screen.getByTestId('speaker');
-  expect(speaker.getAttribute('aria-pressed'), 'the speaker starts off').toBe('false');
+  expect(video.muted, 'every load starts muted').toBe(true);
+  expect(screen.queryByTestId('speaker'), 'the player carries the only control').toBeNull();
   expect(
     screen.queryByRole('button', { name: /^(Listen|Listening)$/ }),
     'no separate Listen button on a tile',
   ).toBeNull();
-
-  speaker.click();
-  await vi.advanceTimersByTimeAsync(600);
-
-  expect(video.muted, 'the speaker unmutes this camera').toBe(false);
-  expect(
-    localStorage.getItem('nazar.audio.cam-1'),
-    'and the choice is remembered per camera',
-  ).toBe('1');
 });
 
 test('a live tile carries no still', () => {
@@ -372,11 +362,14 @@ test('a frozen picture asks for a retry', async () => {
   expect(screen.queryByText(/stopped/), 'one advancing sample is not a freeze').toBeNull();
 
   await vi.advanceTimersByTimeAsync(10000);
-  await failVendoredPlayer(/stopped/);
   expect(
     screen.getByText(/stopped/),
-    'a stalled clock is surfaced once the fallback cannot take it',
+    'a stalled clock is surfaced - quietly, with its frame held',
   ).toBeTruthy();
+  expect(
+    document.querySelectorAll('script[src="/hls.min.js"]').length,
+    'and the fallback is never reached for a picture that painted',
+  ).toBe(0);
 
   screen.getByText('Try again').click();
   expect(onwatch, 'the retry asks for a fresh stream').toHaveBeenCalledWith('cam-1');
@@ -488,32 +481,5 @@ test('a backgrounded tab is never called a stalled picture', async () => {
   expect(document.querySelectorAll('video-rtc').length, 'one player, still').toBe(1);
 });
 
-test('a picture that did not follow us back is started again', async () => {
-  vi.useFakeTimers();
-  const { onwatch } = liveTile();
-  const video = await videoOf();
-  const first = document.querySelector('video-rtc');
-  video.dispatchEvent(new Event('playing'));
-  video.currentTime = 4;
-
-  // Away, and the peer drops while we are not looking: the clock is exactly
-  // where we left it when the tab comes back.
-  setHidden(true);
-  await vi.advanceTimersByTimeAsync(60000);
-  setHidden(false);
-  await vi.advanceTimersByTimeAsync(50);
-
-  expect(
-    document.querySelector('video-rtc'),
-    'the dead player was replaced rather than left on the screen',
-  ).not.toBe(first);
-  expect(
-    document.querySelectorAll('video-rtc').length,
-    'one player at a time, the new one',
-  ).toBe(1);
-  expect(
-    onwatch,
-    'and the server is asked for the stream again: a long absence can outlive it',
-  ).toHaveBeenCalledWith('cam-1');
-  expect(screen.queryByText(/stopped/), 'the recovery is not framed as a failure').toBeNull();
-});
+// The return path is pinned in PlayerSurfaces.test.ts: a suspended tab
+// gets its resumption grace, and only a genuinely stuck peer rebuilds.

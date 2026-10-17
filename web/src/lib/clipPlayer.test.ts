@@ -184,10 +184,14 @@ test('the retry re-mints where the clock stood, not where the clip began', async
   video.dispatchEvent(new Event('playing'));
   video.currentTime = 42;
   await vi.advanceTimersByTimeAsync(5000);
-  // The clock stops: no advance across two samples.
+  // The clock stops: no advance across two samples. A painted picture
+  // holds its frame, so the note comes straight up - no fallback reach.
   await vi.advanceTimersByTimeAsync(11_000);
-  await failVendoredPlayer();
   await vi.waitFor(() => expect(screen.getByText(/may have ended/)).toBeTruthy());
+  expect(
+    document.querySelectorAll('script[src="/hls.min.js"]').length,
+    'no fallback for a picture that painted',
+  ).toBe(0);
 
   screen.getByText('Try again').click();
   expect(
@@ -220,9 +224,11 @@ test('the fallback gets the same watch and re-ask as the socket', async () => {
   await vi.advanceTimersByTimeAsync(5000);
 
   // Away, and the session dies while nobody consumes it: the clock is
-  // where it was on return, and the fallback has nobody else to ask.
+  // where it was on return, and the fallback has nobody else to ask. The
+  // resumption grace runs first and finds the clock still stuck.
   setHidden(true);
   setHidden(false);
+  await vi.advanceTimersByTimeAsync(5000);
 
   await vi.waitFor(() => {
     expect(onseek, 'the fallback re-asks where the clock stood').toHaveBeenCalledWith(
@@ -242,6 +248,7 @@ function setHidden(hidden: boolean) {
 }
 
 test('a tab that comes back asks for the session again', async () => {
+  vi.useFakeTimers();
   const onseek = vi.fn();
   const at = DAY_START + 3 * HOUR;
   render(ClipPlayer, {
@@ -259,9 +266,11 @@ test('a tab that comes back asks for the session again', async () => {
 
   // Away, and the session dies while nobody consumes it: the cloud drops
   // one long before this server's own idle window, so the re-ask is the
-  // only thing that brings the picture back.
+  // only thing that brings the picture back - after the resumption grace
+  // finds the clock still stuck.
   setHidden(true);
   setHidden(false);
+  await vi.advanceTimersByTimeAsync(5000);
 
   await vi.waitFor(() => {
     expect(

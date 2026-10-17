@@ -139,10 +139,20 @@
     // dead stream leaves the last one. No first frame inside the window,
     // then no advancing clock, are the two signals a person can act on.
     const stall = (state: 'start' | 'frozen', playhead?: number) => {
+      if (state === 'frozen') {
+        // A painted picture that stopped holds its last frame: it resumes
+        // in place when the server heals, and reaching for the fallback
+        // would replace the frame with a second dead player under it.
+        frozenHeld = true;
+        onsettled?.('frozen', playhead);
+        return;
+      }
       void engageFallback().then((taken) => {
         onsettled?.(taken ? 'hls' : state, playhead);
       });
     };
+    /** A frozen picture was announced; the next playing clears it. */
+    let frozenHeld = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let watching: ReturnType<typeof setInterval> | null = null;
     let lastTime = -1;
@@ -191,6 +201,12 @@
       paused = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (frozenHeld) {
+        // The picture came back on its own: the held frame resumes and
+        // the quiet note clears, all in place.
+        frozenHeld = false;
+        onsettled?.('recovered');
+      }
       watch();
     };
     const onpause = () => {
@@ -199,8 +215,10 @@
 
     // A background tab is not a stalled picture: Chromium throttles it and
     // may drop the peer behind its back, so the watch stands down while it
-    // cannot see, and the picture is started again on return when the clock
-    // did not follow us back - a dropped peer never re-attaches on its own.
+    // cannot see. On return the clock is given a beat before the peer is
+    // believed dead: the browser suspends media in hidden tabs routinely,
+    // and rebuilding on that alone flashed a reset on every return.
+    let grace: ReturnType<typeof setInterval> | null = null;
     const onVisibility = () => {
       const video = player.querySelector('video');
       if (document.hidden) {
@@ -213,9 +231,28 @@
       }
       const here = video ? video.currentTime : -1;
       if (!playing || (awayAt >= 0 && here <= awayAt)) {
-        fallback = false;
-        rebuilt += 1;
-        onsettled?.('recovered', here >= 0 ? here : undefined);
+        if (grace) return;
+        let tries = 0;
+        grace = setInterval(() => {
+          tries += 1;
+          const now = player.querySelector('video')?.currentTime ?? -1;
+          if (now > here) {
+            // The tab resumed on its own: same player, same picture.
+            if (grace) clearInterval(grace);
+            grace = null;
+            awayAt = -1;
+            lastTime = -1;
+            watch();
+            return;
+          }
+          if (tries >= 4) {
+            if (grace) clearInterval(grace);
+            grace = null;
+            fallback = false;
+            rebuilt += 1;
+            onsettled?.('recovered', now >= 0 ? now : undefined);
+          }
+        }, 1000);
         return;
       }
       // Still the same picture: watch it again from where it stands.
@@ -233,6 +270,7 @@
       if (armStartFor === armStart) armStartFor = null;
       if (timer) clearTimeout(timer);
       if (watching) clearInterval(watching);
+      if (grace) clearInterval(grace);
       video?.removeEventListener('playing', onplaying);
       video?.removeEventListener('pause', onpause);
       document.removeEventListener('visibilitychange', onVisibility);
@@ -261,6 +299,7 @@
     let paused = false;
     let started = false;
     let awayAt = -1;
+    let grace: ReturnType<typeof setInterval> | null = null;
 
     const tick = () => {
       if (paused) {
@@ -297,7 +336,26 @@
       }
       const here = video.currentTime;
       if (!started || (awayAt >= 0 && here <= awayAt)) {
-        onsettled?.('recovered', here >= 0 ? here : undefined);
+        // The same beat as the stage player: a suspended tab's clock
+        // resumes on its own and nothing should reset.
+        if (grace) return;
+        let tries = 0;
+        grace = setInterval(() => {
+          tries += 1;
+          if (video.currentTime > here) {
+            if (grace) clearInterval(grace);
+            grace = null;
+            awayAt = -1;
+            lastTime = -1;
+            watch();
+            return;
+          }
+          if (tries >= 4) {
+            if (grace) clearInterval(grace);
+            grace = null;
+            onsettled?.('recovered', here >= 0 ? here : undefined);
+          }
+        }, 1000);
         return;
       }
       awayAt = -1;
@@ -310,22 +368,27 @@
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
       if (watching) clearInterval(watching);
+      if (grace) clearInterval(grace);
       video.removeEventListener('playing', onplaying);
       video.removeEventListener('pause', onpause);
       document.removeEventListener('visibilitychange', onVisibility);
     };
   });
 
-  // The video element arrives with the connection, so the mute the caller
-  // set has to be re-applied to whatever is on the stage.
+  // The video element arrives with the connection, so the default mute has
+  // to be applied to whatever is on the stage - once per element: from
+  // there the player's own control owns the volume, and a native unmute
+  // is never reverted under the person's finger.
   $effect(() => {
+    const want = muted;
     const timer = setInterval(() => {
-      const video = host?.querySelector('video');
-      if (!video) return;
-      if (video.muted !== muted) {
-        video.muted = muted;
-      }
-      video.volume = muted ? 0 : 1;
+      const video = host?.querySelector('video') as
+        | (HTMLVideoElement & { nazarDefault?: boolean })
+        | null;
+      if (!video || video.nazarDefault) return;
+      video.muted = want;
+      video.volume = want ? 0 : 1;
+      video.nazarDefault = true;
     }, 500);
     return () => clearInterval(timer);
   });
