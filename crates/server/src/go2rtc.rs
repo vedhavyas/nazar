@@ -268,10 +268,13 @@ impl Go2rtc {
 /// carries it, transcoding the camera's HEVC to H.264 and keeping audio,
 /// with the same churn-past start window as the tile chain - the camera's
 /// own chain is what a viewer watches, so a churn-slow start there matters
-/// most.
+/// most. Both audio codecs ride the one producer: WebRTC can carry only
+/// opus (a browser cannot decode aac inside it - measured: the AAC-only
+/// source answers the audio m-line `inactive`), and the HLS fallback keeps
+/// its aac.
 pub fn live_source(mint_url: &str) -> String {
     format!(
-        "ffmpeg:{mint_url}#input={TEMPLATE}#video={H264_PRESET}#audio=aac#starttimeout={START_TIMEOUT_SECS}"
+        "ffmpeg:{mint_url}#input={TEMPLATE}#video={H264_PRESET}#audio=opus#audio=aac#starttimeout={START_TIMEOUT_SECS}"
     )
 }
 
@@ -294,7 +297,7 @@ const START_TIMEOUT_SECS: u32 = 60;
 /// reads the high stream from there.
 pub fn low_source(high_name: &str) -> String {
     format!(
-        "ffmpeg:{high_name}#input={TEMPLATE}#video={H264_PRESET}#width={LOW_WIDTH}#audio=copy#starttimeout={START_TIMEOUT_SECS}"
+        "ffmpeg:{high_name}#input={TEMPLATE}#video={H264_PRESET}#width={LOW_WIDTH}#audio=opus#audio=aac#starttimeout={START_TIMEOUT_SECS}"
     )
 }
 

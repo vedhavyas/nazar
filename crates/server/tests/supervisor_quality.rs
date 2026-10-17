@@ -183,7 +183,7 @@ async fn a_tile_rides_the_hero_stream_and_the_cloud_is_minted_once() {
     assert_eq!(
         low_source,
         format!(
-            "ffmpeg:{DEVICE_ID}-high#input=nazar#video=nazar-h264#width=640#audio=copy#starttimeout=60"
+            "ffmpeg:{DEVICE_ID}-high#input=nazar#video=nazar-h264#width=640#audio=opus#audio=aac#starttimeout=60"
         ),
         "the tile chains off the hero's own stream, inside go2rtc"
     );

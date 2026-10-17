@@ -23,9 +23,11 @@ use server::supervisor::StreamHold;
 fn live_source_references_the_config_template() {
     assert_eq!(
         live_source("rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc"),
-        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=nazar-h264#audio=aac#starttimeout=60",
+        "ffmpeg:rtsps://wowza2.example/hero-iot-live/x_CAMERA_VOD0?token=abc#input=nazar#video=nazar-h264#audio=opus#audio=aac#starttimeout=60",
         "the source names the config's ffmpeg template, selects the one-second-keyframe \
-         preset, and gets the same churn-past start window the tile chain carries"
+         preset, carries both audio codecs (opus for WebRTC, aac for HLS - a browser \
+         cannot decode aac inside WebRTC, and the AAC-only answer SDP showed a dead \
+         audio m-line), and keeps the churn-past start window"
     );
 }
 
@@ -33,9 +35,10 @@ fn live_source_references_the_config_template() {
 fn low_source_chains_off_the_high_stream_by_name() {
     assert_eq!(
         low_source("cam-1-high"),
-        "ffmpeg:cam-1-high#input=nazar#video=nazar-h264#width=640#audio=copy#starttimeout=60",
+        "ffmpeg:cam-1-high#input=nazar#video=nazar-h264#width=640#audio=opus#audio=aac#starttimeout=60",
         "the tile rides the high stream inside go2rtc - no second mint, one cloud consumer - \
-         with a one-second-keyframe preset and a start window past the churn"
+         with a one-second-keyframe preset, both audio codecs (the tile's WebRTC needs \
+         opus too), and a start window past the churn"
     );
 }
 
