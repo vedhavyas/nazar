@@ -103,6 +103,8 @@ print({k: c.get(k) for k in ("aud", "iss", "exp", "email")})
 
 ### Step 1a - browser attempt with THAT client id [VED: one browser consent, may fail before consent]
 
+**RESULT (2026-10-16, run mechanically):** `redirect_uri_mismatch` - the page landed on `accounts.google.com/signin/oauth/error?authError=...` whose base64 decodes to `redirect_uri_mismatch`, exactly as predicted. No consent spent; the web-client id cannot be driven from this machine without GCP console access (Hero's project - a gate, not a step).
+
 Open this URL in any browser (being signed into Ved's Google account, the one the Qubo app uses):
 
 ```
@@ -126,6 +128,10 @@ client, which needs GCP console access to project 398700023943 (Hero's project; 
 a step in this recipe).
 
 ### Step 1b - browser attempt with the Android client id [VED: one browser consent]
+
+**RESULT (2026-10-16, run with Ved's sign-in):** both browser flows refused by Google BEFORE any consent. `response_type=id_token` landed on `signin/oauth/error` with `invalid_request` ("Access blocked: Qubo's request is invalid"); the doc's code + PKCE fallback (`response_type=code`, S256 challenge, the same custom-scheme redirect) landed on the same `invalid_request` for the same client. The Android client cannot be driven from a plain browser either, and the web client cannot without registering a redirect in Hero's GCP project (a gate). **Conclusion: a headless browser mint does not exist.** The durable path is the one-time app-minted token (the Step 0 logcat control run - the genuine app is the only thing that can mint this client's token, which is presumably the point): its exchange returns the refreshToken, and the refresh route renews forever after. The login screen's Google button therefore has no mint to call in v1; the exchange route (`POST /api/login/google`) stays, fed once with an app-minted token.
+
+**Attempts against the app itself (2026-10-16, all walled):** the app's logcat never prints its ID token in this build (three sign-ins incl. a manual one; a full-buffer JWT scan is empty) and it pins its TLS (every PCAPdroid capture, third-party and manual, carries only ciphertext even with the MITM addon; the same holds for the chase's own 14-Oct captures), no root on the phone, `allowBackup=false` blocks adb backup, and its external storage holds only cached stills. A Play-Store emulator (API 30, arm64) runs the app fine but Play images are `user` builds (no adb root, measured), and the read-from-the-AVD-userdata route was abandoned by Ved's call before the account sign-in - the emulator UX made the sign-in impractical (clipboard dead, recovery challenge expiring, no cross-device flow on the 2020-era sign-in stack). The durable token therefore remains pending a capture route; the OTP re-test (below) is the live thread.
 
 Loopback is NOT allowed for Android-type clients - Google's auto-registered redirect for an Android
 client is the custom scheme `com.googleusercontent.apps.<client-id-without-suffix>:/oauth2redirect`.

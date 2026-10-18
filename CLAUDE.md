@@ -13,8 +13,8 @@ Status: designed - the approved design is `docs/design.md` (the contract the imp
 
 ## Hard facts from the research (do not re-derive)
 
-- Login: phone OTP sessions last 1h with NO refresh token; Google sign-in returns a refreshToken (durable path). Email is display-only on phone-created accounts.
-- Streaming: per-session RTSPS mint (`/stream-manager/.../v1/live/...`), session ~5 min, one unconsumed URL dies ~1 min; go2rtc + ffmpeg transcode works (see the spike).
+- Login: the raw phone-OTP verify gives a 1h session with no refresh token, BUT the app's own OTP login does not stay there - its profile-select step mints a refreshToken with a 180-day expiry (measured in-app 2026-10-16, docs/qubo-findings.md). Google sign-in also returns a refreshToken (durable path). Email is display-only on phone-created accounts.
+- Streaming: per-session RTSPS mint (`/stream-manager/.../v1/live/...`); the URL is one-shot per attach - after its first consumer leaves (or after any failed attach) the same URL is dead, so retries must re-mint, and the camera's push can lag seconds after a mint (measured 2026-10-16, spec section on the mint). go2rtc + ffmpeg transcode works (see the spike).
 - Controls: PUT command envelope `{topic, payload:{devices:{deviceUUID, services:{<svc>:{attributes...}}}}}`; the camera ACKs everything 200 regardless - always read the shadow back.
 - MQTT: username = account userUUID, password = a live accessToken; topics `/monitor/<unit>/<device>/<svc>`, `/control/...`, `/config/<unit>`.
 - P2P: pairing is relay-initiated and the relay's forwarding is armed server-side for genuine app-session SDK sessions; a standalone client cannot trigger it. The real app's own sessions may inherit this - verify when built.
@@ -25,3 +25,6 @@ Status: designed - the approved design is `docs/design.md` (the contract the imp
 - Brainstorm -> plan -> approve -> build. Workers build; the lead reviews every PR substantively before merge.
 - No hand-rolled infrastructure where a solid tool exists (go2rtc sidecar over custom streaming glue, and so on).
 - Private repo on the personal account; no AI/process mentions in any commit, PR, or doc text.
+- Release tags (`git tag` + push, and the CI publish they trigger) are routine in this repo - no per-action approval (Ved, 2026-10-15, when the first tag unblocked the hub module).
+- A release tag bumps the workspace version first (bump -> commit -> tag): /api/health reports CARGO_PKG_VERSION, so a tag cut without the bump reports one version behind.
+

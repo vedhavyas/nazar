@@ -104,9 +104,9 @@ All flows live in `qubopy/auth.py` (class `QuboAuth`) plus the CLI persistence i
   - `QuboClient.request` reacts to HTTP 401 by refreshing once (with the failed token, to defeat the lock's double-check) and retrying the request exactly once; a second 401 raises `QuboAuthError` (qubopy/client.py:102-149).
 - Status: VERIFIED-HW (README auth section: "proactively refreshes the access token before expiration using POST /auth/refresh"). The exact token TTL for email sessions is unknown (derived from the JWT `exp` at runtime; README implies a long-lived continuous session).
 
-### 3.3 Phone + SMS OTP (1-hour session)
+### 3.3 Phone + SMS OTP (1-hour wire session; the app mints a durable pair on profile select)
 
-Two steps, no refresh token on this route.
+Two steps. The wire session is 1 hour and the verify call itself returns no refresh token - but the app's own OTP login does NOT stay on this route: after profile selection it mints a durable refresh token (180 days). See the measured-in-app bullet below and `docs/qubo-findings.md` ("the app-side answer").
 
 Request OTP:
 
@@ -123,6 +123,7 @@ Verify OTP:
 - Response: a single JSON object (wrapped into a one-element list) or a JSON list of account profiles (qubopy/auth.py:293-298). Each profile's fields read: `accessToken` (or `token`), `uuid` (or `userUUID` or `userId`), optional `refreshToken` (qubopy/auth.py:341-350). The CLI also reads `name` and `email` per profile for display (qubopy/cli.py:276-279).
 - The 1-hour limit: the README states phone sessions live exactly 1 hour (`exp: 3600s`) and the phone route issues no `refreshToken` (README, "Phone Number and SMS OTP"). The code does not hardcode 3600; it derives expiry from the JWT `exp` claim, and the CLI's error handler prints "Phone OTP tokens are valid for 1 hour" (qubopy/cli.py:169). Treat "1 hour" as a server-side property confirmed by README + observed error text, not by code logic.
 - **Measured 2026-10-13:** the session JWT carried `iat` 11:42:33 and `exp` 12:42:33 - exactly 3600s - and the session then failed with "Session expired; please log in again". No refresh token exists on this route, so the hour is hard; a durable client needs the email/password route (section 3.1), and no email-code login exists on the gateway (eight candidate endpoints probed, all 404; `/user/login` rejects OTP-shaped bodies with `ERR_SM_004 Invalid username or password`).
+- **Measured 2026-10-16 (in-app, rootable emulator):** the raw verify response (profile list, one profile per account, each with a 1h `token`) is NOT the whole app flow. The app's profile-select step runs a native `MobileUserManager.userPhoneLogin` call whose response it stores; read back from the app's own `hero_iot.db` (user table) and `shared_prefs` minutes after an OTP login, that response carried a 1h `accessToken` (sub `USER`) **plus a `refreshToken` JWT with `sub: USER_REFRESH` and `exp - iat = 180 days`**, an `mqttPassword` (PBKDF2$sha256$...), `accountType` `GM` and `gmLoginId` set. So "no refresh token on this route" is true of the raw verify call only; the app's OTP path is durable for 180 days. **The mint call is pinned and wire-verified** - `POST /user/emailprofile/login` with body `{"deviceAttribute": "<M|M|P>", "username": "<profile email>"}` and the profile's token as `Subscriber-Key`; the full recipe, headers and the capture method are in `docs/qubo-findings.md` ("the app-side answer").
 - Errors: HTTP != 200 -> `QuboAuthError` (status only); network -> `QuboConnectionError`; unexpected body type -> `QuboAuthError` (qubopy/auth.py:286-302). Inconsistency: unlike email login, `request_phone_otp` does not catch `json.JSONDecodeError`, so a malformed body escapes as a raw `JSONDecodeError` (qubopy/auth.py:240-251).
 - Status: VERIFIED-HW (README auth row; quick start method B).
 
@@ -134,6 +135,7 @@ A phone number can map to multiple Qubo accounts. After verify, the returned pro
 - `select_profile` adopts the chosen profile's tokens (qubopy/auth.py:329-359).
 - CLI behavior: interactive picker when more than one profile and a TTY is present (qubopy/cli.py:273-283, 370-380); non-interactive selection via `--profile-index` or `--account-uuid` (qubopy/cli.py:670-679). When the selected profile has an `email`, it is stored in the session file (qubopy/cli.py:297-302).
 - Status: VERIFIED-HW (README: "detects multiple profiles and allows interactive selection or targeted selection via --profile-index or --account-uuid").
+- In the app the selection is not purely local: picking a profile triggers a native `MobileUserManager.userPhoneLogin(UserDto)` call and the picked profile's tokens (including the 180-day `refreshToken`) are committed only at that point - measured 2026-10-16, see section 3.3's in-app bullet. Ved's number <phone-number> maps to two accounts (uuid `10000000-...`, <family-email>; uuid `10000000-...`, <family-email>), and the app's picker shows exactly those two.
 
 ### 3.5 What carries the token
 
@@ -418,6 +420,7 @@ README: "Streaming URLs minted by Qubo cloud are single-consumer sessions (each 
 
 - **The Wowza path is per login session.** All mints from one session share one path; mints from different sessions get different paths. Within a session the LAST mint wins - every URL of that session then serves that camera (proven byte-identical frames). Different sessions serve different cameras simultaneously (three sessions, three cameras, concurrent, verified with frames).
 - **Unconsumed URLs expire fast.** A minted URL that nobody connects to dies within about a minute (404 on a later connect). Once connected, the session streams steadily (90 seconds held, 899 frames, no cut) and ends after roughly five minutes (observed EOF cadence ~5 min), so clients re-mint on reconnect.
+- **Sharpened 2026-10-16: the URL is one-shot per attach.** A fresh mint attaches promptly and plays, but after its first consumer attaches and leaves, every later attach to the SAME URL 404s - measured at +7s and +9s after a +1s success, well inside the old five-minute claim. A wrong-token attach consumes that one slot too (wowza did not validate the token on this path). Multiple clients therefore share one producer (the earlier "multi-consumer" observation is go2rtc sharing a single attach), and any retry path must RE-MINT and swap the source rather than reconnect to a URL that has been attached once. The camera's push can also lag intermittently after a mint (one cold attempt 404'd for 52s, while later mints on the same device id attached in ~1s), so a retry loop needs both a fresh URL and patience. Found on the hub as the live-open defect (task f9861050).
 - **The README's "single-consumer" claim did not reproduce:** one minted URL served three simultaneous consumers, all streaming, zero errors.
 
 ### No open LAN RTSP / ONVIF
@@ -615,7 +618,7 @@ Extracted 2026-10-14 from the installed APK (`com.hero.iot`, pulled via adb from
 
 **Auth, account, devices (sms family)**
 - `/sms/api/v1/sp/{sp}/user/login?system=CS` - email+password login (section 3.1)
-- `/sms/api/v1/sp/{sp}/user/emailprofile/login` - email-profile login (different route from the above; bodies unverified)
+- `/sms/api/v1/sp/{sp}/user/emailprofile/login` - the profile-select mint: body `{"deviceAttribute": "<MANUFACTURER>|<MODEL>|<PRODUCT>", "username": "<profile email>"}`, the profile's verify token as `Subscriber-Key`; returns the durable pair (1h accessToken + 180-day refreshToken). VERIFIED live 2026-10-16 - recipe in `docs/qubo-findings.md` ("the app-side answer")
 - `/sms/api/v1/sp/{sp}/user/phone/login` + `/user/phone/verify` - phone OTP (section 3.3)
 - `/sms/api/v1/sp/{sp}/users/{uuid}/auth/refresh` - token refresh (section 3.2)
 - `/sms/api/v1/sp/{sp}/user/changePassword` - set/change password (the route to a durable email login)

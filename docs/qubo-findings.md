@@ -781,3 +781,60 @@ Ran the reference flow against the hub's own OTP login (fresh that morning, from
 - The relay never engaged in 10.0s despite a byte-faithful register; endP2pCall torn down cleanly.
 
 Read: the relay gate is still shut for our session class, even freshly minted by the server. The camera-side half demonstrably works up to the relay wait. The kill-switch decision (M6 Task 2 Step 3) runs with the ported Rust engine and the server's own arm path before any conclusion - this run is a strong early signal, not the verdict.
+
+### 2026-10-16, later: the ported engine's run - THE VERDICT
+
+The ported Rust engine (byte-vector-reviewed) ran against a second fresh hub login, with the SDK's SYN beat held for the whole window (`--hold-beat`). Same shape one layer down: allocation 200 (relay 13.204.183.153:48532), token 200, candidates offered, `startP2pCall` published, the camera answered `p2pCallStarted` in ~3s with its candidates - then `Handshake { timeout: 10s, relay_engaged: false }`. The beat did not move it.
+
+**Conclusion, three independent runs deep:** the relay pairs only sessions its own side recognises as the official SDK's - a server-side arming policy nothing reachable from outside the app reproduces, beating or no beating. The fast lane is closed for this client class; the cloud path stands as the design's primary and fully carries live view.
+
+## 2026-10-16: phone-OTP hour boundary - ENFORCED at the wire
+
+Ved asked for a real measurement of the "one hour" claim (two live sessions, both minted through the phone-OTP verify with the app's own request shape):
+
+- Session A: minted 09:21:00Z, exp 10:21:00Z. Probed 10:30:59Z (+9min past exp) -> **HTTP 401 `ERR_AUTH_002` "User Token expired, Access denied"**.
+- Session B: minted 09:41:50Z, exp 10:41:50Z. Probed 10:30:59Z (inside its hour) -> **HTTP 200 served**.
+- The hub independently confirms: holding session A, its MQTT monitor feed was refused from 10:23:18Z ("User Token expired, Access denied") ~2min past expiry, with no self-recovery.
+
+So for tokens minted by the raw OTP routes (v1 phone/login+verify, v4 v1-verify), iat+3600 is a HARD server-side boundary - the hour is not a client-side convention. Both raw routes also return NO refreshToken field (measured today on the app's exact request shape: response keys are `email, name, token, uuid`).
+
+That does NOT yet explain Ved's long-lived app sessions: the app's native layer holds refresh machinery (`MobileUserManager.getRefreshToken()`, `/auth/refresh`, "refresh token from cloud" strings, and the app stores `KEY_REFRESH_TOKEN`/`ServerInfo.saveUserInformation(uuid, accessToken, refreshToken)` after OTP login). Something in the app path obtains a durable credential the raw REST verify does not - under investigation via the emulator (log in through the real app, watch what tokens get minted/stored).
+
+## 2026-10-16: the app-side answer - OTP DOES mint a durable refreshToken (Ved was right)
+
+Ved's pushback ("OTP is not short-lived... without actually properly testing") was correct. Instrument: the rootable emulator (google_apis userdebug, `adb root` works), the real app (v3.3.42, pulled APKs), frida for the root-check bypass - then the app's private data read directly as root.
+
+**What the app holds after a phone-OTP login** (read from `/data/user/0/com.hero.iot/` minutes after the login, verbatim):
+
+- `databases/hero_iot.db`, `user` table: `accessToken` (JWT, sub `USER`, iat+3600), **`refreshToken` (JWT, sub `USER_REFRESH`, exp-iat = 180 days)**, `mqttPassword` (PBKDF2$sha256$901$...), `accountType` `GM`, `gmLoginId` `<family-email>`, phone, uuid `10000000-...`, `isdCode +91`.
+- `shared_prefs/com.hero.iot_preferences.xml`: `userUUID`, **`refreshToken`**, `subscriberKey` (a 1h sub `USER` JWT), `username` `uuid:expiry`; other keys empty until login commits.
+- `shared_prefs/hero_iot_pref.xml` (encrypted store): `is_login=true`, encrypted `access_token`/`login_type`/`user_id` (the `access_token` here is a different, longer value - EncryptedSharedPreferences ciphertext).
+
+**Where it comes from.** The verify response on the wire is a LIST of account profiles - one per account the phone maps to (Ved's number: `10000000-...`/<family-email> and `10000000-...`/<family-email>), each carrying a 1h `token`, no refreshToken. The app then shows "Choose your profile"; picking one runs a native `MobileUserManager.userPhoneLogin(UserDto)` (native log string "Post user Phone Login url : %s"; decompile: the fragment's profile-select handler calls it and `ServerInfo.saveUserInformation(uuid, accessToken, refreshToken)` follows), and THAT response carries the durable pair. The refreshToken's iat matches the verify moment, and the prefs commit at the pick - consistent with: mint at profile-select, commit on pick.
+
+**The mint call, pinned (2026-10-16, captured from the app's own wire and replayed successfully):**
+
+```
+POST /sms/api/v1/sp/{sp}/user/emailprofile/login
+Content-Type: application/json
+App-Id: <app constant>          App-Type: HOME
+Login-Device-Name: <device>     Source: ANDROID
+Source-Device-Id: <android id>  Subscriber-Key: <the chosen profile's 1h token from verify>
+Token-Type: USER                User-UUID: <the chosen profile's uuid>
+
+{"deviceAttribute": "<MANUFACTURER>|<MODEL>|<PRODUCT>", "username": "<the chosen profile's EMAIL>"}
+
+-> 200 {"accessToken": <1h JWT sub USER>, "refreshToken": <180d JWT sub USER_REFRESH>, "newUser": false, "uuid": ...}
+```
+
+How it was pinned: the app's native `MobileUserManager.userPhoneLogin(UserDto)` was called through frida against the running app with a curl `CURLOPT_POSTFIELDS` hook installed (the Qubo API is HTTP/2 over the app's libcurl, so no ASCII request line reaches SSL_write; the curl-layer hook is the instrument). The captured body was exactly the two fields above. Replayed from this machine against the live account: HTTP 200, and the returned JWTs decode to iat+3600 and iat+15552000 (180 days) - the durable pair. The profile token from the verify response works as the Subscriber-Key (an existing session token works too). Routes ruled out on the way: `/user/login?system=USER` (`ERR_SM_014`), `system=GM` (500 `ERR_UNKNOWN_001`), `system=CS` (email-password semantics), `PUT /users/{uuid}/phone` ("Phone already registered"), `PUT /user/phone?tempUUID=` (`ERR_SM_026`).
+
+**Instrument note (root detection).** The app refuses to run on a rooted device: `BaseActivity.onCreate` runs a vendored RootBeer fork whose PATH-scan found `/system/xbin/su` ("Device is untrusted", toast + finish, plus a non-cancelable dialog from the splash). Defeated for instrumentation only: frida 16.7.19 (17.x crashes on this Android 11 emulator, sigchain assertion) + hooks on `com.scottyab.rootbeer.RootBeer.isRooted`, `java.io.File.exists` for `*/su` paths, and the toast/finish pair. The app under test is the genuine APK; nothing was repacked. Also of note: `pm clear` resets runtime permissions, so they must be re-granted (`pm grant`) before the app will pass its own permission flow.
+
+## 2026-10-16: the arm run on a genuine session - NEGATIVE (the fast lane's gate, closed)
+
+M6's Task 2 re-ran the arm against the hub's own genuine login (freshly minted that morning), from the ported Rust engine with the SDK's SYN beat held for the whole window. The camera-side protocol was healthy end to end - alloc 200, device-access token 200, candidates offered, `startP2pCall` published, the camera answering `p2pCallStarted` in ~3s - and the relay never engaged: `Handshake { timeout: 10s, relay_engaged: false }`.
+
+Three independent runs now agree (the chase's Python rounds, the morning pre-check that additionally saw the camera's own probe reach us and get acked, and this held-beat run with a genuine session): **the relay arms only sessions its own side recognises as the official SDK's. Our session class is never forwarded, and nothing reachable from outside the app reproduces that recognition** - the arming gate is cloud-side, the standalone client's ceiling. The full transcript is in `docs/plans/2026-10-15-nazar-m6.md` (Results); the chase chronology and the W4b/W5 resolutions are carried on the m6-fast-lane branch's copy of this file, which moves to main with the chain.
+
+Consequence: live view stays on the cloud path (the design's primary, fully working); the fast lane ships in the code behind `NAZAR_PREFER_P2P` (off) with every fallback in place, ready if the relay's policy ever changes; talkback's live acceptance stands recorded as blocked on the same gate.
