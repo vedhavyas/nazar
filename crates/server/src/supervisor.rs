@@ -265,6 +265,9 @@ struct Stall {
     /// is given ever-longer windows instead of a metronome that replaces
     /// its URL forever. A connect resets it.
     mints_unconnected: u32,
+    /// The run's last mint refusal: the cloud's own reason outranks the
+    /// generic producer line while the run is open.
+    mint_error: Option<String>,
 }
 
 impl Stall {
@@ -276,6 +279,7 @@ impl Stall {
             wait: Duration::ZERO,
             connected: false,
             mints_unconnected: 0,
+            mint_error: None,
         }
     }
 
@@ -299,7 +303,45 @@ impl Stall {
         self.reported = false;
         self.attempts = 0;
         self.wait = Duration::ZERO;
+        self.mint_error = None;
         Some(out)
+    }
+}
+
+/// Why a mint did not take. `stale_source` marks the cloud's definitive
+/// "device is offline": the URL the stream holds cannot serve until the
+/// camera is back.
+#[derive(Debug)]
+struct MintFailure {
+    reason: String,
+    stale_source: bool,
+}
+
+impl MintFailure {
+    fn transient(reason: String) -> Self {
+        Self {
+            reason,
+            stale_source: false,
+        }
+    }
+
+    /// A refused mint. Anything but the offline code may clear on the next
+    /// attempt, so only that one condemns the source.
+    fn from_error(err: &qubo::QuboError) -> Self {
+        if matches!(err, qubo::QuboError::Api { code, .. } if code == "ERR_STM_010") {
+            Self {
+                reason: "device offline in the cloud".to_owned(),
+                stale_source: true,
+            }
+        } else {
+            Self::transient(redact(&err.to_string()))
+        }
+    }
+}
+
+impl From<String> for MintFailure {
+    fn from(reason: String) -> Self {
+        Self::transient(reason)
     }
 }
 
@@ -1142,6 +1184,7 @@ impl Supervisor {
             next_mint = match self.mint_and_swap(&device, Quality::High).await {
                 Ok(()) => {
                     failed = false;
+                    stall.mint_error = None;
                     // The ladder counts fresh mints that never connected;
                     // a mint that replaced a connected producer starts it
                     // over (this mint's own connect resets it too, in the
@@ -1169,9 +1212,8 @@ impl Supervisor {
                     }
                     Instant::now() + self.pacing.remint
                 }
-                Err(reason) => {
-                    tracing::warn!(stream = %name, %reason, "stream re-mint failed");
-                    self.mark_degraded(&name, reason).await;
+                Err(failure) => {
+                    stall.mint_error = Some(self.settle_mint_failure(&name, failure).await);
                     failed = true;
                     // The starvation clock is not restarted: a refused mint
                     // is another way the picture is dead, not a fresh
@@ -1195,7 +1237,7 @@ impl Supervisor {
     /// over its bound, a session that ended, or a lane benched after media
     /// silence - falls back to the cloud mint for that pass, and a benched
     /// lane is retried once its cooldown elapses.
-    async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), String> {
+    async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), MintFailure> {
         let name = stream_name(&device.device_id, quality);
         if let Some(lane) = &self.lane
             && self.prefer_p2p.contains(&device.device_id)
@@ -1242,7 +1284,7 @@ impl Supervisor {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);
-                return Err(redact(&err.to_string()));
+                return Err(MintFailure::from_error(&err));
             }
         };
         self.put_and_confirm(&name, &live_source(&mint.url)).await?;
@@ -1386,16 +1428,20 @@ impl Supervisor {
             return StallStep::Idle;
         }
         if waiting >= self.pacing.connect_window {
+            let reason = stall
+                .mint_error
+                .clone()
+                .unwrap_or_else(|| "the producer has not connected".to_owned());
             if !stall.reported {
                 tracing::warn!(
                     stream = %name,
                     ?waiting,
-                    "the producer has not connected; giving the reason"
+                    %reason,
+                    "the stall passed its window; giving the reason"
                 );
                 stall.reported = true;
             }
-            self.mark_degraded(name, "the producer has not connected".to_owned())
-                .await;
+            self.mark_degraded(name, reason).await;
         } else {
             self.mark_waking(name).await;
         }
@@ -1516,6 +1562,26 @@ impl Supervisor {
         {
             tile.state = StreamState::Waking;
         }
+    }
+
+    /// A refused mint: report it, and drop the source when the cloud says
+    /// the device is offline (the URL we hold cannot serve until it is
+    /// back, and leaving it has go2rtc dialling a dead source). Returns
+    /// the reason the run carries.
+    async fn settle_mint_failure(&self, name: &str, failure: MintFailure) -> String {
+        tracing::warn!(
+            stream = %name,
+            reason = %failure.reason,
+            "stream re-mint failed"
+        );
+        if failure.stale_source
+            && let Err(err) = self.go2rtc.delete_stream(name).await
+        {
+            tracing::debug!(stream = %name, %err, "the stale source could not be dropped");
+        }
+        let reason = failure.reason;
+        self.mark_degraded(name, reason.clone()).await;
+        reason
     }
 
     async fn mark_degraded(&self, name: &str, reason: String) {

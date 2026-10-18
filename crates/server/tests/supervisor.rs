@@ -1454,13 +1454,13 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
     let degraded = common::eventually(|| async {
         matches!(
             h.supervisor.status(DEVICE_ID).await,
-            StreamState::Degraded { reason } if reason == "the producer has not connected"
+            StreamState::Degraded { reason } if reason == "http error: 500 Internal Server Error"
         )
     })
     .await;
     assert!(
         degraded,
-        "the window lands on its own deadline despite the refused mints: {:?}",
+        "the window lands on its own deadline and carries the mint's reason: {:?}",
         h.supervisor.status(DEVICE_ID).await
     );
     // The premise provably ran: the refused mints actually happened.
@@ -1468,6 +1468,113 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         mint_count(&h.qubo).await >= 2,
         "a refused mint ran mid-stall: {} mints",
         mint_count(&h.qubo).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A device the cloud reports offline can never serve the URL we hold:
+/// the stale source is dropped, and the cloud's reason is what the tile
+/// keeps saying instead of the generic producer line.
+#[tokio::test]
+async fn an_offline_mint_failure_drops_the_stale_source_and_keeps_the_reason() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    // The first mint lands; every re-mint is refused because the device
+    // has gone offline in the cloud.
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let refused = common::eventually(|| async { mint_count(&h.qubo).await >= 2 }).await;
+    assert!(refused, "the re-mint runs");
+
+    let dropped = common::eventually(|| async {
+        h.go2rtc
+            .ops()
+            .into_iter()
+            .rev()
+            .find(|op| op.ends_with(&name))
+            .is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(dropped, "the stale source is dropped: {:?}", h.go2rtc.ops());
+
+    let reason = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "device offline in the cloud"
+        )
+    })
+    .await;
+    assert!(
+        reason,
+        "the cloud reason is carried, not the generic line: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    // The stall's own window must not launder it back to the generic line.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "device offline in the cloud"
+        ),
+        "the reason survives the window re-assert: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A transient refusal is not proof the URL is dead: the source stays
+/// while the loop keeps its backoff.
+#[tokio::test]
+async fn a_transient_mint_failure_keeps_the_stale_source() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "http error: 500 Internal Server Error"
+        )
+    })
+    .await;
+    assert!(degraded, "the refusal degrades the stream");
+    let last = h
+        .go2rtc
+        .ops()
+        .into_iter()
+        .rev()
+        .find(|op| op.ends_with(&name));
+    assert_eq!(
+        last,
+        Some(format!("put:{name}")),
+        "a transient refusal keeps the source: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

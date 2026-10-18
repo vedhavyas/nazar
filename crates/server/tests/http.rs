@@ -459,6 +459,51 @@ async fn the_camera_page_carries_the_degraded_reason() {
 }
 
 #[tokio::test]
+async fn the_camera_page_carries_the_cloud_offline_reason() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string(r#"{"code":"ERR_STM_010","message":"device is offline"}"#),
+        )
+        .mount(&h.qubo)
+        .await;
+    let browser = client();
+
+    let _ = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+
+    // The refusal comes from the stream's own loop, a moment later.
+    let mut page = Value::Null;
+    for _ in 0..50 {
+        page = browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json");
+        if page["cameras"][0]["state"] == json!("degraded") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(page["cameras"][0]["state"], json!("degraded"));
+    assert_eq!(
+        page["cameras"][0]["reason"],
+        json!("device offline in the cloud"),
+        "the cloud's offline reason reaches the browser"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+#[tokio::test]
 async fn login_otp_forwards_to_the_gateway() {
     let h = harness().await;
     Mock::given(method("POST"))
