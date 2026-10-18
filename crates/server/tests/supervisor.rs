@@ -157,6 +157,11 @@ fn released_last(h: &Harness) -> bool {
         .is_some_and(|op| op.starts_with("delete:"))
 }
 
+/// The last streams operation for `name`, as `put:<name>` or `delete:<name>`.
+fn last_op(ops: &[String], name: &str) -> Option<String> {
+    ops.iter().rev().find(|op| op.ends_with(name)).cloned()
+}
+
 /// The stream's state once its loop has taken a position: the first mint
 /// runs in the loop, so `Waking` is what a fresh registration reads.
 async fn settled(supervisor: &Supervisor) -> StreamState {
@@ -1534,6 +1539,110 @@ async fn an_offline_mint_failure_drops_the_stale_source_and_keeps_the_reason() {
         ),
         "the reason survives the window re-assert: {:?}",
         h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile rendition has no cloud URL of its own: when the offline
+/// refusal drops the high's source, the low must stop dialling it too.
+#[tokio::test]
+async fn an_offline_drop_removes_the_low_chain() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low chain registers");
+    h.go2rtc.set_viewers(&high, 1);
+
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(
+        dropped,
+        "both chains are dropped off the offline high: {:?}",
+        h.go2rtc.ops()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The low has no cloud URL of its own: after an offline drop, the next
+/// successful mint must rebuild it off the recovered high.
+#[tokio::test]
+async fn a_mint_after_an_offline_drop_rebuilds_the_low_chain() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low chain registers");
+    h.go2rtc.set_viewers(&high, 1);
+
+    // The rebuild is only meaningful after the drop: wait for both gone.
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop removes both first: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The camera is back: the next mint rebuilds the high, and the
+    // reconcile rebuilds the low off it.
+    mint_mock(200, &mint_body("again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    let rebuilt = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("put:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("put:"))
+    })
+    .await;
+    assert!(
+        rebuilt,
+        "the next mint rebuilds the high and reconciles the low: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

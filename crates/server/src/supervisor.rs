@@ -1574,14 +1574,27 @@ impl Supervisor {
             reason = %failure.reason,
             "stream re-mint failed"
         );
-        if failure.stale_source
-            && let Err(err) = self.go2rtc.delete_stream(name).await
-        {
-            tracing::debug!(stream = %name, %err, "the stale source could not be dropped");
+        if failure.stale_source {
+            // The device is offline in the cloud: neither the high's URL
+            // nor the low chain that dials it can serve. Dropping both
+            // stops go2rtc dialling a dead source; reconcile_low rebuilds
+            // the low on the next successful mint.
+            self.drop_source(name).await;
+            if let Some(low) = low_name_of(name) {
+                self.drop_source(&low).await;
+            }
         }
         let reason = failure.reason;
         self.mark_degraded(name, reason.clone()).await;
         reason
+    }
+
+    /// Drop a stream's source; an absent entry's delete finds nothing and
+    /// is not an error.
+    async fn drop_source(&self, name: &str) {
+        if let Err(err) = self.go2rtc.delete_stream(name).await {
+            tracing::debug!(stream = %name, %err, "the stale source could not be dropped");
+        }
     }
 
     async fn mark_degraded(&self, name: &str, reason: String) {
