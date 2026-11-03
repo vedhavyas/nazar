@@ -132,9 +132,11 @@ test('a retile drops the stale reason and detail', async () => {
   const detail =
     'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)';
   let hang = false;
+  const calls: string[] = [];
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string) => {
+      calls.push(String(url));
       if (url === '/api/cameras') {
         if (hang) return new Promise<Response>(() => {});
         return json({
@@ -173,4 +175,6 @@ test('a retile drops the stale reason and detail', async () => {
   expect(shown().state, 'the retile asks for a fresh stream').toBe('waking');
   expect(shown().reason, 'and drops the old reason').toBe(null);
   expect(shown().details, 'and the detail with it').toBe(null);
+  const retiled = calls.filter((url) => url.includes('/live?')).pop();
+  expect(retiled, 'the retile pulls the mint forward').toContain('retry=true');
 });
