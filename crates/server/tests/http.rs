@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,10 +45,12 @@ struct Harness {
     qubo: MockServer,
     data_dir: PathBuf,
     go2rtc: common::FakeApi,
+    /// The stand-in the probe dials when the test does not replace it.
+    _rtsp: Option<common::RtspStandIn>,
 }
 
-async fn harness() -> Harness {
-    harness_with(Pacing {
+fn test_pacing() -> Pacing {
+    Pacing {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
@@ -60,13 +63,37 @@ async fn harness() -> Harness {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
-    })
-    .await
+    }
+}
+
+async fn harness() -> Harness {
+    harness_with(test_pacing()).await
 }
 
 async fn harness_with(pacing: Pacing) -> Harness {
+    harness_with_api(pacing, None, None).await
+}
+
+/// The harness with the go2rtc API base and RTSP address overridden - the
+/// proxy and the health probe share the base - so a test can point the
+/// probe at a dead, wedged or foreign engine while the rest talks to the
+/// fake.
+async fn harness_with_api(
+    pacing: Pacing,
+    api: Option<String>,
+    rtsp: Option<SocketAddr>,
+) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let stand_in = match rtsp {
+        Some(_) => None,
+        None => Some(common::RtspStandIn::start().await),
+    };
+    let rtsp_addr = rtsp.unwrap_or_else(|| stand_in.as_ref().expect("a stand-in").addr());
+    let api = api.unwrap_or_else(|| go2rtc.base.to_string());
+    let probe = Go2rtc::connect(api.parse().expect("a url"))
+        .expect("a client")
+        .engine(rtsp_addr);
     let data_dir = std::env::temp_dir().join(format!(
         "nazar-http-{}-{}",
         std::process::id(),
@@ -96,7 +123,7 @@ async fn harness_with(pacing: Pacing) -> Harness {
             sessions,
             qubo: client,
             supervisor,
-            go2rtc_api: go2rtc.base.to_string(),
+            engine: probe,
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -121,6 +148,7 @@ async fn harness_with(pacing: Pacing) -> Harness {
         qubo,
         data_dir,
         go2rtc,
+        _rtsp: stand_in,
     }
 }
 
@@ -163,9 +191,319 @@ async fn health_is_open_and_carries_the_version() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
         response.json::<Value>().await.expect("json"),
-        json!({ "ok": true, "version": "test" }),
-        "health answers without a session"
+        json!({ "ok": true, "version": "test", "go2rtc": true }),
+        "health answers without a session and reports the engine"
     );
+}
+
+/// The engine can be gone: a child whose bind failed leaves its API port
+/// closed, so the connect is refused while the server is fine. The health
+/// body must say so and stay 200, so the container healthcheck does not
+/// flip during a restart backoff.
+#[tokio::test]
+async fn health_reports_a_dead_engine_without_failing() {
+    // Dropped: the connect is refused, which is the shape a child whose
+    // bind failed leaves behind.
+    let addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        listener.local_addr().expect("the address")
+    };
+    let h = harness_with_api(test_pacing(), Some(format!("http://{addr}")), None).await;
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the server is fine, so health stays 200"
+    );
+    let body = response.json::<Value>().await.expect("json");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["version"], json!("test"));
+    assert_eq!(
+        body["go2rtc"],
+        json!(false),
+        "the dead engine is surfaced in the body"
+    );
+}
+
+/// The timeout path: a go2rtc that accepts and never answers must not hold
+/// the health endpoint. The probe is bounded, and the body reports the
+/// engine down. The accept must be proven, or a fast connection failure
+/// would pass for the bound.
+#[tokio::test]
+async fn health_bounds_a_wedged_engine_probe() {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    let (accepted, accepted_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let _ = accepted.send(());
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        std::future::pending::<()>().await;
+    });
+    let h = harness_with_api(test_pacing(), Some(format!("http://{addr}")), None).await;
+    let started = std::time::Instant::now();
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+        .await
+        .expect("the probe connected before its bound")
+        .expect("the accept task signalled");
+    let body = response.json::<Value>().await.expect("json");
+    assert_eq!(body["go2rtc"], json!(false), "a wedged engine reads down");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the probe is bounded: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The API can answer while the RTSP listener (what FfmpegHold dials)
+/// cannot bind; the engine still reads down. TEST-NET-1 is reserved and
+/// never routed, so nothing can take the address between the test and the
+/// probe.
+#[tokio::test]
+async fn health_reports_a_dead_rtsp_listener() {
+    let dead: SocketAddr = "192.0.2.1:8554".parse().expect("an address");
+    let h = harness_with_api(test_pacing(), None, Some(dead)).await;
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.json::<Value>().await.expect("json");
+    assert_eq!(
+        body["go2rtc"],
+        json!(false),
+        "the media half must answer too"
+    );
+}
+
+/// A foreign listener can hold the RTSP port: a squatter, or whatever took
+/// it after a failed bind. A bare connect would read it as the engine, so
+/// the probe asks for RTSP and a listener answering another protocol is
+/// down.
+#[tokio::test]
+async fn health_rejects_a_listener_that_does_not_speak_rtsp() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 512];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            });
+        }
+    });
+    let h = harness_with_api(test_pacing(), None, Some(addr)).await;
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("json")["go2rtc"],
+        json!(false),
+        "a listener that answers HTTP is not the engine's RTSP server"
+    );
+}
+
+/// The probe runs every request: a bound but silent engine reads down,
+/// then serving on the same address reads up.
+#[tokio::test]
+async fn health_does_not_cache_the_engine_state() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    let h = harness_with_api(test_pacing(), Some(format!("http://{addr}")), None).await;
+
+    let first = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        first.json::<Value>().await.expect("json")["go2rtc"],
+        json!(false),
+        "a bound listener that does not serve is down"
+    );
+
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let second = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        second.json::<Value>().await.expect("json")["go2rtc"],
+        json!(true),
+        "the next request sees the engine serving"
+    );
+}
+
+/// A 200 from /api/streams that is not JSON reads down: a serving-looking
+/// engine with a broken body is not live.
+#[tokio::test]
+async fn health_reads_an_unparsable_api_body_as_down() {
+    let h = harness().await;
+    h.go2rtc.set_streams_error(true);
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("json")["go2rtc"],
+        json!(false),
+        "an unreadable engine answer is not live"
+    );
+}
+
+/// The fmt subscriber's own writer, so a test can read what was logged.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("the buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The engine state is logged on its transitions only: one warn when it
+/// goes down with the failing half and its cause, nothing while it stays
+/// down, one when it answers again, and nothing for a healthy first probe.
+#[tokio::test]
+async fn health_logs_a_transition_once() {
+    let h = harness().await;
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let downs = |text: &str| {
+        text.matches("the stream engine is not answering fully")
+            .count()
+    };
+    let ups = |text: &str| text.matches("the stream engine is answering again").count();
+
+    // A healthy first probe is the normal boot.
+    assert_eq!(
+        health_body(&h).await["go2rtc"],
+        json!(true),
+        "the engine answers"
+    );
+    assert_eq!(
+        downs(&captured.text()) + ups(&captured.text()),
+        0,
+        "a healthy first probe is silent: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(true);
+    assert_eq!(
+        health_body(&h).await["go2rtc"],
+        json!(false),
+        "a broken API answer reads down"
+    );
+    let logs = captured.text();
+    assert_eq!(downs(&logs), 1, "the transition logs once: {logs}");
+    assert!(
+        logs.contains("api=down (go2rtc"),
+        "the failing half carries its cause: {logs}"
+    );
+    assert!(
+        logs.contains("rtsp=up"),
+        "the answering half is named: {logs}"
+    );
+
+    assert_eq!(health_body(&h).await["go2rtc"], json!(false));
+    assert_eq!(
+        downs(&captured.text()),
+        1,
+        "an identical probe adds no line: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(false);
+    assert_eq!(health_body(&h).await["go2rtc"], json!(true));
+    let logs = captured.text();
+    assert_eq!(ups(&logs), 1, "the recovery logs once: {logs}");
+    assert_eq!(downs(&logs), 1, "the recovery adds no down line: {logs}");
+
+    assert_eq!(health_body(&h).await["go2rtc"], json!(true));
+    assert_eq!(
+        ups(&captured.text()),
+        1,
+        "an identical healthy probe adds no line: {}",
+        captured.text()
+    );
+}
+
+async fn health_body(h: &Harness) -> Value {
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json::<Value>().await.expect("json")
 }
 
 #[tokio::test]

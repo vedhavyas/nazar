@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use qubo::{
     AccountProfile, Device, Quality, QuboClient, QuboError, Session, SessionStore, phone_login,
@@ -27,6 +29,7 @@ use qubo::{
 
 use crate::episodes::EpisodeStore;
 use crate::events::EventBus;
+use crate::go2rtc::Engine;
 use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
@@ -94,8 +97,9 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
-    /// go2rtc's API base the proxy forwards to.
-    pub go2rtc_api: String,
+    /// The engine's listeners, narrowed to reads: the `/go2rtc` proxy
+    /// forwards to its API base and the health probe reads both halves.
+    pub engine: Engine,
     pub control: ControlTiming,
     /// The broker events every live view follows.
     pub events: EventBus,
@@ -109,6 +113,10 @@ pub struct AppState {
     /// One lock per camera: a step is a read-modify-write, and two of them
     /// racing read the same base and lose one another's move.
     ptz_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The last engine state the health probe saw, so only a change is
+    /// logged: the browser polls every 5s while it is open and the
+    /// container healthcheck every 30s.
+    health: Arc<Mutex<Option<EngineState>>>,
     http: reqwest::Client,
 }
 
@@ -117,7 +125,7 @@ pub struct Wiring {
     pub sessions: SessionStore,
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
-    pub go2rtc_api: String,
+    pub engine: Engine,
     pub events: EventBus,
     pub motion: Arc<Mutex<MotionOrder>>,
     pub notifications: Arc<NotificationStore>,
@@ -132,7 +140,7 @@ impl AppState {
             sessions: wiring.sessions,
             qubo: wiring.qubo,
             supervisor: wiring.supervisor,
-            go2rtc_api: wiring.go2rtc_api,
+            engine: wiring.engine,
             control: ControlTiming::default(),
             events: wiring.events,
             motion: wiring.motion,
@@ -140,6 +148,7 @@ impl AppState {
             episodes: wiring.episodes,
             snapshots: wiring.snapshots,
             ptz_locks: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(None)),
             // No redirects on the proxy: a 3xx from go2rtc must reach the
             // browser as-is rather than be followed into another host.
             http: reqwest::Client::builder()
@@ -318,8 +327,136 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// How long the health probe waits for the engine's two listeners, joined.
+/// The endpoint answers inside the Docker healthcheck's window even when
+/// the engine is wedged, and the status never fails for the engine.
+const HEALTH_PROBE: Duration = Duration::from_millis(1000);
+
+/// The RTSP listener answers an OPTIONS on loopback in milliseconds; the
+/// bound exists so a listener that accepts and never replies cannot hold
+/// the health request.
+const RTSP_PROBE: Duration = Duration::from_millis(250);
+
+/// The first exchange of an RTSP session. A connect alone proves only that
+/// something holds the port; the status line proves it is the RTSP server.
+const RTSP_OPTIONS: &[u8] = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+
+/// How much of the answer the probe reads before its headers end: an
+/// OPTIONS carries a status line and headers, no body.
+const RTSP_REPLY_LIMIT: usize = 2048;
+
+/// What the last probe found, for transition logging and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EngineState {
+    api: bool,
+    rtsp: bool,
+}
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "ok": true, "version": state.version }))
+    let go2rtc = engine_answers(&state).await;
+    Json(json!({ "ok": true, "version": state.version, "go2rtc": go2rtc }))
+}
+
+/// The engine's two listeners must both answer: the API the proxy calls,
+/// and the RTSP listener `FfmpegHold` dials. A child that is alive but
+/// cannot bind reads down. Only a change from the last answer is logged:
+/// the browser polls every 5s while it is open and the container
+/// healthcheck every 30s, so per-probe lines would bury the transition
+/// that matters.
+async fn engine_answers(state: &AppState) -> bool {
+    let (api, rtsp) = tokio::join!(
+        tokio::time::timeout(HEALTH_PROBE, state.engine.streams()),
+        tokio::time::timeout(HEALTH_PROBE, rtsp_answers(state.engine.rtsp_addr())),
+    );
+    let api = match api {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!("no answer in {}ms", HEALTH_PROBE.as_millis())),
+    };
+    let rtsp = match rtsp {
+        Ok(result) => result,
+        Err(_) => Err(format!("no answer in {}ms", HEALTH_PROBE.as_millis())),
+    };
+    let now = EngineState {
+        api: api.is_ok(),
+        rtsp: rtsp.is_ok(),
+    };
+    let previous = state
+        .health
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(now);
+    // A healthy first probe is the normal boot; anything else is worth a
+    // line, including an engine that was already down when the server
+    // started.
+    let first_healthy = previous.is_none() && now.api && now.rtsp;
+    if previous != Some(now) && !first_healthy {
+        if now.api && now.rtsp {
+            tracing::warn!("the stream engine is answering again");
+        } else {
+            tracing::warn!(
+                api = %half(&api),
+                rtsp = %half(&rtsp),
+                "the stream engine is not answering fully"
+            );
+        }
+    }
+    now.api && now.rtsp
+}
+
+/// What a half of the probe found, for the transition line.
+fn half(result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => "up".to_owned(),
+        Err(err) => format!("down ({err})"),
+    }
+}
+
+/// The RTSP listener must answer an OPTIONS with `RTSP/1.0 200`: a
+/// listener that merely holds the port is not the engine. The whole answer
+/// is read through its header terminator before the socket closes - a
+/// close with bytes still unread makes the kernel send RST, which the real
+/// engine logs on every poll.
+async fn rtsp_answers(addr: SocketAddr) -> Result<(), String> {
+    let exchange = async {
+        let mut socket = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|err| format!("connect: {err}"))?;
+        socket
+            .write_all(RTSP_OPTIONS)
+            .await
+            .map_err(|err| format!("write: {err}"))?;
+        let mut reply = Vec::with_capacity(256);
+        let mut chunk = [0_u8; 256];
+        loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|err| format!("read: {err}"))?;
+            if read == 0 {
+                return Err("closed before the answer's headers ended".to_owned());
+            }
+            reply.extend_from_slice(&chunk[..read]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if reply.len() >= RTSP_REPLY_LIMIT {
+                return Err("the answer's headers never ended".to_owned());
+            }
+        }
+        if reply.starts_with(b"RTSP/1.0 200") {
+            Ok(())
+        } else {
+            let status = String::from_utf8_lossy(&reply);
+            Err(format!(
+                "answered {:?}",
+                status.lines().next().unwrap_or_default()
+            ))
+        }
+    };
+    tokio::time::timeout(RTSP_PROBE, exchange)
+        .await
+        .map_err(|_| format!("no RTSP answer in {}ms", RTSP_PROBE.as_millis()))?
 }
 
 #[derive(Deserialize)]
@@ -1092,7 +1229,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Result<Respon
 
     let rest = parts.uri.path().trim_start_matches("/go2rtc/").to_owned();
     let query = parts.uri.query().unwrap_or_default();
-    let base = state.go2rtc_api.trim_end_matches('/').to_owned();
+    let base = state.engine.api_base().trim_end_matches('/').to_owned();
     // HLS's parts carry an opaque session id that only a master playlist
     // can create: they read, they never name a source, so an id that is
     // shaped like an id is all they need.

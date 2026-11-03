@@ -348,11 +348,13 @@ struct Harness {
     data_dir: std::path::PathBuf,
     /// The bus the service follows: events go in here, not into the store.
     events: EventBus,
+    _probe: common::ProbeEngine,
 }
 
 async fn harness(store: Arc<NotificationStore>) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     let data_dir = temp_dir("notify-harness");
     // The stills come from the same fake go2rtc the streams do.
     let snapshots = Snapshots::new(
@@ -403,7 +405,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             sessions,
             qubo: client,
             supervisor: supervisor.clone(),
-            go2rtc_api: go2rtc.base.to_string(),
+            engine: probe.engine(),
             events: events.clone(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::clone(&store),
@@ -425,6 +427,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
         supervisor,
         data_dir,
         events,
+        _probe: probe,
     }
 }
 

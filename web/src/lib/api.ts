@@ -61,12 +61,18 @@ export function socketBase(): string {
 
 /** Whether a server answers at `address` - the setup screen's check, run
  * against a candidate before it is saved. */
-export async function healthAt(address: string): Promise<{ ok: boolean; version: string }> {
+export async function healthAt(
+  address: string,
+): Promise<{ ok: boolean; version: string; go2rtc: boolean }> {
   const response = await fetch(`${normalizeAddress(address)}/api/health`);
   if (!response.ok) {
     throw new ApiError(response.status, await errorMessage(response));
   }
-  return (await response.json()) as { ok: boolean; version: string };
+  return (await response.json()) as {
+    ok: boolean;
+    version: string;
+    go2rtc: boolean;
+  };
 }
 
 export interface Camera {
@@ -168,7 +174,8 @@ function post(path: string, body: unknown): Promise<void> {
 }
 
 export const api = {
-  health: () => call<{ ok: boolean; version: string }>('/api/health'),
+  health: () =>
+    call<{ ok: boolean; version: string; go2rtc: boolean }>('/api/health'),
   requestOtp: (phone: string) => post('/api/login/otp', { phone }),
   // 204 signs straight in; a 200 answers the accounts to pick between.
   verifyOtp: (phone: string, code: string) =>

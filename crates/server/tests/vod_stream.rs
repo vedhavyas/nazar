@@ -51,11 +51,13 @@ struct Harness {
     base: String,
     qubo: MockServer,
     go2rtc: common::FakeApi,
+    _probe: common::ProbeEngine,
 }
 
 async fn harness(stream_idle: Duration) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     mount_discovery(&qubo).await;
     let data_dir = temp_dir("vod-harness");
     let sessions = SessionStore::new(data_dir.join("session.json"));
@@ -97,7 +99,7 @@ async fn harness(stream_idle: Duration) -> Harness {
             sessions,
             qubo: client,
             supervisor: supervisor.clone(),
-            go2rtc_api: go2rtc.base.to_string(),
+            engine: probe.engine(),
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -113,7 +115,12 @@ async fn harness(stream_idle: Duration) -> Harness {
     tokio::spawn(async move {
         axum::serve(listener, app(state)).await.expect("serves");
     });
-    Harness { base, qubo, go2rtc }
+    Harness {
+        base,
+        qubo,
+        go2rtc,
+        _probe: probe,
+    }
 }
 
 async fn mount_discovery(server: &MockServer) {
