@@ -196,10 +196,10 @@ async fn health_is_open_and_carries_the_version() {
     );
 }
 
-/// The engine can be alive and unable to serve: its API socket is bound
-/// but nothing answers, while the server is fine. The health body must say
-/// so and stay 200, so the container healthcheck does not flip during a
-/// restart backoff.
+/// The engine can be gone: a child whose bind failed leaves its API port
+/// closed, so the connect is refused while the server is fine. The health
+/// body must say so and stay 200, so the container healthcheck does not
+/// flip during a restart backoff.
 #[tokio::test]
 async fn health_reports_a_dead_engine_without_failing() {
     // Dropped: the connect is refused, which is the shape a child whose
@@ -394,6 +394,116 @@ async fn health_reads_an_unparsable_api_body_as_down() {
         json!(false),
         "an unreadable engine answer is not live"
     );
+}
+
+/// The fmt subscriber's own writer, so a test can read what was logged.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("the buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The engine state is logged on its transitions only: one warn when it
+/// goes down with the failing half and its cause, nothing while it stays
+/// down, one when it answers again, and nothing for a healthy first probe.
+#[tokio::test]
+async fn health_logs_a_transition_once() {
+    let h = harness().await;
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let downs = |text: &str| {
+        text.matches("the stream engine is not answering fully")
+            .count()
+    };
+    let ups = |text: &str| text.matches("the stream engine is answering again").count();
+
+    // A healthy first probe is the normal boot.
+    assert_eq!(
+        health_body(&h).await["go2rtc"],
+        json!(true),
+        "the engine answers"
+    );
+    assert_eq!(
+        downs(&captured.text()) + ups(&captured.text()),
+        0,
+        "a healthy first probe is silent: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(true);
+    assert_eq!(
+        health_body(&h).await["go2rtc"],
+        json!(false),
+        "a broken API answer reads down"
+    );
+    let logs = captured.text();
+    assert_eq!(downs(&logs), 1, "the transition logs once: {logs}");
+    assert!(
+        logs.contains("api=down (go2rtc"),
+        "the failing half carries its cause: {logs}"
+    );
+    assert!(
+        logs.contains("rtsp=up"),
+        "the answering half is named: {logs}"
+    );
+
+    assert_eq!(health_body(&h).await["go2rtc"], json!(false));
+    assert_eq!(
+        downs(&captured.text()),
+        1,
+        "an identical probe adds no line: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(false);
+    assert_eq!(health_body(&h).await["go2rtc"], json!(true));
+    let logs = captured.text();
+    assert_eq!(ups(&logs), 1, "the recovery logs once: {logs}");
+    assert_eq!(downs(&logs), 1, "the recovery adds no down line: {logs}");
+
+    assert_eq!(health_body(&h).await["go2rtc"], json!(true));
+    assert_eq!(
+        ups(&captured.text()),
+        1,
+        "an identical healthy probe adds no line: {}",
+        captured.text()
+    );
+}
+
+async fn health_body(h: &Harness) -> Value {
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json::<Value>().await.expect("json")
 }
 
 #[tokio::test]

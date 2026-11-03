@@ -16,10 +16,14 @@ pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::Ep
 
 /// A loopback RTSP endpoint that answers the health probe's OPTIONS. Every
 /// harness wires its engine through [`ProbeEngine`], so no test can point
-/// the probe at the host's own 8554.
+/// the probe at the host's own 8554. A probe that leaves any of the reply
+/// unread is recorded and fails the test when the harness drops: closing
+/// with unread bytes makes the kernel send RST, which the real engine logs
+/// on every poll.
 pub struct RtspStandIn {
     addr: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    dirty: Arc<Mutex<Vec<String>>>,
 }
 
 impl RtspStandIn {
@@ -28,22 +32,41 @@ impl RtspStandIn {
             .await
             .expect("an rtsp port");
         let addr = listener.local_addr().expect("the address");
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-                    let mut buf = [0_u8; 512];
-                    let _ = socket.read(&mut buf).await;
-                    let _ = socket
-                        .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
-                        .await;
-                });
-            }
-        });
-        Self { addr, task }
+        let dirty = Arc::new(Mutex::new(Vec::new()));
+        let task = {
+            let dirty = Arc::clone(&dirty);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let dirty = Arc::clone(&dirty);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                        let mut request = [0_u8; 512];
+                        let _ = socket.read(&mut request).await;
+                        let _ = socket
+                            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+                            .await;
+                        // Ok(0) is the clean close: the probe read the whole
+                        // answer before letting go.
+                        let mut rest = Vec::new();
+                        match socket.read_to_end(&mut rest).await {
+                            Ok(0) => {}
+                            Ok(unread) => dirty
+                                .lock()
+                                .expect("the buffer")
+                                .push(format!("{unread} bytes left unread")),
+                            Err(err) => dirty
+                                .lock()
+                                .expect("the buffer")
+                                .push(format!("closed with the reply unread: {err}")),
+                        }
+                    });
+                }
+            })
+        };
+        Self { addr, task, dirty }
     }
 
     pub fn addr(&self) -> std::net::SocketAddr {
@@ -54,6 +77,17 @@ impl RtspStandIn {
 impl Drop for RtspStandIn {
     fn drop(&mut self) {
         self.task.abort();
+        if std::thread::panicking() {
+            return;
+        }
+        let dirty = self
+            .dirty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            dirty.is_empty(),
+            "the RTSP probe did not read the reply before closing: {dirty:?}"
+        );
     }
 }
 

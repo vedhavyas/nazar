@@ -114,7 +114,8 @@ pub struct AppState {
     /// racing read the same base and lose one another's move.
     ptz_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// The last engine state the health probe saw, so only a change is
-    /// logged: the container healthcheck polls every few seconds.
+    /// logged: the browser polls every 5s while it is open and the
+    /// container healthcheck every 30s.
     health: Arc<Mutex<Option<EngineState>>>,
     http: reqwest::Client,
 }
@@ -340,6 +341,10 @@ const RTSP_PROBE: Duration = Duration::from_millis(250);
 /// something holds the port; the status line proves it is the RTSP server.
 const RTSP_OPTIONS: &[u8] = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
 
+/// How much of the answer the probe reads before its headers end: an
+/// OPTIONS carries a status line and headers, no body.
+const RTSP_REPLY_LIMIT: usize = 2048;
+
 /// What the last probe found, for transition logging and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct EngineState {
@@ -355,8 +360,9 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 /// The engine's two listeners must both answer: the API the proxy calls,
 /// and the RTSP listener `FfmpegHold` dials. A child that is alive but
 /// cannot bind reads down. Only a change from the last answer is logged:
-/// the healthcheck polls every few seconds, so per-probe lines would bury
-/// the transition that matters.
+/// the browser polls every 5s while it is open and the container
+/// healthcheck every 30s, so per-probe lines would bury the transition
+/// that matters.
 async fn engine_answers(state: &AppState) -> bool {
     let (api, rtsp) = tokio::join!(
         tokio::time::timeout(HEALTH_PROBE, state.engine.streams()),
@@ -406,8 +412,11 @@ fn half(result: &Result<(), String>) -> String {
     }
 }
 
-/// The RTSP listener must answer an OPTIONS with RTSP's status line: a
-/// listener that merely holds the port is not the engine.
+/// The RTSP listener must answer an OPTIONS with `RTSP/1.0 200`: a
+/// listener that merely holds the port is not the engine. The whole answer
+/// is read through its header terminator before the socket closes - a
+/// close with bytes still unread makes the kernel send RST, which the real
+/// engine logs on every poll.
 async fn rtsp_answers(addr: SocketAddr) -> Result<(), String> {
     let exchange = async {
         let mut socket = tokio::net::TcpStream::connect(addr)
@@ -417,15 +426,32 @@ async fn rtsp_answers(addr: SocketAddr) -> Result<(), String> {
             .write_all(RTSP_OPTIONS)
             .await
             .map_err(|err| format!("write: {err}"))?;
-        let mut status = [0_u8; 5];
-        socket
-            .read_exact(&mut status)
-            .await
-            .map_err(|err| format!("read: {err}"))?;
-        if &status == b"RTSP/" {
+        let mut reply = Vec::with_capacity(256);
+        let mut chunk = [0_u8; 256];
+        loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|err| format!("read: {err}"))?;
+            if read == 0 {
+                return Err("closed before the answer's headers ended".to_owned());
+            }
+            reply.extend_from_slice(&chunk[..read]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if reply.len() >= RTSP_REPLY_LIMIT {
+                return Err("the answer's headers never ended".to_owned());
+            }
+        }
+        if reply.starts_with(b"RTSP/1.0 200") {
             Ok(())
         } else {
-            Err(format!("answered {:?}", String::from_utf8_lossy(&status)))
+            let status = String::from_utf8_lossy(&reply);
+            Err(format!(
+                "answered {:?}",
+                status.lines().next().unwrap_or_default()
+            ))
         }
     };
     tokio::time::timeout(RTSP_PROBE, exchange)
