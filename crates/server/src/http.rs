@@ -1415,10 +1415,10 @@ mod tests {
 
     #[test]
     fn a_credential_outside_a_url_query_is_redacted() {
-        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1";
+        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1&wowzaToken=MixedSecret&token=raw-secret";
         assert_eq!(
             diagnostic_detail(raw),
-            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>"
+            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>&wowzaToken=<redacted>&token=<redacted>"
         );
     }
 }
