@@ -349,6 +349,59 @@ test('leaving the screen stops its reads', async () => {
   expect(reads(), 'a screen that left is not read for').toBe(seen);
 });
 
+test('Try again drops the compatibility-stream state', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  class StubHls {
+    static isSupported = () => true;
+    loadSource() {}
+    attachMedia() {}
+    destroy() {}
+  }
+  vi.stubGlobal('Hls', StubHls);
+  let state = 'degraded';
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state,
+              reason: state === 'degraded' ? 'stream engine unavailable' : null,
+              details: null,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  // The fallback takes the stage while the stream is degraded.
+  await vi.advanceTimersByTimeAsync(4000);
+  await vi.advanceTimersByTimeAsync(13000);
+  expect(document.querySelector('video.hls'), 'the fallback took the stage').toBeTruthy();
+
+  // The person retries; the server comes back live on the next read.
+  screen.getByText('Try again').click();
+  state = 'live';
+  await vi.advanceTimersByTimeAsync(3500);
+
+  expect(
+    screen.queryByText(/compatibility stream/),
+    'the old fallback is not claimed after a retry',
+  ).toBeNull();
+  expect(screen.queryByText('stream engine unavailable'), 'and the reason is clear').toBeNull();
+});
+
 test('a fallback on the camera screen is named, not left unexplained', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
