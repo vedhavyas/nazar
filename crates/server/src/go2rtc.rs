@@ -24,6 +24,10 @@ use crate::supervisor::{HoldLease, StreamHold};
 /// Where the generated config puts go2rtc's API.
 pub const API_BASE: &str = "http://127.0.0.1:1984";
 
+/// Where the generated config's RTSP listener answers; the media half the
+/// health probe checks, as `FfmpegHold` dials it.
+pub const RTSP_ADDR: &str = "127.0.0.1:8554";
+
 /// How long a go2rtc call may take before it gives up. The API is loopback
 /// and answers in milliseconds; the bound exists so an API that accepts and
 /// then never answers cannot hold a caller - and, through it, whatever lock
@@ -112,6 +116,7 @@ pub struct Go2rtc {
     http: reqwest::Client,
     supervisor: Option<ChildSupervisor>,
     config_path: PathBuf,
+    rtsp: String,
 }
 
 /// The task that owns the spawned go2rtc: it waits on the child, restarts
@@ -130,6 +135,7 @@ impl Clone for Go2rtc {
             http: self.http.clone(),
             supervisor: None,
             config_path: PathBuf::new(),
+            rtsp: self.rtsp.clone(),
         }
     }
 }
@@ -178,6 +184,7 @@ impl Go2rtc {
             http,
             supervisor: Some(ChildSupervisor { shutdown, task }),
             config_path,
+            rtsp: RTSP_ADDR.to_owned(),
         })
     }
 
@@ -188,7 +195,21 @@ impl Go2rtc {
             http: api_client()?,
             supervisor: None,
             config_path: PathBuf::new(),
+            rtsp: RTSP_ADDR.to_owned(),
         })
+    }
+
+    /// Point the handle's RTSP check at another address (tests run their
+    /// own stand-in).
+    #[must_use]
+    pub fn with_rtsp(mut self, rtsp: &str) -> Self {
+        rtsp.clone_into(&mut self.rtsp);
+        self
+    }
+
+    /// The engine's RTSP endpoint, for the health probe.
+    pub fn rtsp_addr(&self) -> &str {
+        &self.rtsp
     }
 
     /// The generated config's path, when this instance spawned go2rtc.
@@ -540,7 +561,7 @@ fn config_yaml(ffmpeg_bin: &Path, webrtc_candidates: Option<&str>) -> String {
 # The tile chain re-reads streams through this listener; pinned to
 # loopback because go2rtc's default binds every interface.
 rtsp:
-  listen: "127.0.0.1:8554"
+  listen: "{RTSP_ADDR}"
 {webrtc}ffmpeg:
   bin: "{ffmpeg}"
   {TEMPLATE}: "{TEMPLATE_ARGS}"

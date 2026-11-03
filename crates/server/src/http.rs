@@ -95,8 +95,11 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
-    /// go2rtc's API base the proxy forwards to.
+    /// go2rtc's API base: the `/go2rtc` proxy forwards to it.
     pub go2rtc_api: String,
+    /// The engine handle the health probe reads; a clone of the owned one,
+    /// sharing its client and RTSP address.
+    pub go2rtc: Go2rtc,
     pub control: ControlTiming,
     /// The broker events every live view follows.
     pub events: EventBus,
@@ -119,6 +122,7 @@ pub struct Wiring {
     pub qubo: QuboClient,
     pub supervisor: Supervisor,
     pub go2rtc_api: String,
+    pub go2rtc: Go2rtc,
     pub events: EventBus,
     pub motion: Arc<Mutex<MotionOrder>>,
     pub notifications: Arc<NotificationStore>,
@@ -134,6 +138,7 @@ impl AppState {
             qubo: wiring.qubo,
             supervisor: wiring.supervisor,
             go2rtc_api: wiring.go2rtc_api,
+            go2rtc: wiring.go2rtc,
             control: ControlTiming::default(),
             events: wiring.events,
             motion: wiring.motion,
@@ -324,17 +329,47 @@ pub fn app(state: AppState) -> Router {
 /// wedged, and the status never fails for the engine.
 const HEALTH_PROBE: Duration = Duration::from_millis(1000);
 
+/// A local connect to the RTSP listener is instant; the bound exists so a
+/// listener that accepts nothing still answers the probe.
+const RTSP_PROBE: Duration = Duration::from_millis(250);
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    let go2rtc = match state.go2rtc_api.parse() {
-        Ok(url) => match Go2rtc::connect(url) {
-            Ok(client) => tokio::time::timeout(HEALTH_PROBE, client.streams())
-                .await
-                .is_ok_and(|answer| answer.is_ok()),
-            Err(_) => false,
-        },
-        Err(_) => false,
-    };
+    let go2rtc = engine_answers(&state).await;
     Json(json!({ "ok": true, "version": state.version, "go2rtc": go2rtc }))
+}
+
+/// The engine's two listeners must both answer: the API the proxy calls,
+/// and the RTSP listener `FfmpegHold` dials. A child that is alive but
+/// cannot bind reads down; each failure is logged with its cause.
+async fn engine_answers(state: &AppState) -> bool {
+    let api = match tokio::time::timeout(HEALTH_PROBE, state.go2rtc.streams()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
+            tracing::debug!(%err, "the health probe could not read the go2rtc API");
+            false
+        }
+        Err(err) => {
+            tracing::debug!(%err, "the health probe timed out on the go2rtc API");
+            false
+        }
+    };
+    let rtsp = match tokio::time::timeout(
+        RTSP_PROBE,
+        tokio::net::TcpStream::connect(state.go2rtc.rtsp_addr()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
+            tracing::debug!(%err, "the health probe could not reach the go2rtc RTSP listener");
+            false
+        }
+        Err(err) => {
+            tracing::debug!(%err, "the health probe timed out on the go2rtc RTSP listener");
+            false
+        }
+    };
+    api && rtsp
 }
 
 #[derive(Deserialize)]

@@ -85,6 +85,7 @@ async fn harness() -> Harness {
             qubo: client,
             supervisor,
             go2rtc_api: go2rtc.base.to_string(),
+            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(

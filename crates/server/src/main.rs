@@ -28,6 +28,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     let go2rtc = Go2rtc::start(&config).context("starting go2rtc")?;
+    // The health probe's handle: the same client and RTSP address, no child.
+    let go2rtc_probe = go2rtc.clone();
     let qubo = QuboClient::with_device_id(
         BASE_URL.parse().context("the gateway URL parses")?,
         config.service_provider.clone(),
@@ -101,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             qubo,
             supervisor,
             go2rtc_api: server::go2rtc::API_BASE.to_owned(),
+            go2rtc: go2rtc_probe,
             events,
             motion,
             notifications,

@@ -109,6 +109,7 @@ async fn harness(
             qubo: client,
             supervisor: supervisor.clone(),
             go2rtc_api: go2rtc.base.to_string(),
+            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
             events: EventBus::new(),
             motion: Arc::new(std::sync::Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
