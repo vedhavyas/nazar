@@ -877,3 +877,48 @@ async fn the_ffmpeg_hold_restarts_after_the_child_dies() {
     drop(lease);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hold that keeps dying young reports the exit once, not once per
+/// respawn: the retained hub log carried 2,408 of these lines during the
+/// outage.
+#[tokio::test]
+async fn a_dying_hold_reports_its_exit_once() {
+    let dir = temp_dir();
+    let bin = dir.join("dying-ffmpeg.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nsleep 0.1\nprintf 'e' >> \"$(dirname \"$0\")/exits.log\"\nexit 1\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+
+    let captured = common::Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let hold = server::go2rtc::FfmpegHold::new(bin);
+    let lease = hold.hold("hall-high");
+
+    // The second exit lands one backoff later (the base doubled once).
+    let two_exits = await_text_where(&dir.join("exits.log"), |text| text.len() >= 2)
+        .await
+        .is_some();
+    assert!(two_exits, "the hold re-ran and died twice");
+    assert_eq!(
+        captured.text().matches("the hold consumer exited").count(),
+        1,
+        "one exit line for the streak: {}",
+        captured.text()
+    );
+
+    drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
+}

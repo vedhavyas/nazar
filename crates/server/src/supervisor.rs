@@ -23,6 +23,7 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, Go2rtcError, live_source, low_source};
 use crate::redact::redact_credentials;
+use crate::throttle::{Repeat, RepeatLog};
 
 /// A consumer narar keeps on its own stream, so go2rtc's producer stays
 /// warm for every viewer: a client that connects finds a picture already
@@ -414,6 +415,12 @@ pub struct Supervisor {
     /// with per-lease identity, so a parked loop's late drop can never
     /// erase the registration a respawn just made.
     holds: HoldRegistry,
+    /// The liveness read's repeated failures, by stream: one line per
+    /// cause, a count while it repeats. Separate from the chain log so a
+    /// recoverable read cannot clear a chain failure's record.
+    liveness_repeats: RepeatLog,
+    /// The tile chain's repeated failures, by stream.
+    chain_repeats: RepeatLog,
     /// The fast lane, when the deployment enables it.
     lane: Option<Arc<dyn Lane>>,
     /// Cameras that try the fast lane before the cloud mint.
@@ -470,6 +477,8 @@ impl Supervisor {
             warm_wanted: Arc::new(AtomicBool::new(false)),
             warmed: Arc::new(AtomicBool::new(false)),
             refresh_spend: Arc::new(tokio::sync::Mutex::new(())),
+            liveness_repeats: RepeatLog::default(),
+            chain_repeats: RepeatLog::default(),
             lane: None,
             prefer_p2p: Arc::new(HashSet::new()),
             armed: Arc::new(RwLock::new(HashMap::new())),
@@ -989,6 +998,9 @@ impl Supervisor {
             // is what re-arms a chain go2rtc lost.
             match self.swap_source(&name, &low_source(&high)).await {
                 Ok(()) => {
+                    if self.chain_repeats.recovered(&name) {
+                        tracing::info!(stream = %name, "the tile's chain took again");
+                    }
                     // The loop can drop the high while this PUT is in
                     // flight: what just landed dials a source that is gone.
                     // Unpinned: the fake's shared DELETE delay cannot order
@@ -1000,7 +1012,20 @@ impl Supervisor {
                 }
                 Err(err) => {
                     let reason = redact_credentials(&err);
-                    tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
+                    match self.chain_repeats.note(&name, &reason) {
+                        Repeat::First => {
+                            tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
+                        }
+                        Repeat::Suppressed => {}
+                        Repeat::Summary { suppressed } => {
+                            tracing::warn!(
+                                stream = %name,
+                                suppressed,
+                                %reason,
+                                "the tile's chain is still not taking"
+                            );
+                        }
+                    }
                     self.mark_degraded(&name, reason).await;
                 }
             }
@@ -1416,10 +1441,28 @@ impl Supervisor {
     /// back.
     async fn watch_producer(&self, name: &str) -> ProducerWatch {
         let streams = match self.go2rtc.streams().await {
-            Ok(streams) => streams,
+            Ok(streams) => {
+                if self.liveness_repeats.recovered_all() > 0 {
+                    tracing::info!("the liveness watch can read go2rtc again");
+                }
+                streams
+            }
             Err(err) => {
                 let reason = redact_credentials(&err.to_string());
-                tracing::warn!(stream = %name, %reason, "the liveness watch could not read go2rtc");
+                match self.liveness_repeats.note(name, &reason) {
+                    Repeat::First => {
+                        tracing::warn!(stream = %name, %reason, "the liveness watch could not read go2rtc");
+                    }
+                    Repeat::Suppressed => {}
+                    Repeat::Summary { suppressed } => {
+                        tracing::warn!(
+                            stream = %name,
+                            suppressed,
+                            %reason,
+                            "the liveness watch still cannot read go2rtc"
+                        );
+                    }
+                }
                 return ProducerWatch::Unreadable;
             }
         };
@@ -1562,18 +1605,37 @@ impl Supervisor {
             .await
             .is_ok_and(|streams| streams.iter().any(|stream| stream.name == low));
         if present {
+            if self.chain_repeats.recovered(&low) {
+                tracing::info!(stream = %low, "the tile's chain took again");
+            }
             let live = self.status_for_name(high).await;
             self.settle(&low, live).await;
             return;
         }
         match self.swap_source(&low, &low_source(high)).await {
             Ok(()) => {
+                if self.chain_repeats.recovered(&low) {
+                    tracing::info!(stream = %low, "the tile's chain took again");
+                }
                 let live = self.status_for_name(high).await;
                 self.settle(&low, live).await;
             }
             Err(err) => {
                 let reason = redact_credentials(&err);
-                tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
+                match self.chain_repeats.note(&low, &reason) {
+                    Repeat::First => {
+                        tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
+                    }
+                    Repeat::Suppressed => {}
+                    Repeat::Summary { suppressed } => {
+                        tracing::warn!(
+                            stream = %low,
+                            suppressed,
+                            %reason,
+                            "the tile's chain is still not taking"
+                        );
+                    }
+                }
                 self.mark_degraded(&low, reason).await;
             }
         }

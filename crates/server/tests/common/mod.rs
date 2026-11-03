@@ -4,6 +4,35 @@
 
 pub mod mqtt;
 
+/// The fmt subscriber's own writer, so a test can read what was logged.
+#[derive(Clone, Default)]
+pub struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("the buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// A motion-episode store on a scratch path: tests that never read the
 /// timeline still need one wired.
 pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::EpisodeStore> {

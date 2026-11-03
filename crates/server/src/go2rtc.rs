@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::redact::redact_credentials;
 use crate::supervisor::{HoldLease, StreamHold};
+use crate::throttle::{Repeat, RepeatLog};
 
 /// Where the generated config puts go2rtc's API.
 pub const API_BASE: &str = "http://127.0.0.1:1984";
@@ -666,6 +667,67 @@ fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
+/// A failure's words with ffmpeg's per-process addresses (`0x...`) removed,
+/// so the same failure keeps one signature across runs.
+fn failure_signature(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .filter(|word| !word.starts_with("0x"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A young death, through the throttle: the first of a streak in full, the
+/// rest counted.
+fn log_hold_exit(
+    stream: &str,
+    ran_for: Duration,
+    status: &Result<std::process::ExitStatus, std::io::Error>,
+    failures: u32,
+    reason: &str,
+    repeats: &RepeatLog,
+) {
+    match repeats.note(stream, &failure_signature(reason)) {
+        Repeat::First => tracing::warn!(
+            stream = %stream,
+            ran_for = ?ran_for,
+            ?status,
+            failures,
+            reason = %reason,
+            "the hold consumer exited"
+        ),
+        Repeat::Suppressed => {}
+        Repeat::Summary { suppressed } => tracing::warn!(
+            stream = %stream,
+            ran_for = ?ran_for,
+            ?status,
+            failures,
+            suppressed,
+            reason = %reason,
+            "the hold consumer is still exiting"
+        ),
+    }
+}
+
+/// A failed spawn, through the throttle, like [`log_hold_exit`].
+fn log_hold_spawn_failure(stream: &str, err: &std::io::Error, failures: u32, repeats: &RepeatLog) {
+    match repeats.note(stream, &failure_signature(&err.to_string())) {
+        Repeat::First => {
+            tracing::warn!(stream = %stream, %err, failures, "the hold consumer could not start");
+        }
+        Repeat::Suppressed => {}
+        Repeat::Summary { suppressed } => {
+            tracing::warn!(
+                stream = %stream,
+                %err,
+                failures,
+                suppressed,
+                "the hold consumer still cannot start"
+            );
+        }
+    }
+}
+
 /// The base delay before a hold reconnects: long enough that a camera
 /// that is away is not dialled every second, short enough that a viewer
 /// arriving after a failure waits seconds, not minutes. Consecutive young
@@ -758,6 +820,7 @@ impl StreamHold for FfmpegHold {
             let attached = Arc::clone(&attached);
             tokio::spawn(async move {
                 let mut failures: u32 = 0;
+                let repeats = RepeatLog::default();
                 loop {
                     let started = Instant::now();
                     match Command::new(&ffmpeg)
@@ -807,29 +870,32 @@ impl StreamHold for FfmpegHold {
                                 }
                                 None => String::new(),
                             };
-                            if started.elapsed() >= HOLD_HEALTHY_RUN {
+                            let ran_for = started.elapsed();
+                            let reason = snippet(&redact_credentials(&reason));
+                            if ran_for >= HOLD_HEALTHY_RUN {
+                                // A healthy run ends the failure streak: the
+                                // next young death logs its detail again.
                                 failures = 0;
+                                repeats.recovered(&stream);
+                                tracing::warn!(
+                                    stream = %stream,
+                                    ran_for = ?ran_for,
+                                    ?status,
+                                    failures,
+                                    reason = %reason,
+                                    "the hold consumer exited"
+                                );
                             } else {
                                 failures += 1;
+                                log_hold_exit(
+                                    &stream, ran_for, &status, failures, &reason, &repeats,
+                                );
                             }
-                            tracing::warn!(
-                                stream = %stream,
-                                ran_for = ?started.elapsed(),
-                                ?status,
-                                failures,
-                                reason = %snippet(&redact_credentials(&reason)),
-                                "the hold consumer exited"
-                            );
                         }
                         Err(err) => {
                             attached.store(false, Ordering::SeqCst);
                             failures += 1;
-                            tracing::warn!(
-                                stream = %stream,
-                                %err,
-                                failures,
-                                "the hold consumer could not start"
-                            );
+                            log_hold_spawn_failure(&stream, &err, failures, &repeats);
                         }
                     }
                     if failures == HOLD_ESCALATE_AT {
@@ -885,6 +951,21 @@ mod tests {
             )
         );
         assert_eq!(redacted_line(b" \n"), None, "a blank line is not emitted");
+    }
+
+    #[test]
+    fn a_hold_failure_signature_ignores_ffmpeg_addresses() {
+        let first = "[tcp @ 0x5f225addb5c0] Connection to tcp://127.0.0.1:8554?timeout=0 failed: Connection refused";
+        let second = "[tcp @ 0x59d0d9c2f5c0] Connection to tcp://127.0.0.1:8554?timeout=0 failed: Connection refused";
+        assert_eq!(
+            failure_signature(first),
+            failure_signature(second),
+            "the per-process address is not part of the failure"
+        );
+        assert!(
+            failure_signature(first).contains("Connection refused"),
+            "the failure's own words survive"
+        );
     }
 
     #[test]

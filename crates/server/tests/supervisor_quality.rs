@@ -740,6 +740,107 @@ async fn a_status_check_that_fails_keeps_the_stream() {
     );
 }
 
+/// The liveness watch reports a dead engine once, not once per slice, and
+/// its recovery once: the retained hub log carried 44,006 of these lines in
+/// a few hours.
+#[tokio::test]
+async fn a_dead_engine_logs_its_liveness_failure_once() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let captured = common::Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let downs = |text: &str| {
+        text.matches("the liveness watch could not read go2rtc")
+            .count()
+    };
+    let ups = |text: &str| {
+        text.matches("the liveness watch can read go2rtc again")
+            .count()
+    };
+
+    h.go2rtc.set_streams_error(true);
+    assert!(
+        common::eventually(|| async { downs(&captured.text()) > 0 }).await,
+        "the outage is reported"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        downs(&captured.text()),
+        1,
+        "one line for the outage, not one per slice: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(false);
+    assert!(
+        common::eventually(|| async { ups(&captured.text()) > 0 }).await,
+        "the recovery is reported"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let text = captured.text();
+    assert_eq!(ups(&text), 1, "one recovery line: {text}");
+    assert_eq!(downs(&text), 1, "the recovery adds no failure line: {text}");
+}
+
+/// The tile chain reports a dead engine once, not once per loop slice, and
+/// its recovery once: the retained hub log carried 35,167 of these lines.
+#[tokio::test]
+async fn a_dead_engine_logs_the_broken_chain_once() {
+    let h = harness(Duration::from_millis(60)).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let captured = common::Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let downs = |text: &str| text.matches("the tile's chain did not take").count();
+    let ups = |text: &str| text.matches("the tile's chain took again").count();
+
+    // A dead engine fails both ways: the view cannot be read, and the
+    // chain's PUT is refused.
+    h.go2rtc.set_streams_error(true);
+    h.go2rtc.set_put_refused_marker(Some("#input="));
+    assert!(
+        common::eventually(|| async { downs(&captured.text()) > 0 }).await,
+        "the broken chain is reported"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        downs(&captured.text()),
+        1,
+        "one line, not one per slice: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_streams_error(false);
+    h.go2rtc.set_put_refused_marker(None);
+    assert!(
+        common::eventually(|| async { ups(&captured.text()) > 0 }).await,
+        "the chain's recovery is reported"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let text = captured.text();
+    assert_eq!(ups(&text), 1, "one recovery line: {text}");
+    assert_eq!(downs(&text), 1, "the recovery adds no failure line: {text}");
+}
+
 #[tokio::test]
 async fn a_retry_during_a_mint_does_not_mint_again() {
     let h = harness(Duration::from_secs(30)).await;

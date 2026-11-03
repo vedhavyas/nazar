@@ -16,3 +16,4 @@ pub mod notify;
 pub mod recordings;
 mod redact;
 pub mod supervisor;
+pub mod throttle;
