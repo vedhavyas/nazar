@@ -302,6 +302,8 @@ test('a live tile waiting on its stream name says so', () => {
 });
 
 test('a degraded tile shows its short reason and never the technical detail', () => {
+  const details =
+    'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)';
   const onwatch = vi.fn();
   render(CameraTile, {
     camera: {
@@ -309,8 +311,7 @@ test('a degraded tile shows its short reason and never the technical detail', ()
       name: 'Hall',
       state: 'degraded',
       reason: 'stream engine unavailable',
-      details:
-        'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)',
+      details,
     },
     onwatch,
   });
@@ -322,7 +323,7 @@ test('a degraded tile shows its short reason and never the technical detail', ()
   expect(
     document.body.textContent,
     'the technical detail never reaches the grid',
-  ).not.toContain('127.0.0.1');
+  ).not.toContain(details);
 });
 
 async function videoOf(): Promise<HTMLVideoElement> {
