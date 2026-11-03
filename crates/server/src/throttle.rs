@@ -90,18 +90,6 @@ impl RepeatLog {
             .remove(key)
             .is_some()
     }
-
-    /// Every key answers again (one read covers them all): how many had a
-    /// failure on record.
-    pub fn recovered_all(&self) -> usize {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let recovered = entries.len();
-        entries.clear();
-        recovered
-    }
 }
 
 #[cfg(test)]
@@ -132,6 +120,7 @@ mod tests {
     fn a_recovered_key_logs_its_next_failure_in_full() {
         let log = RepeatLog::new(Duration::from_secs(60));
         assert_eq!(log.note("hall", "connection refused"), Repeat::First);
+        assert_eq!(log.note("porch", "connection refused"), Repeat::First);
         assert!(log.recovered("hall"), "the failure was on record");
         assert!(!log.recovered("hall"), "the record is gone");
         assert_eq!(
@@ -139,14 +128,10 @@ mod tests {
             Repeat::First,
             "a new failure logs in full after a recovery"
         );
-    }
-
-    #[test]
-    fn a_recovered_all_names_how_many_were_failing() {
-        let log = RepeatLog::new(Duration::from_secs(60));
-        log.note("hall", "connection refused");
-        log.note("porch", "connection refused");
-        assert_eq!(log.recovered_all(), 2);
-        assert_eq!(log.recovered_all(), 0, "a second read finds nothing");
+        assert_eq!(
+            log.note("porch", "connection refused"),
+            Repeat::Suppressed,
+            "one stream's recovery leaves another's record alone"
+        );
     }
 }

@@ -1442,8 +1442,8 @@ impl Supervisor {
     async fn watch_producer(&self, name: &str) -> ProducerWatch {
         let streams = match self.go2rtc.streams().await {
             Ok(streams) => {
-                if self.liveness_repeats.recovered_all() > 0 {
-                    tracing::info!("the liveness watch can read go2rtc again");
+                if self.liveness_repeats.recovered(name) {
+                    tracing::info!(stream = %name, "the liveness watch can read go2rtc again");
                 }
                 streams
             }
