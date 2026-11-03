@@ -12,6 +12,16 @@ const URL_SCHEMES: [&str; 6] = [
     "https://", "http://", "rtsps://", "rtsp://", "wss://", "ws://",
 ];
 
+/// The same schemes as a quoted JSON body carries them: `https:\/\/...`.
+const ESCAPED_URL_SCHEMES: [&str; 6] = [
+    "https:\\/\\/",
+    "http:\\/\\/",
+    "rtsps:\\/\\/",
+    "rtsp:\\/\\/",
+    "wss:\\/\\/",
+    "ws:\\/\\/",
+];
+
 /// A URL keeps its endpoint and loses its query, where a mint's
 /// credentials ride. The scheme is matched in any case and kept as found.
 pub(crate) fn strip_url_queries(text: &str) -> String {
@@ -21,6 +31,7 @@ pub(crate) fn strip_url_queries(text: &str) -> String {
     loop {
         let next = URL_SCHEMES
             .iter()
+            .chain(ESCAPED_URL_SCHEMES.iter())
             .filter_map(|scheme| lower[at..].find(scheme).map(|off| (at + off, *scheme)))
             .min_by_key(|(start, _)| *start);
         let Some((start, scheme)) = next else {
@@ -117,21 +128,12 @@ pub(crate) fn redact_credentials(text: &str) -> String {
             {
                 Some(1)
             }
-            // A JSON body quotes its key: `{"token": "secret"}`.
-            Some(b'"' | b'\'')
-                if bytes.get(sep_at + 1) == Some(&b':')
-                    && bytes.get(sep_at + 2).is_some_and(|byte| {
-                        byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'\\')
-                    }) =>
-            {
-                Some(2)
-            }
-            // A JSON body escaped inside a string: `{\"token\":\"secret\"}`.
-            Some(b'\\')
-                if matches!(bytes.get(sep_at + 1), Some(b'"' | b'\''))
-                    && bytes.get(sep_at + 2) == Some(&b':') =>
-            {
-                Some(3)
+            // A JSON body quotes its key: `{"token": "secret"}`, with or
+            // without spaces before the colon.
+            Some(b'"' | b'\'') => quoted_colon(bytes, sep_at),
+            // A JSON body escaped inside a string: `{\"token\" : \"x\"}`.
+            Some(b'\\') if matches!(bytes.get(sep_at + 1), Some(b'"' | b'\'')) => {
+                quoted_colon(bytes, sep_at + 1).map(|len| 1 + len)
             }
             _ => encoded_len(bytes, sep_at, b'3', b'd').or_else(|| encoded_json_sep(bytes, sep_at)),
         };
@@ -172,13 +174,32 @@ pub(crate) fn redact_credentials(text: &str) -> String {
     }
 }
 
+/// A JSON key's closing quote, any spaces, and the colon. `at` points at
+/// the quote; the length is measured from there.
+fn quoted_colon(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    // A value must follow, or prose like `"token":` alone is left alone.
+    let next = bytes.get(i + 1)?;
+    (next.is_ascii_whitespace() || matches!(next, b'"' | b'\'' | b'\\')).then_some(i + 1 - at)
+}
+
 /// The length of a percent-encoded JSON key's closer and colon (`%22%3A`
-/// or `%27%3A`), as a nested encoding leaves them.
+/// or `%27%3A`), with any encoded spaces between them.
 fn encoded_json_sep(bytes: &[u8], at: usize) -> Option<usize> {
     let quote =
         encoded_len(bytes, at, b'2', b'2').or_else(|| encoded_len(bytes, at, b'2', b'7'))?;
-    let colon = encoded_len(bytes, at + quote, b'3', b'a')?;
-    Some(quote + colon)
+    let mut i = at + quote;
+    while let Some(space) = encoded_len(bytes, i, b'2', b'0') {
+        i += space;
+    }
+    let colon = encoded_len(bytes, i, b'3', b'a')?;
+    Some(i + colon - at)
 }
 
 /// The length of an encoded `=` or `&`, accepting either case and any
@@ -203,12 +224,28 @@ fn encoded_len(bytes: &[u8], at: usize, lead: u8, tail: u8) -> Option<usize> {
 /// `\"` pair of an escaped one. `None` when the quote never closes.
 fn quoted_end(bytes: &[u8], at: usize, quote: u8, escaped: bool) -> Option<usize> {
     if escaped {
-        bytes[at..]
+        return bytes[at..]
             .windows(2)
-            .position(|pair| pair == [b'\\', quote])
-    } else {
-        bytes[at..].iter().position(|&byte| byte == quote)
+            .position(|pair| pair == [b'\\', quote]);
     }
+    let mut i = at;
+    while let Some(&byte) = bytes.get(i) {
+        if byte == quote {
+            // A quote escaped by an odd run of backslashes belongs to the
+            // value: `{"token":"ab\"cd"}` ends at the last quote only.
+            let mut backslashes = 0;
+            let mut start = i;
+            while start > at && bytes[start - 1] == b'\\' {
+                backslashes += 1;
+                start -= 1;
+            }
+            if backslashes % 2 == 0 {
+                return Some(i - at);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// How far a credential's value runs before a separator: raw or encoded
@@ -267,9 +304,15 @@ mod tests {
                 "{\\\"token\\\":\\\"<redacted>\\\"}",
             ),
             (
-                "%22token%22%3A%22secret%22%26next%3D1",
-                "%22token%22%3A<redacted>%26next%3D1",
+                "{\\\"token\\\" : \\\"secret\\\"}",
+                "{\\\"token\\\" : \\\"<redacted>\\\"}",
             ),
+            ("{\"token\" : \"secret\"}", "{\"token\" : \"<redacted>\"}"),
+            (
+                "%22token%22%20%3A%20%22secret%22%26next%3D1",
+                "%22token%22%20%3A<redacted>%26next%3D1",
+            ),
+            ("{\"token\":\"ab\\\"cd\"}", "{\"token\":\"<redacted>\"}"),
             ("token= spaced", "token= <redacted>"),
             ("token=café", "token=<redacted>"),
         ];
@@ -320,6 +363,10 @@ mod tests {
             (
                 "URL (HTTPS://cloud.example/live/cam?sessionId=sid)",
                 "URL (HTTPS://cloud.example/live/cam?<redacted>)",
+            ),
+            (
+                r#"{"u":"https:\/\/w.ex\/c?token=abc"}"#,
+                r#"{"u":"https:\/\/w.ex\/c?<redacted>"}"#,
             ),
         ];
         for (raw, expected) in cases {

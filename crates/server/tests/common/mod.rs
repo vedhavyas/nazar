@@ -331,8 +331,7 @@ pub struct FakeApi {
     /// `delete:<name>`: the order tests otherwise cannot see.
     ops: Arc<Mutex<Vec<String>>>,
     /// The answer a DELETE gives: 200 with no body unless a test sets one.
-    delete_status: Arc<AtomicU16>,
-    delete_body: Arc<Mutex<Option<String>>>,
+    delete_answer: Arc<Mutex<(u16, Option<String>)>>,
     /// How long a PUT takes to answer, in milliseconds: a put caught
     /// mid-flight, or one past a caller's own bound.
     put_delay: Arc<AtomicU64>,
@@ -355,8 +354,7 @@ impl FakeApi {
         let url_state = Arc::new(Mutex::new(HashMap::new()));
         let dialed = Arc::new(Mutex::new(HashSet::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
-        let delete_status = Arc::new(AtomicU16::new(200));
-        let delete_body = Arc::new(Mutex::new(None));
+        let delete_answer = Arc::new(Mutex::new((200, None)));
         let put_delay = Arc::new(AtomicU64::new(0));
         let ops = Arc::new(Mutex::new(Vec::new()));
         let app = hls_routes().merge(streams_routes(
@@ -373,8 +371,7 @@ impl FakeApi {
                 dialed: &dialed,
                 connect_after: &connect_after,
                 delete_delay: &delete_delay,
-                delete_status: &delete_status,
-                delete_body: &delete_body,
+                delete_answer: &delete_answer,
                 put_delay: &put_delay,
                 ops: &ops,
                 taken: &taken,
@@ -406,8 +403,7 @@ impl FakeApi {
             connect_after,
             held,
             delete_delay,
-            delete_status,
-            delete_body,
+            delete_answer,
             put_delay,
             ops,
         }
@@ -475,11 +471,20 @@ impl FakeApi {
     /// Make every DELETE answer `status` with `body`, as a go2rtc whose
     /// config is in a different shape would.
     pub fn set_delete_status(&self, status: u16, body: Option<&str>) {
-        self.delete_status.store(status, Ordering::SeqCst);
         *self
-            .delete_body
+            .delete_answer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = body.map(str::to_owned);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (status, body.map(str::to_owned));
+    }
+
+    /// The stream names the fake currently holds in its streams view.
+    pub fn stream_names(&self) -> Vec<String> {
+        self.taken
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Report `count` viewers on the stream, as go2rtc does while a browser
@@ -668,8 +673,7 @@ struct Knobs<'a> {
     dialed: &'a Arc<Mutex<HashSet<String>>>,
     connect_after: &'a Arc<Mutex<HashMap<String, Duration>>>,
     delete_delay: &'a Arc<AtomicU64>,
-    delete_status: &'a Arc<AtomicU16>,
-    delete_body: &'a Arc<Mutex<Option<String>>>,
+    delete_answer: &'a Arc<Mutex<(u16, Option<String>)>>,
     put_delay: &'a Arc<AtomicU64>,
     ops: &'a Arc<Mutex<Vec<String>>>,
     taken: &'a Arc<Mutex<Vec<(String, String)>>>,
@@ -795,11 +799,11 @@ fn streams_methods(
     let drop_stream = delete_handler(
         Arc::clone(deletes),
         Arc::clone(knobs.delete_delay),
-        Arc::clone(knobs.delete_status),
-        Arc::clone(knobs.delete_body),
+        Arc::clone(knobs.delete_answer),
         Arc::clone(knobs.ops),
         Arc::clone(knobs.taken),
     );
+
     let list_streams = list_streams_handler(StreamsAnswer {
         recorded: Arc::clone(knobs.taken),
         visible: Arc::clone(knobs.streams_visible),
@@ -819,16 +823,14 @@ fn streams_methods(
 fn delete_handler(
     dropped: Arc<Mutex<Vec<String>>>,
     delay: Arc<AtomicU64>,
-    status: Arc<AtomicU16>,
-    body: Arc<Mutex<Option<String>>>,
+    answer: Arc<Mutex<(u16, Option<String>)>>,
     ops: Arc<Mutex<Vec<String>>>,
     taken: Arc<Mutex<Vec<(String, String)>>>,
 ) -> axum::routing::MethodRouter {
     axum::routing::delete(move |Query(params): Query<HashMap<String, String>>| {
         let dropped = Arc::clone(&dropped);
         let delay = Arc::clone(&delay);
-        let status = Arc::clone(&status);
-        let body = Arc::clone(&body);
+        let answer = Arc::clone(&answer);
         let ops = Arc::clone(&ops);
         let taken = Arc::clone(&taken);
         async move {
@@ -838,21 +840,22 @@ fn delete_handler(
             let src = params.get("src").cloned().unwrap_or_default();
             dropped.lock().unwrap().push(src.clone());
             ops.lock().unwrap().push(format!("delete:{src}"));
-            // A real go2rtc drops the entry: the streams view must no
+            let (code, text) = answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+            // A successful DELETE drops the entry: the streams view must no
             // longer list it, or a reconcile reads a deleted chain as
-            // present.
-            taken.lock().unwrap().retain(|(name, _)| name != &src);
+            // present. A failed one leaves the entry, as go2rtc's does.
+            if status.is_success() {
+                taken.lock().unwrap().retain(|(name, _)| name != &src);
+            }
             let millis = delay.load(Ordering::SeqCst);
             if millis > 0 {
                 tokio::time::sleep(Duration::from_millis(millis)).await;
             }
-            let code = status.load(Ordering::SeqCst);
-            let text = body
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or_default();
-            (StatusCode::from_u16(code).unwrap_or(StatusCode::OK), text)
+            (status, text.unwrap_or_default())
         }
     })
 }

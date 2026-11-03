@@ -942,6 +942,43 @@ async fn a_refresh_spends_both_tokens_and_takes_the_fresh_pair() {
     assert_eq!(body["refreshToken"], json!("gm-refresh-token"));
 }
 
+/// An empty access token is not a rotation: saving it would leave every
+/// later discovery re-refreshing with a session that cannot authenticate.
+#[tokio::test]
+async fn a_refresh_refuses_an_empty_access_token() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        REFRESH_PATH,
+        200,
+        r#"{"accessToken":"","refreshToken":"gm-refresh-token-2"}"#,
+    )
+    .await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some("gm-refresh-token".to_owned()),
+    };
+
+    let err = refresh_session(&client, &stored)
+        .await
+        .expect_err("an empty token is not a rotation");
+    match err {
+        QuboError::Http {
+            status: None,
+            message,
+        } => {
+            assert!(
+                message.contains("not understood"),
+                "the fixed reason: {message}"
+            );
+        }
+        other => panic!("expected the fixed Http reason, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_refresh_without_a_rotation_keeps_the_stored_token() {
     let server = MockServer::start().await;

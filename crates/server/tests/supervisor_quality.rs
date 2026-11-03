@@ -792,11 +792,6 @@ async fn a_dead_engine_logs_its_liveness_failure_once() {
         "one line for the outage, not one per slice: {}",
         captured.text()
     );
-    assert!(
-        captured.text().contains("cause="),
-        "the failing cause is named on the line: {}",
-        captured.text()
-    );
 
     h.go2rtc.set_streams_error(false);
     assert!(
@@ -842,11 +837,6 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
         downs(&captured.text()),
         1,
         "one line, not one per slice: {}",
-        captured.text()
-    );
-    assert!(
-        captured.text().contains("cause="),
-        "the failing cause is named on the line: {}",
         captured.text()
     );
 
@@ -909,7 +899,7 @@ async fn a_transport_failure_keeps_its_cause_on_every_site() {
         "both sites report the transport failure: {}",
         captured.text()
     );
-    // The ensure path logs the strip in full; the loop's repeats are
+    // The ensure path logs the first line in full; the loop's repeats are
     // suppressed under the same cause, which is the throttle working.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let text = captured.text();
@@ -971,22 +961,58 @@ async fn a_failed_predecessor_reap_is_split_by_its_answer() {
         captured.text()
     );
 
+    // A 400 that is not the benign shape is a real failure, as is any
+    // other status; both warn and name their cause.
+    h.go2rtc.set_delete_status(400, Some("boom"));
+    assert!(
+        common::eventually(|| async {
+            captured.text().lines().any(|line| {
+                line.contains("the predecessor could not be reaped") && line.contains("cause=")
+            })
+        })
+        .await,
+        "a non-benign 400 is warned with its cause: {}",
+        captured.text()
+    );
+    let non_benign = captured
+        .text()
+        .lines()
+        .find(|line| line.contains("the predecessor could not be reaped"))
+        .map(str::to_owned)
+        .expect("the warned line");
+    assert!(
+        non_benign.contains("HTTP 400"),
+        "the line names the status: {non_benign}"
+    );
+
     h.go2rtc.set_delete_status(500, Some("boom"));
     assert!(
         common::eventually(|| async {
-            captured
-                .text()
-                .contains("the predecessor could not be reaped")
+            captured.text().lines().any(|line| {
+                line.contains("the predecessor could not be reaped") && line.contains("HTTP 500")
+            })
         })
         .await,
-        "a real reap failure is warned: {}",
+        "a 500 reap failure is warned: {}",
         captured.text()
+    );
+
+    // A failed reap leaves the predecessor: the next swap's delete and put
+    // both fail, so the entry must still be there afterwards.
+    h.go2rtc.set_put_status(500);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        h.go2rtc
+            .stream_names()
+            .contains(&format!("{DEVICE_ID}-high")),
+        "a failed reap leaves the predecessor: {:?}",
+        h.go2rtc.stream_names()
     );
 }
 
-/// A re-mint failure names its cause: a refused PUT and a timed-out PUT
-/// print the same reqwest sentence in the reason, so the chain is what
-/// tells them apart.
+/// A re-mint failure names its cause: a timed-out PUT and a PUT the engine
+/// rejects land on the same line shape, and only the cause tells them
+/// apart (only the timeout is a transport failure).
 #[tokio::test]
 async fn a_re_mint_failure_names_its_cause() {
     let mut pacing = pacing(Duration::from_millis(60));
@@ -1038,7 +1064,23 @@ async fn a_re_mint_failure_names_its_cause() {
         "the refused put is reported: {}",
         captured.text()
     );
-    assert_ne!(timed_out, refused, "the two causes produce different lines");
+    let cause_of =
+        |line: &str| -> String { line.split("cause=").nth(1).unwrap_or_default().to_owned() };
+    let timed_out = timed_out.expect("the timed-out line");
+    let refused = refused.expect("the refused line");
+    assert!(
+        cause_of(&timed_out).contains("timed out"),
+        "the timeout's cause names it: {timed_out}"
+    );
+    assert!(
+        cause_of(&refused).contains("HTTP 500"),
+        "the refusal's cause names its status: {refused}"
+    );
+    assert_ne!(
+        cause_of(&timed_out),
+        cause_of(&refused),
+        "the two causes differ: {timed_out} vs {refused}"
+    );
 }
 
 #[tokio::test]

@@ -36,8 +36,11 @@ async fn a_refused_connection_is_classified_without_its_url()
 
 #[tokio::test]
 async fn a_dns_failure_is_classified_as_one() -> Result<(), Box<dyn std::error::Error>> {
-    // The `.invalid` TLD is reserved to never resolve.
-    let Err(err) = reqwest::Client::new()
+    // The `.invalid` TLD is reserved to never resolve. No proxy: the suite's
+    // only real lookup must reach the resolver, not a forwarded URL.
+    let Err(err) = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
         .get("http://nazar-does-not-exist.invalid/refresh")
         .send()
         .await

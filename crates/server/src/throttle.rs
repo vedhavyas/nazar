@@ -15,10 +15,10 @@ const RECOVERY_AFTER: u32 = 3;
 /// A cause with no traffic for this long is forgotten.
 const STALE_AFTER: Duration = Duration::from_hours(6);
 
-/// How many causes one key may remember. A key is a stream at one call
-/// site (the hold keeps an exit key and a spawn key), so a stream holds at
-/// most twice this. The cap is local, so one noisy key cannot evict
-/// another's records.
+/// How many causes one key may remember. The hold uses one `RepeatLog` per
+/// hold with two keys (exit and spawn), so each of those keys is capped
+/// independently. The cap is local: one noisy key cannot evict another's
+/// records.
 const MAX_PER_KEY: usize = 8;
 
 /// What a repeated failure should log.
@@ -532,6 +532,26 @@ mod tests {
             log.note("hall", "cause 1"),
             Repeat::First,
             "a record with nothing pending was evicted instead"
+        );
+    }
+
+    /// Dropping one stale record must not reset the key's recovery streak
+    /// while another cause is still fresh.
+    #[test]
+    fn a_stale_drop_keeps_a_live_keys_streak() {
+        let log = RepeatLog::new(Duration::from_secs(60), 3, Duration::from_secs(1));
+        assert_eq!(log.note("hall", "cause a"), Repeat::First);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(log.note("hall", "cause b"), Repeat::First);
+        assert_eq!(log.recovered("hall"), None);
+        assert_eq!(log.recovered("hall"), None);
+        // `cause a` is stale by now; `cause b` is not. The third success
+        // must still complete the streak.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            log.recovered("hall"),
+            Some(0),
+            "the streak survived the stale record's drop"
         );
     }
 

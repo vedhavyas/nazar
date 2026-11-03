@@ -1090,6 +1090,11 @@ mod tests {
             failure_signature("frame 0xdeadbeef missing").contains("0xdeadbeef"),
             "a hex word that is not an ffmpeg address stays in the signature"
         );
+        let two = failure_signature("[tcp @ 0x1234 0x5678] Connection refused");
+        assert!(
+            !two.contains("0x1234") && two.contains("0x5678"),
+            "only the word directly after @ goes: {two}"
+        );
     }
 
     #[cfg(unix)]

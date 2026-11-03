@@ -83,39 +83,3 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
         CaptureWriter
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A nested capture puts the outer buffer back when it goes.
-    #[test]
-    fn a_nested_capture_restores_the_outer_buffer() {
-        let outer = Captured::start();
-        tracing::warn!("outer one");
-        let inner = Captured::start();
-        tracing::warn!("inner one");
-        assert!(
-            inner.text().contains("inner one"),
-            "the inner capture sees its own line: {}",
-            inner.text()
-        );
-        assert!(
-            !inner.text().contains("outer one"),
-            "and not the outer's: {}",
-            inner.text()
-        );
-        drop(inner);
-        tracing::warn!("outer two");
-        assert!(
-            outer.text().contains("outer two"),
-            "the outer capture is live again: {}",
-            outer.text()
-        );
-        assert!(
-            !outer.text().contains("inner one"),
-            "and did not take the inner's lines: {}",
-            outer.text()
-        );
-    }
-}

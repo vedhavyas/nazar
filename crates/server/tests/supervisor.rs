@@ -1785,7 +1785,7 @@ async fn a_non_offline_refusal_keeps_the_stale_source() {
         matches!(
             h.supervisor.status(DEVICE_ID).await,
             StreamState::Degraded { reason }
-                if reason == "api error ERR_STM_002: request rejected"
+                if reason == "http 400: api error ERR_STM_002: request rejected"
         )
     })
     .await;
