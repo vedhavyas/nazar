@@ -229,7 +229,9 @@ impl From<SupervisorError> for ApiError {
             SupervisorError::UnknownDevice(id) => {
                 Self::new(StatusCode::NOT_FOUND, format!("unknown device {id}"))
             }
-            SupervisorError::Go2rtc(reason) => Self::new(StatusCode::BAD_GATEWAY, reason),
+            SupervisorError::Go2rtc(reason) => {
+                Self::new(StatusCode::BAD_GATEWAY, diagnostic_detail(&reason))
+            }
             SupervisorError::Qubo(err) => err.into(),
         }
     }

@@ -182,6 +182,43 @@ async fn a_vod_go2rtc_did_not_take_is_an_error() {
     );
 }
 
+/// A refusal quotes the source back, credentials and all; the error body
+/// must not hand the browser the mint's credentials.
+#[tokio::test]
+async fn a_playback_refusal_carries_no_credentials() {
+    let h = harness(Duration::from_secs(120)).await;
+    Mock::given(method("POST"))
+        .and(path(VOD_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "appSessionId": "sess-9d1",
+                    "streamURL": format!(
+                        "rtsps://wowza.example.com:443/hero-iot-live/{CAMERA}%3Fwowzatoken%253Dsekrit-token%26sessionid%3dsess-9d1%26useruuid%3dusr-7f3%26camsessionid%3dcam-4a2"
+                    ),
+                })
+                .to_string(),
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    h.go2rtc.set_put_refused_marker(Some("sekrit-token"));
+
+    let refusal = play(&h, CLIP_MS).await;
+    assert_eq!(refusal.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body = refusal.text().await.expect("a body");
+    for secret in ["sekrit-token", "sess-9d1", "usr-7f3", "cam-4a2"] {
+        assert!(
+            !body.contains(secret),
+            "the refusal carries the credential {secret}: {body}"
+        );
+    }
+    assert!(
+        body.contains("<redacted>"),
+        "the refusal says what was removed: {body}"
+    );
+}
+
 #[tokio::test]
 async fn a_playback_mints_at_the_instant_and_names_its_own_stream() {
     let h = harness(Duration::from_secs(120)).await;
