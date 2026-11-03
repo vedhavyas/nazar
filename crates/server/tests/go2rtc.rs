@@ -897,21 +897,39 @@ async fn a_dying_hold_reports_its_exit_once() {
             .expect("the stand-in is executable");
     }
 
-    let captured = common::Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let captured = common::Captured::start();
 
     let hold = server::go2rtc::FfmpegHold::new(bin);
     let lease = hold.hold("hall-high");
+    let exits_path = dir.join("exits.log");
 
-    // The second exit lands one backoff later (the base doubled once).
-    let two_exits = await_text_where(&dir.join("exits.log"), |text| text.len() >= 2)
-        .await
-        .is_some();
-    assert!(two_exits, "the hold re-ran and died twice");
+    // Pin the first line before the second death can race it: the final
+    // count only means something once the first was seen.
+    assert!(
+        await_text_where(&exits_path, |text| !text.is_empty())
+            .await
+            .is_some(),
+        "the hold died once"
+    );
+    assert!(
+        common::eventually(|| async {
+            captured.text().matches("the hold consumer exited").count() == 1
+        })
+        .await,
+        "the first exit logs in full: {}",
+        captured.text()
+    );
+
+    // The second exit lands one backoff later (the base doubled once), and
+    // must add nothing; the settle lets an unthrottled line land before the
+    // count is read.
+    assert!(
+        await_text_where(&exits_path, |text| text.len() >= 2)
+            .await
+            .is_some(),
+        "the hold re-ran and died twice"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         captured.text().matches("the hold consumer exited").count(),
         1,

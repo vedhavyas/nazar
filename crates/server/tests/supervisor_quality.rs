@@ -753,12 +753,7 @@ async fn a_dead_engine_logs_its_liveness_failure_once() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let captured = common::Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let captured = common::Captured::start();
     let downs = |text: &str| {
         text.matches("the liveness watch could not read go2rtc")
             .count()
@@ -804,12 +799,7 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let captured = common::Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let captured = common::Captured::start();
     let downs = |text: &str| text.matches("the tile's chain did not take").count();
     let ups = |text: &str| text.matches("the tile's chain took again").count();
 

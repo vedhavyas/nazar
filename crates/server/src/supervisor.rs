@@ -239,6 +239,29 @@ pub enum SupervisorError {
     Qubo(#[from] qubo::QuboError),
 }
 
+/// A failed go2rtc write, split two ways: `reason` is what the person may
+/// see, and `signature` adds the error's cause chain - reqwest prints one
+/// sentence for a refusal, a reset and a timeout, so the chain is what
+/// tells them apart. Both are redacted; a token can ride a cause.
+struct SwapFailure {
+    reason: String,
+    signature: String,
+}
+
+fn failure_detail(err: &Go2rtcError) -> SwapFailure {
+    let mut detail = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    SwapFailure {
+        reason: redact_credentials(&err.to_string()),
+        signature: redact_credentials(&detail),
+    }
+}
+
 /// A stream the supervisor is following: its state, the signal that forces
 /// an immediate retry, and when it was last asked for.
 struct Tracked {
@@ -998,8 +1021,12 @@ impl Supervisor {
             // is what re-arms a chain go2rtc lost.
             match self.swap_source(&name, &low_source(&high)).await {
                 Ok(()) => {
-                    if self.chain_repeats.recovered(&name) {
-                        tracing::info!(stream = %name, "the tile's chain took again");
+                    if let Some(suppressed) = self.chain_repeats.recovered(&name) {
+                        tracing::info!(
+                            stream = %name,
+                            suppressed,
+                            "the tile's chain took again"
+                        );
                     }
                     // The loop can drop the high while this PUT is in
                     // flight: what just landed dials a source that is gone.
@@ -1010,9 +1037,9 @@ impl Supervisor {
                     }
                     self.settle(&name, self.status_for_name(&high).await).await;
                 }
-                Err(err) => {
-                    let reason = redact_credentials(&err);
-                    match self.chain_repeats.note(&name, &reason) {
+                Err(failure) => {
+                    let SwapFailure { reason, signature } = failure;
+                    match self.chain_repeats.note(&name, &signature) {
                         Repeat::First => {
                             tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
                         }
@@ -1399,7 +1426,7 @@ impl Supervisor {
     /// ffmpeg never starves out on its own. Every re-PUT in this file goes
     /// through here; an absent entry's delete finds nothing and is not an
     /// error.
-    async fn swap_source(&self, name: &str, source: &str) -> Result<(), String> {
+    async fn swap_source(&self, name: &str, source: &str) -> Result<(), SwapFailure> {
         if let Err(err) = self.go2rtc.delete_stream(name).await {
             let reason = redact_credentials(&err.to_string());
             tracing::debug!(stream = %name, %reason, "no predecessor to reap on the swap");
@@ -1407,7 +1434,7 @@ impl Supervisor {
         self.go2rtc
             .put_stream(name, source)
             .await
-            .map_err(|err| redact_credentials(&err.to_string()))
+            .map_err(|err| failure_detail(&err))
     }
 
     /// Hand the source to go2rtc and confirm the entry is held, or the
@@ -1418,7 +1445,9 @@ impl Supervisor {
     /// narar's own hold, which with a hold configured is the dial that
     /// makes the stream warm.
     async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), String> {
-        self.swap_source(name, source).await?;
+        self.swap_source(name, source)
+            .await
+            .map_err(|failure| failure.reason)?;
         let held = self
             .go2rtc
             .streams()
@@ -1442,8 +1471,12 @@ impl Supervisor {
     async fn watch_producer(&self, name: &str) -> ProducerWatch {
         let streams = match self.go2rtc.streams().await {
             Ok(streams) => {
-                if self.liveness_repeats.recovered(name) {
-                    tracing::info!(stream = %name, "the liveness watch can read go2rtc again");
+                if let Some(suppressed) = self.liveness_repeats.recovered(name) {
+                    tracing::info!(
+                        stream = %name,
+                        suppressed,
+                        "the liveness watch can read go2rtc again"
+                    );
                 }
                 streams
             }
@@ -1605,8 +1638,8 @@ impl Supervisor {
             .await
             .is_ok_and(|streams| streams.iter().any(|stream| stream.name == low));
         if present {
-            if self.chain_repeats.recovered(&low) {
-                tracing::info!(stream = %low, "the tile's chain took again");
+            if let Some(suppressed) = self.chain_repeats.recovered(&low) {
+                tracing::info!(stream = %low, suppressed, "the tile's chain took again");
             }
             let live = self.status_for_name(high).await;
             self.settle(&low, live).await;
@@ -1614,15 +1647,15 @@ impl Supervisor {
         }
         match self.swap_source(&low, &low_source(high)).await {
             Ok(()) => {
-                if self.chain_repeats.recovered(&low) {
-                    tracing::info!(stream = %low, "the tile's chain took again");
+                if let Some(suppressed) = self.chain_repeats.recovered(&low) {
+                    tracing::info!(stream = %low, suppressed, "the tile's chain took again");
                 }
                 let live = self.status_for_name(high).await;
                 self.settle(&low, live).await;
             }
-            Err(err) => {
-                let reason = redact_credentials(&err);
-                match self.chain_repeats.note(&low, &reason) {
+            Err(failure) => {
+                let SwapFailure { reason, signature } = failure;
+                match self.chain_repeats.note(&low, &signature) {
                     Repeat::First => {
                         tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
                     }
@@ -2033,12 +2066,7 @@ mod tests {
             Pacing::default(),
         );
 
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let captured = Captured::start();
         // Control: the capture sees an event at all, so the heal assertion
         // below cannot pass on a dead writer.
         tracing::info!("spend-log capture probe");
@@ -2119,12 +2147,7 @@ mod tests {
             Pacing::default(),
         );
 
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let captured = Captured::start();
         tracing::info!("redaction capture probe");
 
         // The path a refused chain takes: the PUT fails, the error becomes
@@ -2163,19 +2186,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The fmt subscriber's own writer, so a test can read what was logged.
-    #[derive(Clone, Default)]
+    std::thread_local! {
+        /// The buffer this thread's events land in, when a test captures.
+        static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// This thread's tracing output. The subscriber is process-global and
+    /// routes each event to the emitting thread's buffer: tracing caches a
+    /// callsite's interest process-wide, so a thread-local subscriber can
+    /// go silent once a sibling test has run the same line without one.
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
     impl Captured {
+        fn start() -> Self {
+            static INSTALL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            INSTALL.get_or_init(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(CaptureWriter)
+                    .with_ansi(false)
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&buffer)));
+            Self(buffer)
+        }
+
         fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
         }
     }
 
-    impl std::io::Write for Captured {
+    impl Drop for Captured {
+        fn drop(&mut self) {
+            CAPTURE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    struct CaptureWriter;
+
+    impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("the buffer").extend_from_slice(buf);
+            CAPTURE.with(|slot| {
+                if let Some(buffer) = slot.borrow().as_ref() {
+                    buffer.lock().expect("the buffer").extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -2184,11 +2241,11 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            CaptureWriter
         }
     }
 }

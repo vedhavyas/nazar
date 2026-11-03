@@ -667,19 +667,35 @@ fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
-/// A failure's words with ffmpeg's per-process addresses (`0x...`) removed,
-/// so the same failure keeps one signature across runs.
+/// A failure's words with ffmpeg's per-process address (`@ 0x...`) removed,
+/// so the same failure keeps one signature across runs. Only the address
+/// shape goes; any other hex word is part of the message.
 fn failure_signature(reason: &str) -> String {
-    reason
-        .split_whitespace()
-        .filter(|word| !word.starts_with("0x"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut kept: Vec<&str> = Vec::new();
+    for word in reason.split_whitespace() {
+        if word.starts_with("0x") && kept.last() == Some(&"@") {
+            continue;
+        }
+        kept.push(word);
+    }
+    kept.join(" ")
+}
+
+/// How the child ended, as the throttle's key sees it: a clean code and a
+/// signal are different failures even when ffmpeg says nothing.
+fn exit_class(status: &Result<std::process::ExitStatus, std::io::Error>) -> String {
+    match status {
+        Ok(status) => status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}")),
+        Err(err) => format!("wait failed: {err}"),
+    }
 }
 
 /// A young death, through the throttle: the first of a streak in full, the
 /// rest counted.
 fn log_hold_exit(
+    key: &str,
     stream: &str,
     ran_for: Duration,
     status: &Result<std::process::ExitStatus, std::io::Error>,
@@ -687,7 +703,8 @@ fn log_hold_exit(
     reason: &str,
     repeats: &RepeatLog,
 ) {
-    match repeats.note(stream, &failure_signature(reason)) {
+    let cause = format!("{} {}", failure_signature(reason), exit_class(status));
+    match repeats.note(key, &cause) {
         Repeat::First => tracing::warn!(
             stream = %stream,
             ran_for = ?ran_for,
@@ -709,9 +726,45 @@ fn log_hold_exit(
     }
 }
 
+/// A run that outlived [`HOLD_HEALTHY_RUN`]: it ends the failure streak,
+/// names the count it suppressed, and logs the exit itself.
+fn log_hold_healthy_run(
+    exit_key: &str,
+    spawn_key: &str,
+    stream: &str,
+    ran_for: Duration,
+    status: &Result<std::process::ExitStatus, std::io::Error>,
+    reason: &str,
+    repeats: &RepeatLog,
+) {
+    let ended = repeats.recovered_now(exit_key);
+    let started = repeats.recovered_now(spawn_key);
+    if ended.is_some() || started.is_some() {
+        tracing::info!(
+            stream = %stream,
+            suppressed = ended.unwrap_or(0) + started.unwrap_or(0),
+            "the hold consumer ran healthy; the failure streak is over"
+        );
+    }
+    tracing::warn!(
+        stream = %stream,
+        ran_for = ?ran_for,
+        ?status,
+        failures = 0,
+        reason = %reason,
+        "the hold consumer exited"
+    );
+}
+
 /// A failed spawn, through the throttle, like [`log_hold_exit`].
-fn log_hold_spawn_failure(stream: &str, err: &std::io::Error, failures: u32, repeats: &RepeatLog) {
-    match repeats.note(stream, &failure_signature(&err.to_string())) {
+fn log_hold_spawn_failure(
+    key: &str,
+    stream: &str,
+    err: &std::io::Error,
+    failures: u32,
+    repeats: &RepeatLog,
+) {
+    match repeats.note(key, &failure_signature(&err.to_string())) {
         Repeat::First => {
             tracing::warn!(stream = %stream, %err, failures, "the hold consumer could not start");
         }
@@ -814,6 +867,10 @@ impl StreamHold for FfmpegHold {
         let ffmpeg = self.ffmpeg.clone();
         let target = format!("rtsp://{RTSP_ADDR}/{name}");
         let stream = name.to_owned();
+        // A death and a failure to start are different failures even when
+        // their words coincide, so they never share a record.
+        let exit_key = format!("{stream}:exit");
+        let spawn_key = format!("{stream}:spawn");
         let attached = Arc::new(AtomicBool::new(false));
         let deaths = Arc::clone(&self.deaths);
         let worker = {
@@ -876,26 +933,22 @@ impl StreamHold for FfmpegHold {
                                 // A healthy run ends the failure streak: the
                                 // next young death logs its detail again.
                                 failures = 0;
-                                repeats.recovered(&stream);
-                                tracing::warn!(
-                                    stream = %stream,
-                                    ran_for = ?ran_for,
-                                    ?status,
-                                    failures,
-                                    reason = %reason,
-                                    "the hold consumer exited"
+                                log_hold_healthy_run(
+                                    &exit_key, &spawn_key, &stream, ran_for, &status, &reason,
+                                    &repeats,
                                 );
                             } else {
                                 failures += 1;
                                 log_hold_exit(
-                                    &stream, ran_for, &status, failures, &reason, &repeats,
+                                    &exit_key, &stream, ran_for, &status, failures, &reason,
+                                    &repeats,
                                 );
                             }
                         }
                         Err(err) => {
                             attached.store(false, Ordering::SeqCst);
                             failures += 1;
-                            log_hold_spawn_failure(&stream, &err, failures, &repeats);
+                            log_hold_spawn_failure(&spawn_key, &stream, &err, failures, &repeats);
                         }
                     }
                     if failures == HOLD_ESCALATE_AT {
@@ -965,6 +1018,16 @@ mod tests {
         assert!(
             failure_signature(first).contains("Connection refused"),
             "the failure's own words survive"
+        );
+        let reset = first.replace("Connection refused", "Connection reset by peer");
+        assert_ne!(
+            failure_signature(first),
+            failure_signature(&reset),
+            "distinct causes keep distinct signatures"
+        );
+        assert!(
+            failure_signature("frame 0xdeadbeef missing").contains("0xdeadbeef"),
+            "a hex word that is not an ffmpeg address stays in the signature"
         );
     }
 

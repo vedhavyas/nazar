@@ -396,47 +396,13 @@ async fn health_reads_an_unparsable_api_body_as_down() {
     );
 }
 
-/// The fmt subscriber's own writer, so a test can read what was logged.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
-    }
-}
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("the buffer").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// The engine state is logged on its transitions only: one warn when it
 /// goes down with the failing half and its cause, nothing while it stays
 /// down, one when it answers again, and nothing for a healthy first probe.
 #[tokio::test]
 async fn health_logs_a_transition_once() {
     let h = harness().await;
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let captured = common::Captured::start();
     let downs = |text: &str| {
         text.matches("the stream engine is not answering fully")
             .count()
