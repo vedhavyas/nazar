@@ -227,6 +227,367 @@ async fn start_writes_the_config_and_runs_the_binary_with_it() {
     go2rtc.stop().await.expect("stop kills the fake binary");
 }
 
+/// A go2rtc child that exits must come back on its own: the server owns
+/// the process, and one death must not take the house down until someone
+/// restarts the container. The config is rewritten before each respawn,
+/// so a truncated config is replaced before the next spawn.
+#[tokio::test]
+async fn a_child_that_exits_is_respawned_with_a_written_config() {
+    let data_dir = temp_dir();
+    let bin = data_dir.join("exiting-go2rtc.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\n[ -s \"$2\" ] || exit 1\nprintf 'run:%s\\n' \"$*\" >> \"$(dirname \"$0\")/runs.log\"\nexec sleep 1\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: bin,
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
+    let runs = data_dir.join("runs.log");
+    let expected_argv = format!("run:--config {}", go2rtc.config_path().display());
+
+    assert!(
+        await_runs(&runs, 1, SPAWN_WINDOW).await,
+        "the first run lands"
+    );
+    assert_eq!(
+        run_lines(&runs).first(),
+        Some(&expected_argv),
+        "a run is counted only when the config is already non-empty, and it records its argv"
+    );
+    assert!(
+        await_runs(&runs, 2, SPAWN_WINDOW).await,
+        "the dead child is respawned: {:?}",
+        run_lines(&runs)
+    );
+    assert!(
+        run_lines(&runs).iter().all(|line| line == &expected_argv),
+        "every run carries the same argv: {:?}",
+        run_lines(&runs)
+    );
+
+    // Truncate the config after a run; the next respawn must rewrite it
+    // before spawning. Wait until the truncation is the observed state,
+    // then count: the next run must be one more than this point.
+    std::fs::write(go2rtc.config_path(), "").expect("the config is truncated");
+    assert!(
+        await_text_where(go2rtc.config_path(), str::is_empty)
+            .await
+            .is_some(),
+        "the truncation lands before the next respawn"
+    );
+    let before = run_lines(&runs).len();
+    assert!(
+        await_runs(&runs, before + 1, SPAWN_WINDOW).await,
+        "the respawn comes back after the truncation: {:?}",
+        run_lines(&runs)
+    );
+    let config = std::fs::read_to_string(go2rtc.config_path()).expect("the config is readable");
+    assert_eq!(
+        listen_of(&config, "api").as_deref(),
+        Some("127.0.0.1:1984"),
+        "the respawn wrote the API listener first"
+    );
+    assert!(
+        config.contains("/usr/bin/ffmpeg") && config.contains("nazar-h264:"),
+        "the respawn wrote the ffmpeg template and preset: {config:?}"
+    );
+
+    go2rtc.stop().await.expect("stop ends the supervisor");
+}
+
+/// A config that cannot be written must withhold the spawn: go2rtc falls
+/// back to permissive defaults (api and rtsp on every interface) when the
+/// file is missing, so spawning without it loses the loopback pinning.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_config_write_withholds_the_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("id runs");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        return; // root ignores the directory mode bits
+    }
+    let data_dir = temp_dir();
+    let marker_dir = temp_dir();
+    let runs = marker_dir.join("runs.log");
+    let bin = data_dir.join("respawns-go2rtc.sh");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nprintf 'run\\n' >> \"{}\"\nexec sleep 1\n",
+            runs.display()
+        ),
+    )
+    .expect("the stand-in writes");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("the stand-in is executable");
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: bin,
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
+    assert!(
+        await_runs(&runs, 1, SPAWN_WINDOW).await,
+        "the first run lands"
+    );
+
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o555))
+        .expect("the data dir turns read-only");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        run_lines(&runs).len(),
+        1,
+        "no spawn while the config cannot be written: {:?}",
+        run_lines(&runs)
+    );
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("the data dir turns writable");
+    assert!(
+        await_runs(&runs, 2, SPAWN_WINDOW).await,
+        "the spawn returns once the config can be written: {:?}",
+        run_lines(&runs)
+    );
+    go2rtc.stop().await.expect("stop ends the supervisor");
+}
+
+/// Dropping the handle without stop() must not orphan the child: the
+/// supervisor sees its channel close, kills the child and reaps it.
+#[tokio::test]
+async fn dropping_the_handle_kills_the_child() {
+    let data_dir = temp_dir();
+    let bin = data_dir.join("pid-go2rtc.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/go2rtc.pid\"\nexec sleep 60\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: bin,
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    let go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
+    let pid_path = data_dir.join("go2rtc.pid");
+    let pid = await_text(&pid_path)
+        .await
+        .expect("the pid lands")
+        .trim()
+        .to_owned();
+    assert!(!pid.is_empty(), "the stand-in recorded its pid");
+
+    drop(go2rtc);
+    let mut gone = false;
+    for _ in 0..100 {
+        if !process_alive(&pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "the child dies with the handle, no stop needed: pid {pid}"
+    );
+}
+
+fn process_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A binary that cannot spawn is a boot failure: the `?` on start in main
+/// must see it, not a server warning at a dead engine forever.
+#[tokio::test]
+async fn a_first_spawn_that_fails_is_an_error() {
+    let data_dir = temp_dir();
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: data_dir.join("missing-go2rtc"),
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    match Go2rtc::start(&cfg) {
+        Err(Go2rtcError::Io(_)) => {}
+        Err(other) => panic!("a missing go2rtc must fail with its io error: {other:?}"),
+        Ok(_) => panic!("a missing go2rtc must fail the boot"),
+    }
+}
+
+/// A child that execs and exits at once (a wrapper rejecting argv, a
+/// broken binary) must fail the boot too, not leave the supervisor
+/// restarting a corpse while health stays green. An exit-0 child is just
+/// as useless.
+#[tokio::test]
+async fn a_first_child_that_exits_at_once_is_a_boot_failure() {
+    let config_with = |bin: PathBuf| Config {
+        data_dir: temp_dir(),
+        // A real binary that execs and exits at once; a shell wrapper adds
+        // startup latency that is not the case under test.
+        go2rtc_bin: bin,
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    let false_bin = PathBuf::from(if cfg!(target_os = "macos") {
+        "/usr/bin/false"
+    } else {
+        "/bin/false"
+    });
+    match Go2rtc::start(&config_with(false_bin)) {
+        Err(Go2rtcError::StartupExit(status)) => {
+            assert!(
+                !status.success(),
+                "the boot failure carries the exit status"
+            );
+        }
+        Err(other) => panic!("a child that exits at boot must fail with its status: {other:?}"),
+        Ok(_) => panic!("a child that exits at boot must fail the boot"),
+    }
+    let true_bin = PathBuf::from(if cfg!(target_os = "macos") {
+        "/usr/bin/true"
+    } else {
+        "/bin/true"
+    });
+    match Go2rtc::start(&config_with(true_bin)) {
+        Err(Go2rtcError::StartupExit(status)) => {
+            assert!(
+                status.success(),
+                "an exit-0 child inside the grace is still fatal"
+            );
+        }
+        Err(other) => panic!("an exit-0 child at boot must fail with its status: {other:?}"),
+        Ok(_) => panic!("an exit-0 child inside the grace must fail the boot"),
+    }
+}
+
+/// A respawn that cannot spawn is retried, not abandoned: the stand-in
+/// deletes its own script and exits, the first retry fails, and the run
+/// returns once the script is restored.
+#[tokio::test]
+async fn a_spawn_failure_after_an_exit_is_retried() {
+    let data_dir = temp_dir();
+    let marker_dir = temp_dir();
+    let runs = marker_dir.join("runs.log");
+    let bin = data_dir.join("vanishing-go2rtc.sh");
+    let script = format!(
+        "#!/bin/sh\n[ -s \"$2\" ] || exit 1\nprintf 'run:%s\\n' \"$*\" >> \"{}\"\nrm -f \"$0\"\nexec sleep 0.5\n",
+        runs.display()
+    );
+    std::fs::write(&bin, &script).expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        go2rtc_bin: bin.clone(),
+        ffmpeg_bin: PathBuf::from("/usr/bin/ffmpeg"),
+        service_provider: ServiceProvider::default(),
+        webrtc_candidates: None,
+        aqi_alert_at: server::notify::AQI_ALERT_AT,
+        episodes_retention_days: 30,
+        prefer_p2p: Vec::new(),
+        p2p_self_device: "self-device".to_owned(),
+        p2p_src_device_id: "src-device".to_owned(),
+        p2p_camera_controller: None,
+        p2p_login_device_name: "MobileApp_test".to_owned(),
+        p2p_arm_timeout: std::time::Duration::from_secs(15),
+    };
+    let mut go2rtc = Go2rtc::start(&cfg).expect("the fake binary spawns");
+    assert!(
+        await_runs(&runs, 1, SPAWN_WINDOW).await,
+        "the first run lands"
+    );
+    // The child exits at ~0.5s and deletes its script; wait past the first
+    // 1s retry, then give the supervisor a binary again.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    std::fs::write(&bin, &script).expect("the stand-in is restored");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable again");
+    }
+    assert!(
+        await_runs(&runs, 2, SPAWN_WINDOW).await,
+        "the retry lands once the binary is back: {:?}",
+        run_lines(&runs)
+    );
+    go2rtc.stop().await.expect("stop ends the supervisor");
+}
+
 #[tokio::test]
 async fn no_webrtc_section_without_a_configured_candidate() {
     let data_dir = temp_dir();
@@ -306,6 +667,23 @@ async fn await_text_where(path: &Path, done: impl Fn(&str) -> bool) -> Option<St
 
 async fn await_text(path: &Path) -> Option<String> {
     await_text_where(path, |text| !text.is_empty()).await
+}
+
+/// The recorded runs, one marker line per spawn that saw a non-empty config.
+fn run_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path).map_or_default(|text| text.lines().map(str::to_owned).collect())
+}
+
+/// Whether `path` records at least `n` runs within `budget`.
+async fn await_runs(path: &Path, n: usize, budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if run_lines(path).len() >= n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 async fn await_args(path: &Path) -> Vec<String> {

@@ -16,6 +16,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::supervisor::{HoldLease, StreamHold};
@@ -29,6 +30,17 @@ pub const API_BASE: &str = "http://127.0.0.1:1984";
 /// the caller holds - for the process's lifetime.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the supervisor waits before restarting a child that exited.
+const RESPAWN_MIN: Duration = Duration::from_secs(1);
+const RESPAWN_MAX: Duration = Duration::from_secs(60);
+/// A run this long resets the restart delay: the child was healthy.
+const RESPAWN_STABLE_RUN: Duration = Duration::from_secs(60);
+/// How long the first spawn is watched: a child that exits this early
+/// cannot serve the deploy. go2rtc stays up when a listener cannot bind,
+/// so this covers an exit, not a port conflict; the grace only has to
+/// outlast a real binary's exec and first scheduling.
+const START_GRACE: Duration = Duration::from_millis(250);
 
 /// The client every go2rtc call goes through. Both limits are load-bearing:
 /// `a_go2rtc_that_never_answers_is_bounded` pins what removing them costs.
@@ -79,8 +91,12 @@ struct StreamEntry {
 pub enum Go2rtcError {
     #[error("go2rtc io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("go2rtc exited during startup: {0}")]
+    StartupExit(std::process::ExitStatus),
     #[error("go2rtc api: {0}")]
     Api(#[from] reqwest::Error),
+    #[error("go2rtc supervisor: {0}")]
+    Supervisor(String),
     #[error("go2rtc url: {0}")]
     Url(String),
     #[error("go2rtc rejected the request (HTTP {status}): {body}")]
@@ -94,8 +110,15 @@ pub enum Go2rtcError {
 pub struct Go2rtc {
     api: Url,
     http: reqwest::Client,
-    child: Option<Child>,
+    supervisor: Option<ChildSupervisor>,
     config_path: PathBuf,
+}
+
+/// The task that owns the spawned go2rtc: it waits on the child, restarts
+/// it with a bounded backoff, and rewrites the config before each spawn.
+struct ChildSupervisor {
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Clone for Go2rtc {
@@ -105,7 +128,7 @@ impl Clone for Go2rtc {
         Self {
             api: self.api.clone(),
             http: self.http.clone(),
-            child: None,
+            supervisor: None,
             config_path: PathBuf::new(),
         }
     }
@@ -114,31 +137,46 @@ impl Clone for Go2rtc {
 impl Go2rtc {
     /// Spawn the configured binary with a generated config and talk to its
     /// loopback API. The process may take a moment to listen; callers retry
-    /// their first request.
+    /// their first request. The first spawn is fatal: a binary that cannot
+    /// exec, or exits inside its startup grace, fails boot, and later exits
+    /// are the supervisor's.
     pub fn start(cfg: &Config) -> Result<Self, Go2rtcError> {
         // The client first: a build failure must not leave a spawned child
         // behind.
         let http = api_client()?;
         let config_path = cfg.data_dir.join("go2rtc.yaml");
-        std::fs::write(
-            &config_path,
-            config_yaml(&cfg.ffmpeg_bin, cfg.webrtc_candidates.as_deref()),
-        )?;
-        let child = Command::new(&cfg.go2rtc_bin)
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()?;
+        let yaml = config_yaml(&cfg.ffmpeg_bin, cfg.webrtc_candidates.as_deref());
+        let mut child = spawn_with_config(&config_path, &yaml, |path| {
+            spawn_child(&cfg.go2rtc_bin, path)
+        })
+        .map_err(SpawnFailure::into_error)?;
+        let deadline = Instant::now() + START_GRACE;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Err(Go2rtcError::StartupExit(status));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         tracing::info!(
             bin = %cfg.go2rtc_bin.display(),
             config = %config_path.display(),
             "started go2rtc"
         );
+        let (shutdown, wake) = watch::channel(false);
+        let task = tokio::spawn(supervise(
+            child,
+            cfg.go2rtc_bin.clone(),
+            config_path.clone(),
+            yaml,
+            wake,
+        ));
         Ok(Self {
             api: parse_url(API_BASE)?,
             http,
-            child: Some(child),
+            supervisor: Some(ChildSupervisor { shutdown, task }),
             config_path,
         })
     }
@@ -148,7 +186,7 @@ impl Go2rtc {
         Ok(Self {
             api: api_base,
             http: api_client()?,
-            child: None,
+            supervisor: None,
             config_path: PathBuf::new(),
         })
     }
@@ -250,17 +288,188 @@ impl Go2rtc {
 
     /// Kill the spawned process, if this instance owns one.
     pub async fn stop(&mut self) -> Result<(), Go2rtcError> {
-        let Some(child) = &mut self.child else {
+        let Some(supervisor) = self.supervisor.take() else {
             return Ok(());
         };
-        child.kill().await?;
-        Ok(())
+        let _ = supervisor.shutdown.send(true);
+        match supervisor.task.await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!(%err, "the go2rtc supervisor did not end cleanly");
+                Err(Go2rtcError::Supervisor(err.to_string()))
+            }
+        }
     }
 
     fn api_for(&self, path: &str) -> Result<Url, Go2rtcError> {
         self.api
             .join(path)
             .map_err(|err| Go2rtcError::Url(err.to_string()))
+    }
+}
+
+/// Write the config via a temporary file, so a crash mid-write cannot
+/// leave an empty file. go2rtc never refuses a config: a missing or empty
+/// one means permissive defaults (the API and RTSP listeners on every
+/// interface).
+fn write_config(path: &Path, yaml: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, yaml)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The next restart delay: doubles from RESPAWN_MIN and caps at
+/// RESPAWN_MAX.
+fn next_respawn_delay(delay: Duration) -> Duration {
+    (delay * 2).min(RESPAWN_MAX)
+}
+
+/// The delay the next restart waits: the base after a stable run, the
+/// compounded delay after a quick death.
+fn delay_after_exit(delay: Duration, ran: Duration) -> Duration {
+    if ran >= RESPAWN_STABLE_RUN {
+        RESPAWN_MIN
+    } else {
+        delay
+    }
+}
+
+/// Spawn one go2rtc child against the generated config. The child is
+/// killed on drop, so a handle that goes away never orphans a process.
+fn spawn_child(bin: &Path, config_path: &Path) -> Result<Child, Go2rtcError> {
+    Ok(Command::new(bin)
+        .arg("--config")
+        .arg(config_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?)
+}
+
+/// Why a spawn did not happen: the config write failed first, or the spawn
+/// itself did.
+enum SpawnFailure {
+    Config(std::io::Error),
+    Spawn(Go2rtcError),
+}
+
+impl SpawnFailure {
+    fn into_error(self) -> Go2rtcError {
+        match self {
+            Self::Config(err) => Go2rtcError::Io(err),
+            Self::Spawn(err) => err,
+        }
+    }
+}
+
+/// Write the config and only then spawn: go2rtc falls back to permissive
+/// defaults when the file is missing, so the two steps are one operation.
+fn spawn_with_config(
+    config_path: &Path,
+    yaml: &str,
+    spawn: impl FnOnce(&Path) -> Result<Child, Go2rtcError>,
+) -> Result<Child, SpawnFailure> {
+    write_config(config_path, yaml).map_err(SpawnFailure::Config)?;
+    spawn(config_path).map_err(SpawnFailure::Spawn)
+}
+
+/// Own the go2rtc child: wait on it, say why it ended, rewrite the config
+/// and start it again. A child death must never leave the server talking
+/// to a port nobody listens on until the container is restarted.
+async fn supervise(
+    mut child: Child,
+    bin: PathBuf,
+    config_path: PathBuf,
+    yaml: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut delay = RESPAWN_MIN;
+    let mut attempt = 0_u32;
+    loop {
+        let pid = child.id();
+        let started = Instant::now();
+        tokio::select! {
+            status = child.wait() => {
+                let ran = started.elapsed();
+                attempt += 1;
+                if ran >= RESPAWN_STABLE_RUN {
+                    attempt = 0;
+                }
+                delay = delay_after_exit(delay, ran);
+                match status {
+                    Ok(status) => tracing::warn!(
+                        pid = pid.unwrap_or_default(),
+                        status = %status,
+                        ?ran,
+                        attempt,
+                        ?delay,
+                        "go2rtc exited; restarting"
+                    ),
+                    Err(err) => tracing::warn!(
+                        pid = pid.unwrap_or_default(),
+                        %err,
+                        ?ran,
+                        attempt,
+                        ?delay,
+                        "go2rtc could not be waited on; restarting"
+                    ),
+                }
+            }
+            _ = shutdown.changed() => {
+                if let Err(err) = child.kill().await {
+                    tracing::debug!(%err, "the go2rtc child could not be killed");
+                }
+                let _ = child.wait().await;
+                return;
+            }
+        }
+        // Restart: back off, rewrite the config first, then spawn. A spawn
+        // failure keeps backing off until the binary is usable again.
+        loop {
+            if !wait_or_shutdown(delay, &mut shutdown).await {
+                return;
+            }
+            delay = next_respawn_delay(delay);
+            match spawn_with_config(&config_path, &yaml, |path| spawn_child(&bin, path)) {
+                Ok(next) => {
+                    tracing::info!(
+                        bin = %bin.display(),
+                        config = %config_path.display(),
+                        "started go2rtc"
+                    );
+                    child = next;
+                    break;
+                }
+                Err(SpawnFailure::Config(err)) => {
+                    tracing::error!(
+                        config = %config_path.display(),
+                        %err,
+                        attempt,
+                        ?delay,
+                        "the go2rtc config could not be written; spawn withheld"
+                    );
+                    attempt += 1;
+                }
+                Err(SpawnFailure::Spawn(err)) => {
+                    tracing::warn!(
+                        bin = %bin.display(),
+                        %err,
+                        attempt,
+                        ?delay,
+                        "go2rtc could not spawn; retrying"
+                    );
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Sleep out the restart delay, or return false when stop was asked for.
+async fn wait_or_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => true,
+        _ = shutdown.changed() => false,
     }
 }
 
@@ -575,5 +784,60 @@ mod tests {
             HOLD_RETRY,
             "with no failures yet, the base itself"
         );
+    }
+
+    #[test]
+    fn the_respawn_backoff_doubles_from_one_and_caps_at_a_minute() {
+        let mut delay = RESPAWN_MIN;
+        let mut seen = vec![delay.as_secs()];
+        for _ in 0..7 {
+            delay = next_respawn_delay(delay);
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(
+            seen,
+            [1, 2, 4, 8, 16, 32, 60, 60],
+            "the restart delay doubles from one second and caps at a minute"
+        );
+        // The stable-run reset is a timing decision, not arithmetic; its
+        // only proof is a live restart, so it stays unpinned here.
+    }
+
+    #[test]
+    fn a_stable_run_resets_the_delay_only_at_the_boundary() {
+        let quick = RESPAWN_STABLE_RUN
+            .checked_sub(Duration::from_secs(1))
+            .expect("a second below the boundary");
+        assert_eq!(
+            delay_after_exit(Duration::from_secs(32), quick),
+            Duration::from_secs(32),
+            "a death at 59s keeps the compounded delay"
+        );
+        assert_eq!(
+            delay_after_exit(Duration::from_secs(32), RESPAWN_STABLE_RUN),
+            RESPAWN_MIN,
+            "a death at 60s resets to the base"
+        );
+    }
+
+    #[test]
+    fn the_config_is_written_before_the_spawn_is_called() {
+        let dir = std::env::temp_dir().join(format!("nazar-go2rtc-seam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config_path = dir.join("go2rtc.yaml");
+        let yaml = "api:\n  listen: \"127.0.0.1:1984\"\n";
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = seen.clone();
+        let result = spawn_with_config(&config_path, yaml, move |path| {
+            let non_empty = std::fs::read_to_string(path).is_ok_and(|text| !text.is_empty());
+            flag.store(non_empty, std::sync::atomic::Ordering::SeqCst);
+            Err(Go2rtcError::Supervisor("seam".to_owned()))
+        });
+        assert!(result.is_err(), "the injected spawn's error is returned");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the config exists and is non-empty when the spawn is called"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
