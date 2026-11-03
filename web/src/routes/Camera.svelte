@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
   import { pictureWatch } from '../lib/liveness';
@@ -33,6 +33,10 @@
   /** The server is still waking this stream: the player's start window is
    * held until its own word says otherwise. */
   let waiting = $state(false);
+  /** The screen's poll is running; one loop at a time. */
+  let polling = false;
+  /** The screen left: a standing poll must not write to it after teardown. */
+  let gone = false;
   /** The picture is not moving: 'start' never negotiated, 'frozen' stopped. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
@@ -76,6 +80,10 @@
     void load();
   });
 
+  onDestroy(() => {
+    gone = true;
+  });
+
   async function load() {
     try {
       const page = await api.cameras();
@@ -113,20 +121,31 @@
     void waitOutWaking();
   }
 
+  /** Read the server's state until the stream is live or the screen is
+   * gone. A degraded stream is still being healed there - the producer
+   * takes seconds to connect - so it is read like a waking one, the way
+   * Home reads its degraded tiles. */
   async function waitOutWaking() {
-    while (waiting) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      if (!waiting) return;
-      try {
-        const page = await api.cameras();
-        const found = page.cameras.find((entry) => entry.id === id) ?? null;
-        // The poll is also the screen's only look at the server's own
-        // word: a stream that leaves waking into trouble says so here.
-        if (found) camera = found;
-        waiting = found?.state === 'waking';
-      } catch {
-        waiting = false;
+    if (polling) return;
+    polling = true;
+    try {
+      while (!gone && (waiting || camera?.state === 'degraded')) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        if (gone) return;
+        if (!waiting && camera?.state !== 'degraded') return;
+        try {
+          const page = await api.cameras();
+          const found = page.cameras.find((entry) => entry.id === id) ?? null;
+          // The poll is also the screen's only look at the server's own
+          // word: a stream that leaves waking into trouble says so here.
+          if (found) camera = found;
+          waiting = found?.state === 'waking';
+        } catch {
+          waiting = false;
+        }
       }
+    } finally {
+      polling = false;
     }
   }
 

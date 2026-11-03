@@ -260,6 +260,89 @@ test('a degraded camera without a detail renders no diagnostics', async () => {
   expect(document.querySelector('details.diag'), 'no detail means no disclosure').toBeNull();
 });
 
+test('a degraded camera is read until it goes live', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  let state = 'degraded';
+  const mock = vi.fn(async (url: string) => {
+    if (String(url) === '/api/cameras') {
+      return json({
+        cameras: [
+          {
+            id: 'cam-1',
+            name: 'Hall',
+            state,
+            reason: state === 'degraded' ? 'camera is not responding' : null,
+            details: null,
+          },
+        ],
+        needsLogin: false,
+      });
+    }
+    if (String(url).startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    return json({ privacy: false });
+  });
+  vi.stubGlobal('fetch', mock);
+  open();
+
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(screen.getByText('camera is not responding'), 'the degraded reason shows').toBeTruthy();
+
+  // Still degraded on the next read: the screen keeps reading, since the
+  // server heals the producer on its own.
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(screen.getByText('camera is not responding'), 'a degraded stream stays read').toBeTruthy();
+
+  // The producer connects; the next read clears it with no click.
+  state = 'live';
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(
+    screen.queryByText('camera is not responding'),
+    'the recovered stream clears the reason',
+  ).toBeNull();
+
+  const reads = () => mock.mock.calls.filter(([url]) => String(url) === '/api/cameras').length;
+  const settled = reads();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(reads(), 'a live camera is no longer read').toBe(settled);
+});
+
+test('leaving the screen stops its reads', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const mock = vi.fn(async (url: string) => {
+    if (String(url) === '/api/cameras') {
+      return json({
+        cameras: [
+          {
+            id: 'cam-1',
+            name: 'Hall',
+            state: 'degraded',
+            reason: 'camera is not responding',
+            details: null,
+          },
+        ],
+        needsLogin: false,
+      });
+    }
+    if (String(url).startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    return json({ privacy: false });
+  });
+  vi.stubGlobal('fetch', mock);
+  open();
+  await vi.advanceTimersByTimeAsync(3500);
+
+  const reads = () => mock.mock.calls.filter(([url]) => String(url) === '/api/cameras').length;
+  const seen = reads();
+  cleanup();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(reads(), 'a screen that left is not read for').toBe(seen);
+});
+
 test('a fallback on the camera screen is named, not left unexplained', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
