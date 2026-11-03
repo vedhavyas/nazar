@@ -301,7 +301,12 @@
     </div>
   </PtzDrag>
 
-  {#if stalled === 'start'}
+  {#if camera?.state === 'degraded'}
+    <!-- The server's reason outranks the player's own stall: it is the
+         diagnosis, and it keeps the retry the fallback note would lose. -->
+    <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
+    <button class="btn" onclick={retry}>Try again</button>
+  {:else if stalled === 'start'}
     <p class="note">The video did not start. The camera link may be blocked on this network.</p>
     <button class="btn" onclick={retry}>Try again</button>
   {:else if stalled === 'frozen'}
@@ -311,9 +316,6 @@
     <!-- The tile already says this; a screen that swapped its picture for
          another and explained nothing read as broken. -->
     <p class="note">WebRTC could not connect here; showing the compatibility stream.</p>
-  {:else if camera?.state === 'degraded'}
-    <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
-    <button class="btn" onclick={retry}>Try again</button>
   {/if}
 
   {#if camera?.state === 'degraded' && camera.details}

@@ -180,6 +180,13 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
   expect(diag, 'the technical detail sits behind a diagnostics disclosure').toBeTruthy();
   expect((diag as HTMLDetailsElement).open, 'closed until asked for').toBe(false);
   expect(diag?.querySelector('pre')?.textContent, 'and holds the server detail').toBe(details);
+
+  // Past the player's own start window: the server's reason still wins,
+  // and the retry it carries stays.
+  await vi.advanceTimersByTimeAsync(20000);
+  expect(screen.getByText(reason), 'the reason outlasts the player window').toBeTruthy();
+  expect(screen.queryByText(/did not start/), 'the stall note does not replace it').toBeNull();
+  expect(screen.getByText('Try again'), 'and Try again stays').toBeTruthy();
 });
 
 test('a fallback on the camera screen is named, not left unexplained', async () => {
