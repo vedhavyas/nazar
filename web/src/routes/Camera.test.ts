@@ -127,6 +127,11 @@ test('a stalled picture shows the note and Try again on the camera screen', asyn
     String(url).startsWith('/api/cameras/cam-1/live'),
   ).length;
   expect(after, 'and Try again asks for the stream again').toBeGreaterThan(before);
+  const retried = mock.mock.calls
+    .map(([url]) => String(url))
+    .filter((url) => url.startsWith('/api/cameras/cam-1/live'))
+    .pop();
+  expect(retried, 'the click skips the supervisor backoff').toContain('retry=true');
 });
 
 test('a waking stream shows a spinner, and a degraded one its reason', async () => {

@@ -99,9 +99,10 @@
     }
   }
 
-  /** Ask the server for this camera's stream of the chosen quality. */
-  async function start() {
-    const started = await api.watch(id, quality);
+  /** Ask the server for this camera's stream of the chosen quality. `retry`
+   * is the person's own Try again, which skips the supervisor's backoff. */
+  async function start(retry = false) {
+    const started = await api.watch(id, quality, retry);
     // A freshly minted stream can wake for up to the server's own window;
     // the screen otherwise reads the state once, so it keeps reading
     // while the waking lasts - the player's window must not run against
@@ -134,7 +135,7 @@
     rebuild.settled();
     stalled = null;
     waiting = false;
-    void start().catch((err) => {
+    void start(true).catch((err) => {
       error = err instanceof Error ? err.message : String(err);
     });
   }
