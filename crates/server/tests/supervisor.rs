@@ -1659,6 +1659,107 @@ async fn an_offline_drop_removes_the_low_chain() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
+/// The ask's pre-check and the loop's offline drop are separate decisions:
+/// a PUT that passed the pre-check can still land after the drop. The fake
+/// holds the ask's DELETE at its door, so the drop is ordered ahead of the
+/// PUT the ask sends next, and the guard must take the chain down.
+#[tokio::test]
+async fn a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    // The loop's first re-mint is refused: the device has gone offline.
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .up_to_n_times(1)
+    .with_priority(2)
+    .mount(&h.qubo)
+    .await;
+    // Every attempt after it waits, so the loop is past its drop and
+    // cannot outrun the ask's own delete with another one.
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string(r#"{"code":"ERR_STM_010","message":"device is offline"}"#)
+                .set_delay(Duration::from_secs(60)),
+        )
+        .with_priority(3)
+        .mount(&h.qubo)
+        .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low registers");
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(live, "the streams are live before the race");
+
+    // The ask passes its pre-check, and the swap's DELETE is held at the
+    // door: its PUT has not been sent yet.
+    let gate = h.go2rtc.hold_delete(&low);
+    let ask = {
+        let supervisor = h.supervisor.clone();
+        tokio::spawn(async move { supervisor.ensure(DEVICE_ID, Quality::Low, true).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("the ask's DELETE reaches the fake");
+
+    // The starved high is re-minted and refused: the drop lands while the
+    // ask is still blocked on its own DELETE.
+    let deletes_before = h.go2rtc.deletes().len();
+    h.go2rtc.set_viewers(&high, 1);
+    let dropped = common::eventually(|| async {
+        let deletes = h.go2rtc.deletes();
+        // The drop's own delete of the high, then its delete of the low:
+        // anything the loop did earlier is before the high's.
+        let Some(drop_at) = deletes[deletes_before..]
+            .iter()
+            .position(|name| name == &high)
+            .map(|at| at + deletes_before)
+        else {
+            return false;
+        };
+        deletes[drop_at + 1..].iter().any(|name| name == &low)
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop lands while the ask's DELETE is held: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The ask's DELETE lands, and the PUT it sends next lands on the
+    // dropped high.
+    gate.release();
+    ask.await
+        .expect("the ask task does not panic")
+        .expect("the ask answers");
+
+    let ops = h.go2rtc.ops();
+    assert_eq!(
+        last_op(&ops, &low),
+        Some(format!("delete:{low}")),
+        "the ask's late PUT is dropped once the high is gone: {ops:?}"
+    );
+    assert!(
+        !h.go2rtc.has_stream(&low),
+        "the chain is not left dialling a high that was dropped: {ops:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
 /// The low has no cloud URL of its own: after an offline drop, the next
 /// successful mint must rebuild it off the recovered high.
 #[tokio::test]
