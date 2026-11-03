@@ -59,6 +59,13 @@ async fn harness(stream_idle: Duration) -> Harness {
 /// A harness on its own pacing, for tests that need the re-mint cadence
 /// or the retry backoff inside their window.
 async fn harness_with(pacing: Pacing) -> Harness {
+    harness_with_engine(pacing, None).await
+}
+
+/// A harness whose supervisor talks to `engine` instead of the fake: a
+/// closed or silent address is how a transport failure reaches the engine
+/// calls, whose failure text the fake's own answers cannot produce.
+async fn harness_with_engine(pacing: Pacing, engine: Option<String>) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     mount_discovery(&qubo).await;
@@ -73,10 +80,11 @@ async fn harness_with(pacing: Pacing) -> Harness {
         })
         .expect("the session saves");
     let client = QuboClient::new(qubo.uri().parse().expect("a url"), SP.into());
+    let base = engine.unwrap_or_else(|| go2rtc.base.to_string());
     let supervisor = Supervisor::new(
         client,
         store,
-        Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+        Go2rtc::connect(base.parse().expect("a url")).expect("a client"),
         pacing,
     );
     supervisor.refresh_devices().await.expect("discovery");
@@ -856,6 +864,181 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
         suppressed_on(&text, "the tile's chain took again").is_some_and(|n| n > 0),
         "the recovery names what it suppressed: {text}"
     );
+}
+
+/// A transport failure prints the same reqwest sentence whatever its cause;
+/// the chain is what tells them apart. The fake's own errors carry distinct
+/// text, so the engine here is a closed port.
+#[tokio::test]
+async fn a_transport_failure_keeps_its_cause_on_every_site() {
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        listener.local_addr().expect("the address")
+    };
+    let h = harness_with_engine(
+        pacing(Duration::from_millis(60)),
+        Some(format!("http://{dead}")),
+    )
+    .await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    let captured = common::capture::Captured::start();
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile wakes");
+
+    let chain_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains("the tile's chain did not take"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let liveness_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains("the liveness watch could not read go2rtc"))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        common::eventually(|| async {
+            !chain_lines(&captured.text()).is_empty()
+                && !liveness_lines(&captured.text()).is_empty()
+        })
+        .await,
+        "both sites report the transport failure: {}",
+        captured.text()
+    );
+    // The ensure path logs the strip in full; the loop's repeats are
+    // suppressed under the same cause, which is the throttle working.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let text = captured.text();
+    let chains = chain_lines(&text);
+    assert!(
+        !chains.is_empty(),
+        "the ensure path reported the chain: {text}"
+    );
+    assert!(
+        chains
+            .iter()
+            .all(|line| line.contains("cause=") && line.contains("Connection refused")),
+        "every chain line carries the cause chain: {chains:?}"
+    );
+    let lives = liveness_lines(&text);
+    assert!(
+        lives
+            .iter()
+            .all(|line| line.contains("cause=") && line.contains("Connection refused")),
+        "every liveness line carries the cause chain: {lives:?}"
+    );
+}
+
+/// The predecessor reap's benign refusal is silent; any other answer warns.
+#[tokio::test]
+async fn a_failed_predecessor_reap_is_split_by_its_answer() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.remint = Duration::from_millis(150);
+    pacing.retry_base = Duration::from_millis(100);
+    pacing.retry_max = Duration::from_millis(100);
+    let h = harness_with(pacing).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+
+    let captured = common::capture::Captured::start();
+    h.go2rtc
+        .set_delete_status(400, Some("yaml: path not exist"));
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    // One swap proves the benign reap ran; the cadence proves it kept
+    // running silently.
+    assert!(
+        common::eventually(|| async {
+            h.go2rtc
+                .puts()
+                .iter()
+                .any(|(name, _)| name == &format!("{DEVICE_ID}-high"))
+        })
+        .await,
+        "the put landed after the benign reap"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !captured
+            .text()
+            .contains("the predecessor could not be reaped"),
+        "the benign refusal is silent: {}",
+        captured.text()
+    );
+
+    h.go2rtc.set_delete_status(500, Some("boom"));
+    assert!(
+        common::eventually(|| async {
+            captured
+                .text()
+                .contains("the predecessor could not be reaped")
+        })
+        .await,
+        "a real reap failure is warned: {}",
+        captured.text()
+    );
+}
+
+/// A re-mint failure names its cause: a refused PUT and a timed-out PUT
+/// print the same reqwest sentence in the reason, so the chain is what
+/// tells them apart.
+#[tokio::test]
+async fn a_re_mint_failure_names_its_cause() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.retry_base = Duration::from_millis(100);
+    pacing.retry_max = Duration::from_millis(100);
+    let h = harness_with(pacing).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    let captured = common::capture::Captured::start();
+    let saw = |needle: &str| -> bool {
+        captured
+            .text()
+            .lines()
+            .any(|line| line.contains("stream re-mint failed") && line.contains(needle))
+    };
+    let line_with = |needle: &str| -> Option<String> {
+        captured
+            .text()
+            .lines()
+            .find(|line| line.contains("stream re-mint failed") && line.contains(needle))
+            .map(str::to_owned)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+
+    // A PUT held past the client's own bound.
+    h.go2rtc.set_put_delay(Duration::from_secs(6));
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    while tokio::time::Instant::now() < deadline && !saw("timed out") {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let timed_out = line_with("timed out");
+    assert!(
+        timed_out.is_some(),
+        "the timed-out put is reported: {}",
+        captured.text()
+    );
+
+    // A PUT the engine refuses outright.
+    h.go2rtc.set_put_delay(Duration::ZERO);
+    h.go2rtc.set_put_status(500);
+    while tokio::time::Instant::now() < deadline && !saw("insecure producer") {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let refused = line_with("insecure producer");
+    assert!(
+        refused.is_some(),
+        "the refused put is reported: {}",
+        captured.text()
+    );
+    assert_ne!(timed_out, refused, "the two causes produce different lines");
 }
 
 #[tokio::test]

@@ -787,7 +787,7 @@ async fn an_error_message_surfaces_verbatim() {
         .expect("fixture message")
         .to_owned();
     match err {
-        QuboError::Api { code, message } => {
+        QuboError::Api { code, message, .. } => {
             assert_eq!(code, "ERR_SM_057", "the API code is preserved");
             assert_eq!(message, expected, "the server's message surfaces verbatim");
         }

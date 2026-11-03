@@ -249,14 +249,15 @@ struct EngineFailure {
 }
 
 /// A failed refresh keeps its own kind: a transport blip is not a refusal,
-/// and must not route the person to login; a refusal must. Messages are
+/// and must not route the person to login; a refusal must. Every message is
 /// scrubbed or fixed, because the refresh URL carries the account id as a
 /// path segment and the answer can echo values.
 ///
-/// The gateway answers an invalid refresh with HTTP 400 and an
-/// `{code,message}` envelope (measured 2026-11-03: `ERR_SM_005`, "Invalid
-/// Refresh Token"), which the client maps to `Api` - so an envelope on this
-/// endpoint is a refusal.
+/// The measured refusal is HTTP 400 with an `{code,message}` envelope
+/// (2026-11-03: `ERR_SM_005`, "Invalid Refresh Token"). Only that status is
+/// read as a refusal: a 5xx or 429 envelope during a gateway restart is an
+/// error, not the end of the session. The code rides on the Auth error even
+/// though its Display omits it, so a caller that routes on it keeps it.
 fn refresh_failure(err: qubo::QuboError) -> qubo::QuboError {
     const WHY: &str = "the refresh was refused; log in";
     match err {
@@ -264,13 +265,23 @@ fn refresh_failure(err: qubo::QuboError) -> qubo::QuboError {
             code,
             message: WHY.to_owned(),
         },
-        qubo::QuboError::Api { code, .. } => qubo::QuboError::Auth {
+        qubo::QuboError::Api {
+            status: 400, code, ..
+        } => qubo::QuboError::Auth {
             code: Some(code),
             message: WHY.to_owned(),
         },
-        // The transport message is already scrubbed by the client's own
-        // mapping; a parse failure echoes the answer's value, so it is
-        // replaced.
+        // A status-bearing Http error carries the response body's first
+        // chars, which can quote the refresh path; only the status is kept.
+        qubo::QuboError::Http {
+            status: Some(status),
+            ..
+        } => qubo::QuboError::Http {
+            status: Some(status),
+            message: format!("the refresh answer failed with HTTP {status}"),
+        },
+        // A parse failure replaced by the refresh route's fixed reason; the
+        // serde error's line/column text is not useful here.
         qubo::QuboError::Parse(_) => qubo::QuboError::Http {
             status: None,
             message: "the refresh answer was not understood".to_owned(),
@@ -373,13 +384,18 @@ impl Stall {
 #[derive(Debug)]
 struct MintFailure {
     reason: String,
+    /// The engine failure's words plus its cause chain, for the throttle.
+    /// A cloud refusal has no engine chain, so its own words serve.
+    signature: String,
     stale_source: bool,
 }
 
 impl MintFailure {
     fn transient(reason: &str) -> Self {
+        let scrubbed = redact_credentials(reason);
         Self {
-            reason: redact_credentials(reason),
+            reason: scrubbed.clone(),
+            signature: scrubbed,
             stale_source: false,
         }
     }
@@ -390,6 +406,7 @@ impl MintFailure {
         if matches!(err, qubo::QuboError::Api { code, .. } if code == "ERR_STM_010") {
             Self {
                 reason: "device offline in the cloud".to_owned(),
+                signature: "device offline in the cloud".to_owned(),
                 stale_source: true,
             }
         } else {
@@ -398,9 +415,13 @@ impl MintFailure {
     }
 }
 
-impl From<String> for MintFailure {
-    fn from(reason: String) -> Self {
-        Self::transient(&reason)
+impl From<EngineFailure> for MintFailure {
+    fn from(failure: EngineFailure) -> Self {
+        Self {
+            reason: failure.reason,
+            signature: failure.signature,
+            stale_source: false,
+        }
     }
 }
 
@@ -1061,27 +1082,7 @@ impl Supervisor {
                     self.settle(&name, self.status_for_name(&high).await).await;
                 }
                 Err(failure) => {
-                    let EngineFailure { reason, signature } = failure;
-                    match self.chain_repeats.note(&name, &signature) {
-                        Repeat::First => {
-                            tracing::warn!(
-                                stream = %name,
-                                %reason,
-                                cause = %signature,
-                                "the tile's chain did not take"
-                            );
-                        }
-                        Repeat::Suppressed => {}
-                        Repeat::Summary { suppressed } => {
-                            tracing::warn!(
-                                stream = %name,
-                                suppressed,
-                                %reason,
-                                cause = %signature,
-                                "the tile's chain is still not taking"
-                            );
-                        }
-                    }
+                    let reason = self.report_chain_failure(&name, failure);
                     self.mark_degraded(&name, reason).await;
                 }
             }
@@ -1400,13 +1401,14 @@ impl Supervisor {
                             tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
                             return Ok(());
                         }
-                        Err(reason) => {
+                        Err(failure) => {
                             // go2rtc refused the source: this session cannot
                             // serve the pass, so end it and take the cloud
                             // path now rather than retrying it blindly.
                             tracing::info!(
                                 stream = %name,
-                                %reason,
+                                reason = %failure.reason,
+                                cause = %failure.signature,
                                 "go2rtc refused the fast-lane source; the cloud path takes this pass"
                             );
                             session.shutdown();
@@ -1473,6 +1475,34 @@ impl Supervisor {
             .map_err(|err| failure_detail(&err))
     }
 
+    /// One line per cause for a chain that did not take, shared by the
+    /// ensure path and the loop so the two cannot drift. Returns the
+    /// person-facing reason for the degraded state.
+    fn report_chain_failure(&self, name: &str, failure: EngineFailure) -> String {
+        let EngineFailure { reason, signature } = failure;
+        match self.chain_repeats.note(name, &signature) {
+            Repeat::First => {
+                tracing::warn!(
+                    stream = %name,
+                    %reason,
+                    cause = %signature,
+                    "the tile's chain did not take"
+                );
+            }
+            Repeat::Suppressed => {}
+            Repeat::Summary { suppressed } => {
+                tracing::warn!(
+                    stream = %name,
+                    suppressed,
+                    %reason,
+                    cause = %signature,
+                    "the tile's chain is still not taking"
+                );
+            }
+        }
+        reason
+    }
+
     /// Hand the source to go2rtc and confirm the entry is held, or the
     /// source went nowhere. Whether the picture is actually up is the
     /// loop's liveness watch to judge, from the consumers' side: go2rtc
@@ -1480,19 +1510,20 @@ impl Supervisor {
     /// stays unspent until its first consumer dials it - a viewer, or
     /// narar's own hold, which with a hold configured is the dial that
     /// makes the stream warm.
-    async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), String> {
-        self.swap_source(name, source)
-            .await
-            .map_err(|failure| failure.reason)?;
+    async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), EngineFailure> {
+        self.swap_source(name, source).await?;
         let held = self
             .go2rtc
             .streams()
             .await
-            .map_err(|err| redact_credentials(&err.to_string()))?
+            .map_err(|err| failure_detail(&err))?
             .iter()
             .any(|stream| stream.name == name && stream.live);
         if !held {
-            return Err("go2rtc did not take the stream".to_owned());
+            return Err(EngineFailure {
+                reason: "go2rtc did not take the stream".to_owned(),
+                signature: "go2rtc did not take the stream".to_owned(),
+            });
         }
         Ok(())
     }
@@ -1699,27 +1730,7 @@ impl Supervisor {
                 self.settle(&low, live).await;
             }
             Err(failure) => {
-                let EngineFailure { reason, signature } = failure;
-                match self.chain_repeats.note(&low, &signature) {
-                    Repeat::First => {
-                        tracing::warn!(
-                            stream = %low,
-                            %reason,
-                            cause = %signature,
-                            "the tile's chain did not take"
-                        );
-                    }
-                    Repeat::Suppressed => {}
-                    Repeat::Summary { suppressed } => {
-                        tracing::warn!(
-                            stream = %low,
-                            suppressed,
-                            %reason,
-                            cause = %signature,
-                            "the tile's chain is still not taking"
-                        );
-                    }
-                }
+                let reason = self.report_chain_failure(&low, failure);
                 self.mark_degraded(&low, reason).await;
             }
         }
@@ -1819,6 +1830,7 @@ impl Supervisor {
         tracing::warn!(
             stream = %name,
             reason = %failure.reason,
+            cause = %failure.signature,
             "stream re-mint failed"
         );
         if failure.stale_source {
@@ -1954,6 +1966,7 @@ mod tests {
     #[test]
     fn a_refused_mints_reason_is_masked_before_it_is_stored() {
         let failure = MintFailure::from_error(&qubo::QuboError::Api {
+            status: 500,
             code: "ERR_STM_500".to_owned(),
             message: "mint refused for https://cloud.example/live/cam?sessionId=sid-1&token=tok-2"
                 .to_owned(),
@@ -1966,9 +1979,9 @@ mod tests {
         );
     }
 
-    /// A refresh that cannot be spent reports a fixed reason: a transport
-    /// failure echoes the refresh URL, which carries the account id in its
-    /// path and is masked by neither scanner.
+    /// A refresh that fails in transit reports a scrubbed reason and keeps
+    /// its transport kind, so a blip neither logs out the house nor echoes
+    /// the account id that rides the refresh path.
     #[tokio::test]
     async fn a_refresh_failure_names_no_account() {
         let dir = std::env::temp_dir().join(format!("nazar-refresh-{}", std::process::id()));
@@ -2023,10 +2036,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A refresh the gateway refuses with the measured shape (HTTP 400 and
-    /// an envelope) routes the person to login.
-    #[tokio::test]
-    async fn a_refused_refresh_routes_to_login() {
+    /// A supervisor whose discovery is refused and whose refresh answers
+    /// `status` with `body`, on its own scratch session store.
+    async fn supervisor_over_refresh(
+        status: u16,
+        body: &'static str,
+    ) -> (Supervisor, wiremock::MockServer, std::path::PathBuf) {
+        static NEXT_DIR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -2042,14 +2058,14 @@ mod tests {
             .and(wiremock::matchers::path(
                 "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh",
             ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(400).set_body_string(
-                    r#"{"code":"ERR_SM_005","message":["Invalid Refresh Token"]}"#,
-                ),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body))
             .mount(&server)
             .await;
-        let dir = std::env::temp_dir().join(format!("nazar-refusal-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nazar-refresh-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
         std::fs::create_dir_all(&dir).expect("a scratch dir");
         let sessions = SessionStore::new(dir.join("session.json"));
         sessions
@@ -2069,7 +2085,18 @@ mod tests {
             Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")).expect("a client"),
             Pacing::default(),
         );
+        (supervisor, server, dir)
+    }
 
+    /// A refresh the gateway refuses with the measured shape (HTTP 400 and
+    /// an envelope) routes the person to login.
+    #[tokio::test]
+    async fn a_refused_refresh_routes_to_login() {
+        let (supervisor, _server, dir) = supervisor_over_refresh(
+            400,
+            r#"{"code":"ERR_SM_005","message":["Invalid Refresh Token"]}"#,
+        )
+        .await;
         let err = supervisor
             .refresh_devices()
             .await
@@ -2082,52 +2109,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A gateway outage is not a refusal: a 5xx or 429 envelope keeps its
+    /// status and never sends the person to login.
+    #[tokio::test]
+    async fn a_gateway_outage_does_not_route_to_login() {
+        for (status, body) in [
+            (500, r#"{"code":"ERR_INTERNAL","message":"boom"}"#),
+            (429, r#"{"code":"ERR_RATE","message":"slow down"}"#),
+        ] {
+            let (supervisor, _server, dir) = supervisor_over_refresh(status, body).await;
+            let err = supervisor
+                .refresh_devices()
+                .await
+                .expect_err("the refresh fails");
+            assert!(
+                !supervisor.needs_login(),
+                "a {status} envelope is not a refusal: {err}"
+            );
+            assert!(
+                matches!(
+                    err,
+                    SupervisorError::Qubo(qubo::QuboError::Api {
+                        status: carried,
+                        ..
+                    }) if carried == status
+                ),
+                "the status is carried through: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// A refresh answer that is not understood is fixed text, not a
     /// refusal, and never echoes the answer's value.
     #[tokio::test]
     async fn an_unreadable_refresh_answer_is_not_a_refusal() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/unit-entity-management/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/units",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(401)
-                    .set_body_string(r#"{"code":"ERR_TOKEN","message":["Token expired"]}"#),
-            )
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(
-                "/sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/user-uuid-1/auth/refresh",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_string(r#"{"accessToken": 918273645, "refreshToken": "r"}"#),
-            )
-            .mount(&server)
-            .await;
-        let dir = std::env::temp_dir().join(format!("nazar-garbled-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch dir");
-        let sessions = SessionStore::new(dir.join("session.json"));
-        sessions
-            .save(&qubo::Session {
-                access_token: "token-dead".to_owned(),
-                uuid: "user-uuid-1".to_owned(),
-                email: None,
-                refresh_token: Some("refresh-1".to_owned()),
-            })
-            .expect("the durable session saves");
-        let supervisor = Supervisor::new(
-            QuboClient::new(
-                server.uri().parse().expect("a url"),
-                qubo::ServiceProvider::default(),
-            ),
-            sessions,
-            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")).expect("a client"),
-            Pacing::default(),
-        );
-
+        let (supervisor, _server, dir) =
+            supervisor_over_refresh(200, r#"{"accessToken": 918273645, "refreshToken": "r"}"#)
+                .await;
         let err = supervisor
             .refresh_devices()
             .await
@@ -2144,6 +2163,33 @@ mod tests {
         assert!(
             text.contains("was not understood"),
             "the reason is fixed: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A status-bearing failure's body can echo the refresh path, so only
+    /// its status may reach the error.
+    #[tokio::test]
+    async fn a_status_bearing_refresh_failure_hides_its_body() {
+        let (supervisor, _server, dir) = supervisor_over_refresh(
+            404,
+            "no route: http://srvcapp/sms/api/v1/users/user-uuid-1/auth/refresh",
+        )
+        .await;
+        let err = supervisor
+            .refresh_devices()
+            .await
+            .expect_err("the refresh fails");
+        let text = err.to_string();
+        assert!(
+            !text.contains("user-uuid-1"),
+            "the account id stays out: {text}"
+        );
+        assert!(!text.contains("http://"), "the URL stays out: {text}");
+        assert!(text.contains("HTTP 404"), "the status is named: {text}");
+        assert!(
+            !supervisor.needs_login(),
+            "a status-bearing body is not a refusal: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2418,8 +2464,16 @@ mod tests {
             logs.contains("rtsps://w.ex/c"),
             "the URL's endpoint survives: {logs}"
         );
+        // The reason and the cause each carry the masked text; the reason
+        // alone is what the person sees, so it is the one counted.
+        let reason = logs
+            .lines()
+            .find(|line| line.contains("stream re-mint failed"))
+            .and_then(|line| line.split("reason=").nth(1))
+            .and_then(|rest| rest.split(" cause=").next())
+            .unwrap_or_default();
         assert_eq!(
-            logs.matches("<redacted>").count(),
+            reason.matches("<redacted>").count(),
             SECRETS.len(),
             "every shape in the body was masked, none fell outside the snippet: {logs}"
         );

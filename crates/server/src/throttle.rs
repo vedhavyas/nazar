@@ -8,22 +8,23 @@ use std::time::{Duration, Instant};
 /// An outage that lasts hours leaves a heartbeat, not a wall.
 const SUMMARY_EVERY: Duration = Duration::from_mins(30);
 
-/// Consecutive successes that end a stream's failure records: a stream
-/// failing every other poll must not log a failure-and-recovery pair.
+/// Consecutive successes that end a key's failure records: a key failing
+/// every other poll must not log a failure-and-recovery pair.
 const RECOVERY_AFTER: u32 = 3;
 
 /// A cause with no traffic for this long is forgotten.
 const STALE_AFTER: Duration = Duration::from_hours(6);
 
-/// How many causes one key may remember. A key is a stream at one site (the
-/// hold keeps an exit key and a spawn key), so a stream holds at most twice
-/// this. The cap is local, so one noisy stream cannot evict another's.
+/// How many causes one key may remember. A key is a stream at one call
+/// site (the hold keeps an exit key and a spawn key), so a stream holds at
+/// most twice this. The cap is local, so one noisy key cannot evict
+/// another's records.
 const MAX_PER_KEY: usize = 8;
 
 /// What a repeated failure should log.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Repeat {
-    /// The cause is new for this stream: log it in full.
+    /// The cause is new for this key: log it in full.
     First,
     /// The same cause again, before its summary is due: log nothing.
     Suppressed,
@@ -31,8 +32,8 @@ pub(crate) enum Repeat {
     Summary { suppressed: u64 },
 }
 
-/// One cause failing on one key. Keying by the cause, not the stream
-/// alone, keeps alternating failures from replacing one another's counts.
+/// One cause failing on one key. Keying by the cause, not the key alone,
+/// keeps alternating failures from replacing one another's counts.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Record {
     key: String,
@@ -56,14 +57,19 @@ struct Dropped {
 #[derive(Default)]
 struct State {
     entries: HashMap<Record, Entry>,
-    /// Consecutive successes per stream, for the recovery debounce.
+    /// Consecutive successes per key, for the recovery debounce.
     streaks: HashMap<String, u32>,
 }
 
 /// Per-key, per-cause failure deduplication. A new cause logs at once, an
 /// identical repeat is counted, a summary carrying the count lands every
-/// `summary_every`, and recovery clears the stream's records and hands back
+/// `summary_every`, and recovery clears the key's records and hands back
 /// the suppressed total they held.
+///
+/// The dropped-record lines carry `key`: the caller's own key, which is a
+/// stream name at the supervisor's sites and `<stream>:exit` /
+/// `<stream>:spawn` for the hold. The sites' own failure lines use a
+/// `stream` field, so the two are filtered differently by design.
 #[derive(Clone)]
 pub(crate) struct RepeatLog {
     summary_every: Duration,
@@ -138,7 +144,7 @@ impl RepeatLog {
     }
 
     /// One success for `key`. After `recovery_after` consecutive ones the
-    /// stream's records are cleared, and the suppressed total they held is
+    /// key's records are cleared, and the suppressed total they held is
     /// returned for the recovery line; `None` while the streak is short or
     /// when nothing was failing. A record older than the staleness window
     /// is already dead and clears nothing.
@@ -217,24 +223,24 @@ fn drop_stale(
     let mut dropped = Vec::new();
     entries.retain(|record, entry| {
         let stale = now.duration_since(entry.last_seen) >= stale_after;
-        if stale {
-            streaks.remove(&record.key);
-            if entry.suppressed > 0 {
-                dropped.push(Dropped {
-                    key: record.key.clone(),
-                    cause: record.cause.clone(),
-                    suppressed: entry.suppressed,
-                    why: "a stale failure record is dropped",
-                });
-            }
+        if stale && entry.suppressed > 0 {
+            dropped.push(Dropped {
+                key: record.key.clone(),
+                cause: record.cause.clone(),
+                suppressed: entry.suppressed,
+                why: "a stale failure record is dropped",
+            });
         }
         !stale
     });
+    // A streak survives while its key still holds a record: one stale
+    // cause beside a fresh one must not reset the recovery debounce.
+    streaks.retain(|key, _| entries.keys().any(|record| &record.key == key));
     dropped
 }
 
 /// Make room for one more cause of `key`. The cap is per key, so one noisy
-/// stream cannot evict another's records. A record with nothing pending is
+/// key cannot evict another's records. A record with nothing pending is
 /// preferred for eviction; a count that would be lost is said.
 fn evict_within_key(entries: &mut HashMap<Record, Entry>, key: &str) -> Option<Dropped> {
     if entries.keys().filter(|record| record.key == key).count() < MAX_PER_KEY {

@@ -15,8 +15,14 @@ pub enum QuboError {
     },
 
     /// A non-2xx response carrying the API's `{code, message}` envelope.
+    /// The status is kept: a 4xx refusal and a 5xx outage are different
+    /// events to every caller that routes on them.
     #[error("api error {code}: {message}")]
-    Api { code: String, message: String },
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
 
     /// 401/403 - the session is missing, expired or refused.
     #[error("auth error: {message}")]
@@ -50,8 +56,10 @@ impl From<reqwest::Error> for QuboError {
 fn transport_message(err: &reqwest::Error) -> String {
     let mut text = String::from(if err.is_timeout() {
         "timeout"
+    } else if err.is_dns() {
+        "dns"
     } else if err.is_connect() {
-        if is_dns(err) { "dns" } else { "connect" }
+        "connect"
     } else if err.is_body() || err.is_decode() {
         "body"
     } else {
@@ -64,20 +72,6 @@ fn transport_message(err: &reqwest::Error) -> String {
         source = cause.source();
     }
     text
-}
-
-/// Whether a connect failure was name resolution: hyper carries the
-/// resolver's words in the cause chain.
-fn is_dns(err: &reqwest::Error) -> bool {
-    let mut source = std::error::Error::source(err);
-    while let Some(cause) = source {
-        let text = cause.to_string().to_ascii_lowercase();
-        if text.contains("dns") || text.contains("lookup") || text.contains("resolve") {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
 }
 
 /// Map a non-2xx response to the right variant, reading the API's error
@@ -98,7 +92,11 @@ pub(crate) fn error_for_status(status: StatusCode, body: &str) -> QuboError {
                 message,
             }
         } else {
-            QuboError::Api { code, message }
+            QuboError::Api {
+                status: status.as_u16(),
+                code,
+                message,
+            }
         };
     }
 
@@ -135,4 +133,30 @@ fn body_snippet(body: &str) -> Option<String> {
         return None;
     }
     Some(body.chars().take(200).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_api_envelope_carries_its_status_and_code() -> Result<(), String> {
+        let err = error_for_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":"RATE","message":"slow down"}"#,
+        );
+        match err {
+            QuboError::Api {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(code, "RATE");
+                assert_eq!(message, "slow down");
+                Ok(())
+            }
+            other => Err(format!("expected Api, got {other:?}")),
+        }
+    }
 }

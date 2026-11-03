@@ -242,7 +242,7 @@ async fn mint_live_maps_a_rejection_body_to_api() {
 
     let payload = fixture(include_str!("fixtures/error_mint_rejected.json"));
     match err {
-        QuboError::Api { code, message } => {
+        QuboError::Api { code, message, .. } => {
             assert_eq!(code, payload["code"], "the API code is preserved");
             assert_eq!(
                 message, payload["message"][0],

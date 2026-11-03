@@ -946,10 +946,19 @@ impl StreamHold for FfmpegHold {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .insert(stream.clone(), Instant::now());
                             let reason = match drain {
-                                Some(handle) => {
-                                    String::from_utf8_lossy(&handle.await.unwrap_or_default())
-                                        .into_owned()
-                                }
+                                Some(handle) => match handle.await {
+                                    Ok(tail) => String::from_utf8_lossy(&tail).into_owned(),
+                                    Err(err) => {
+                                        // A panicked or cancelled drain says
+                                        // nothing; the exit still does.
+                                        tracing::warn!(
+                                            stream = %stream,
+                                            %err,
+                                            "the hold consumer's stderr drain did not finish"
+                                        );
+                                        String::new()
+                                    }
+                                },
                                 None => String::new(),
                             };
                             let ran_for = started.elapsed();
@@ -1020,13 +1029,18 @@ impl Drop for FfmpegLease {
         self.worker.abort();
         self.attached.store(false, Ordering::SeqCst);
         // The worker dies with the lease, taking whatever it had counted
-        // but not yet summarised; a released hold must not swallow that.
+        // but not yet summarised; a released hold must not swallow that. A
+        // failure already logged in full has nothing pending, so only a
+        // positive count is announced. One note can still be lost if the
+        // abort lands between the worker's check and its record: the bound
+        // is one line, not the streak.
         let ended = self.repeats.recovered_now(&self.exit_key);
         let started = self.repeats.recovered_now(&self.spawn_key);
-        if ended.is_some() || started.is_some() {
+        let suppressed = ended.unwrap_or(0) + started.unwrap_or(0);
+        if suppressed > 0 {
             tracing::warn!(
                 stream = %self.stream,
-                suppressed = ended.unwrap_or(0) + started.unwrap_or(0),
+                suppressed,
                 "a held stream is released with a pending failure count"
             );
         }

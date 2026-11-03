@@ -126,7 +126,14 @@ pub(crate) fn redact_credentials(text: &str) -> String {
             {
                 Some(2)
             }
-            _ => encoded_len(bytes, sep_at, b'3', b'd'),
+            // A JSON body escaped inside a string: `{\"token\":\"secret\"}`.
+            Some(b'\\')
+                if matches!(bytes.get(sep_at + 1), Some(b'"' | b'\''))
+                    && bytes.get(sep_at + 2) == Some(&b':') =>
+            {
+                Some(3)
+            }
+            _ => encoded_len(bytes, sep_at, b'3', b'd').or_else(|| encoded_json_sep(bytes, sep_at)),
         };
         let Some(sep) = sep else {
             // The whole name is emitted with no re-scan of its own suffix,
@@ -163,6 +170,15 @@ pub(crate) fn redact_credentials(text: &str) -> String {
         out.push_str(REDACTED);
         at = value_start + end;
     }
+}
+
+/// The length of a percent-encoded JSON key's closer and colon (`%22%3A`
+/// or `%27%3A`), as a nested encoding leaves them.
+fn encoded_json_sep(bytes: &[u8], at: usize) -> Option<usize> {
+    let quote =
+        encoded_len(bytes, at, b'2', b'2').or_else(|| encoded_len(bytes, at, b'2', b'7'))?;
+    let colon = encoded_len(bytes, at + quote, b'3', b'a')?;
+    Some(quote + colon)
 }
 
 /// The length of an encoded `=` or `&`, accepting either case and any
@@ -246,6 +262,14 @@ mod tests {
             ("token: S3CR3T", "token: <redacted>"),
             ("token=\\\"S3CR3T\\\"", "token=\\\"<redacted>\\\""),
             ("{\"token\": \"secret\"}", "{\"token\": \"<redacted>\"}"),
+            (
+                "{\\\"token\\\":\\\"secret\\\"}",
+                "{\\\"token\\\":\\\"<redacted>\\\"}",
+            ),
+            (
+                "%22token%22%3A%22secret%22%26next%3D1",
+                "%22token%22%3A<redacted>%26next%3D1",
+            ),
             ("token= spaced", "token= <redacted>"),
             ("token=café", "token=<redacted>"),
         ];

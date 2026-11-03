@@ -43,6 +43,7 @@ pub struct AccountProfile {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Refreshed {
+    #[serde(deserialize_with = "non_empty")]
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,

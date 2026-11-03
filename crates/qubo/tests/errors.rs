@@ -22,12 +22,33 @@ async fn a_refused_connection_is_classified_without_its_url()
         return Err("the closed port answered".into());
     };
     let text = QuboError::from(err).to_string();
-    assert!(text.contains("connect"), "the class is named: {text}");
+    assert!(
+        text.starts_with("http error: connect"),
+        "the class is named: {text}"
+    );
     assert!(
         !text.contains("SECRET-UUID"),
         "the account id is scrubbed: {text}"
     );
     assert!(!text.contains("http://"), "the URL is scrubbed: {text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dns_failure_is_classified_as_one() -> Result<(), Box<dyn std::error::Error>> {
+    // The `.invalid` TLD is reserved to never resolve.
+    let Err(err) = reqwest::Client::new()
+        .get("http://nazar-does-not-exist.invalid/refresh")
+        .send()
+        .await
+    else {
+        return Err("the reserved host resolved".into());
+    };
+    let text = QuboError::from(err).to_string();
+    assert!(
+        text.starts_with("http error: dns"),
+        "the class is named: {text}"
+    );
     Ok(())
 }
 
