@@ -392,7 +392,7 @@ async fn dropping_the_handle_kills_the_child() {
     let bin = data_dir.join("pid-go2rtc.sh");
     std::fs::write(
         &bin,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/go2rtc.pid\"\nexec sleep 60\n",
+        "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nprintf '%s' \"$$\" > \"$d/go2rtc.pid.tmp\"\nmv \"$d/go2rtc.pid.tmp\" \"$d/go2rtc.pid\"\nexec sleep 60\n",
     )
     .expect("the stand-in writes");
     #[cfg(unix)]
@@ -665,13 +665,22 @@ async fn await_text_where(path: &Path, done: impl Fn(&str) -> bool) -> Option<St
     None
 }
 
+/// Poll `path` until it holds anything at all, within `SPAWN_WINDOW`. Its
+/// writer must publish the path atomically (write a temp sibling, then
+/// rename), because this returns on the first readable byte.
 async fn await_text(path: &Path) -> Option<String> {
     await_text_where(path, |text| !text.is_empty()).await
 }
 
-/// The recorded runs, one marker line per spawn that saw a non-empty config.
+/// The complete recorded runs: a line still being written is not a run.
 fn run_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path).map_or_default(|text| text.lines().map(str::to_owned).collect())
+    std::fs::read_to_string(path).map_or_default(|text| {
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if !text.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+    })
 }
 
 /// Whether `path` records at least `n` runs within `budget`.
@@ -719,7 +728,7 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
     let bin = dir.join("fake-ffmpeg.sh");
     std::fs::write(
         &bin,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/ffmpeg.args\"\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/ffmpeg.pid\"\nexec sleep 60\n",
+        "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nprintf '%s\\n' \"$@\" > \"$d/ffmpeg.args.tmp\"\nmv \"$d/ffmpeg.args.tmp\" \"$d/ffmpeg.args\"\nprintf '%s' \"$$\" > \"$d/ffmpeg.pid.tmp\"\nmv \"$d/ffmpeg.pid.tmp\" \"$d/ffmpeg.pid\"\nexec sleep 60\n",
     )
     .expect("the stand-in writes");
     #[cfg(unix)]
@@ -737,7 +746,11 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
         .await
         .expect("the stand-in recorded its args");
     let args: Vec<&str> = args_text.lines().collect();
-    let target = args.iter().position(|a| *a == "-i").map(|i| args[i + 1]);
+    let target = args
+        .iter()
+        .position(|a| *a == "-i")
+        .and_then(|i| args.get(i + 1))
+        .copied();
     assert_eq!(
         target,
         Some("rtsp://127.0.0.1:8554/hall-high"),
