@@ -991,8 +991,8 @@ impl Supervisor {
                 Ok(()) => {
                     // The loop can drop the high while this PUT is in
                     // flight: what just landed dials a source that is gone.
-                    // Unpinned: the fake's shared DELETE delay cannot order
-                    // the loop's drop ahead of this PUT.
+                    // Pinned by
+                    // an_ask_put_landing_after_the_offline_drop_drops_the_low_chain.
                     if self.is_dropped(&high) {
                         self.drop_source(&name).await;
                     }

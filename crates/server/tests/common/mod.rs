@@ -131,6 +131,7 @@ use axum::response::Response;
 use axum::routing::{get, put};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use qubo::Device;
 use server::supervisor::{Lane, LaneSession};
@@ -322,9 +323,58 @@ pub struct FakeApi {
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
-    /// Every streams-admin operation in arrival order, `put:<name>` and
-    /// `delete:<name>`: the order tests otherwise cannot see.
+    /// Every streams-admin operation in the order it landed, `put:<name>`
+    /// and `delete:<name>`: the order tests otherwise cannot see.
     ops: Arc<Mutex<Vec<String>>>,
+    /// The next DELETE of a stream held at the fake's door: it arrives but
+    /// does not land until the test releases it.
+    delete_gate: Arc<Mutex<Option<DeleteGate>>>,
+}
+
+/// A DELETE held at the fake's door.
+pub struct DeleteHold {
+    arrived: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl DeleteHold {
+    /// Wait until the held DELETE has reached the fake.
+    pub async fn arrived(&self) {
+        let _permit = self
+            .arrived
+            .acquire()
+            .await
+            .expect("the hold is never closed");
+    }
+
+    /// Let the held DELETE land.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+struct DeleteGate {
+    name: String,
+    arrived: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+/// Hold this DELETE at the door if it is the one the test armed, and wait
+/// there until the test lets it land.
+async fn hold_at_door(gate: &Arc<Mutex<Option<DeleteGate>>>, name: &str) {
+    let held = {
+        let mut slot = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(held) if held.name == name => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(held) = held {
+        held.arrived.add_permits(1);
+        let _permit = held.release.acquire().await;
+    }
 }
 
 impl FakeApi {
@@ -345,10 +395,12 @@ impl FakeApi {
         let dialed = Arc::new(Mutex::new(HashSet::new()));
         let delete_delay = Arc::new(AtomicU64::new(0));
         let ops = Arc::new(Mutex::new(Vec::new()));
+        let delete_gate = Arc::new(Mutex::new(None));
         let app = hls_routes().merge(streams_routes(
             &puts,
             &deletes,
             &Knobs {
+                delete_gate: &delete_gate,
                 put_status: &put_status,
                 put_refused_marker: &put_refused_marker,
                 streams_visible: &streams_visible,
@@ -390,6 +442,7 @@ impl FakeApi {
             held,
             delete_delay,
             ops,
+            delete_gate,
         }
     }
 
@@ -397,6 +450,34 @@ impl FakeApi {
     /// `put:<name>` and `delete:<name>`.
     pub fn ops(&self) -> Vec<String> {
         self.ops.lock().unwrap().clone()
+    }
+
+    /// Arm the next DELETE of `name` at the fake's door: the test learns
+    /// when it arrives and decides when it lands. A second call replaces
+    /// the first; a DELETE of another stream passes through.
+    pub fn hold_delete(&self, name: &str) -> DeleteHold {
+        let hold = DeleteHold {
+            arrived: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        *self
+            .delete_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DeleteGate {
+            name: name.to_owned(),
+            arrived: Arc::clone(&hold.arrived),
+            release: Arc::clone(&hold.release),
+        });
+        hold
+    }
+
+    /// Whether the fake currently lists a stream entry by this name.
+    pub fn has_stream(&self, name: &str) -> bool {
+        self.taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(listed, _)| listed == name)
     }
 
     /// Report every stream without a producer, as a go2rtc whose sources
@@ -620,6 +701,7 @@ impl Drop for FakeLease {
 /// The answer-mode knobs a test turns, bundled so the fake's surfaces take
 /// them as one argument.
 struct Knobs<'a> {
+    delete_gate: &'a Arc<Mutex<Option<DeleteGate>>>,
     put_status: &'a Arc<AtomicU16>,
     put_refused_marker: &'a Arc<Mutex<Option<String>>>,
     streams_visible: &'a Arc<AtomicBool>,
@@ -747,19 +829,24 @@ fn streams_methods(
     });
     let dropped = Arc::clone(deletes);
     let delay = Arc::clone(knobs.delete_delay);
+    let gate = Arc::clone(knobs.delete_gate);
     let ops = Arc::clone(knobs.ops);
     let taken = Arc::clone(knobs.taken);
     let drop_stream =
         axum::routing::delete(move |Query(params): Query<HashMap<String, String>>| {
             let dropped = Arc::clone(&dropped);
             let delay = Arc::clone(&delay);
+            let gate = Arc::clone(&gate);
             let ops = Arc::clone(&ops);
             let taken = Arc::clone(&taken);
             async move {
-                // Recorded on arrival, not on answer: a slow DELETE is
-                // still an operation that happened when it was sent, and
-                // the op order is what some tests read.
                 let src = params.get("src").cloned().unwrap_or_default();
+                // Held at the door before it lands, so a test can order a
+                // swap's DELETE against operations that would race it.
+                hold_at_door(&gate, &src).await;
+                // Recorded when the request lands, not when it answers: a
+                // DELETE slowed by `delete_delay` still happened when it was
+                // sent, and the op order is what some tests read.
                 dropped.lock().unwrap().push(src.clone());
                 ops.lock().unwrap().push(format!("delete:{src}"));
                 // A real go2rtc drops the entry: the streams view must no
