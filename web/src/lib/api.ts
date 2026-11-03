@@ -73,7 +73,10 @@ export interface Camera {
   id: string;
   name: string;
   state: 'offline' | 'waking' | 'live' | 'degraded';
+  /** A short, user-facing reason; null unless the stream is degraded. */
   reason: string | null;
+  /** The technical detail behind the reason, for the camera screen's diagnostics. */
+  details?: string | null;
 }
 
 /** The camera page: the list, and whether Qubo has refused the session. */

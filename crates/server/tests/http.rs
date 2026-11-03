@@ -452,8 +452,79 @@ async fn the_camera_page_carries_the_degraded_reason() {
     assert_eq!(page["cameras"][0]["state"], json!("degraded"));
     assert_eq!(
         page["cameras"][0]["reason"],
+        json!("sign-in expired"),
+        "the tile gets a sentence that fits it, not the cloud's error"
+    );
+    assert_eq!(
+        page["cameras"][0]["details"],
         json!("auth error: User Token expired, Access denied"),
-        "the server's reason reaches the browser verbatim"
+        "the cloud's own words stay behind the diagnostics"
+    );
+    let _ = std::fs::remove_dir_all(&h.data_dir);
+}
+
+/// The engine's refusal quotes the source it was handed, credentials and
+/// all; the detail the browser receives keeps the shape and loses them.
+#[tokio::test]
+async fn the_camera_page_redacts_the_engine_detail() {
+    let h = harness().await;
+    mount_discovery(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "streamURL": "rtsps://w/x%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-9d1%26useruuid%3dusr-7f3%26camsessionid%3dcam-4a2",
+                    "sessionId": "session-1",
+                })
+                .to_string(),
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    h.go2rtc.set_put_refused_marker(Some("sekrit"));
+    let browser = client();
+
+    let _ = browser
+        .post(format!("{}/api/cameras/{DEVICE_ID}/live", h.base))
+        .send()
+        .await
+        .expect("watch");
+
+    let mut page = Value::Null;
+    for _ in 0..50 {
+        page = browser
+            .get(format!("{}/api/cameras", h.base))
+            .send()
+            .await
+            .expect("cameras")
+            .json::<Value>()
+            .await
+            .expect("json");
+        if page["cameras"][0]["state"] == json!("degraded") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(page["cameras"][0]["state"], json!("degraded"));
+    assert_eq!(
+        page["cameras"][0]["reason"],
+        json!("stream engine unavailable"),
+        "the tile gets the short reason"
+    );
+    let details = page["cameras"][0]["details"]
+        .as_str()
+        .expect("the engine's detail");
+    for secret in ["sekrit", "sess-9d1", "usr-7f3", "cam-4a2"] {
+        assert!(
+            !details.contains(secret),
+            "the detail carries the credential {secret}: {details}"
+        );
+    }
+    assert_eq!(
+        details.matches("<redacted>").count(),
+        4,
+        "all four credentials were present and redacted: {details}"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

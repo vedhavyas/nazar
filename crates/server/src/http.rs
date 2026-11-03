@@ -229,7 +229,9 @@ impl From<SupervisorError> for ApiError {
             SupervisorError::UnknownDevice(id) => {
                 Self::new(StatusCode::NOT_FOUND, format!("unknown device {id}"))
             }
-            SupervisorError::Go2rtc(reason) => Self::new(StatusCode::BAD_GATEWAY, reason),
+            SupervisorError::Go2rtc(reason) => {
+                Self::new(StatusCode::BAD_GATEWAY, diagnostic_detail(&reason))
+            }
             SupervisorError::Qubo(err) => err.into(),
         }
     }
@@ -465,23 +467,180 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
         if !device.is_camera() {
             continue;
         }
-        let (name, reason) = match state.supervisor.status(&device.device_id).await {
-            StreamState::Offline => ("offline", None),
-            StreamState::Waking => ("waking", None),
-            StreamState::Live { .. } => ("live", None),
-            StreamState::Degraded { reason } => ("degraded", Some(reason)),
+        let (name, reason, details) = match state.supervisor.status(&device.device_id).await {
+            StreamState::Offline => ("offline", None, None),
+            StreamState::Waking => ("waking", None, None),
+            StreamState::Live { .. } => ("live", None, None),
+            StreamState::Degraded { reason } => {
+                let (short, detail) = degraded_words(&reason);
+                ("degraded", Some(short), detail)
+            }
         };
         cameras.push(json!({
             "id": device.device_id,
             "name": device.name,
             "state": name,
             "reason": reason,
+            "details": details,
         }));
     }
     Ok(Json(json!({
         "cameras": cameras,
         "needsLogin": state.supervisor.needs_login(),
     })))
+}
+
+/// A degraded stream's sentence for the person, and the technical detail
+/// behind it. The supervisor's reason is an engine or cloud error, often a
+/// whole request URL; the tile gets words that fit it, and the camera
+/// screen's diagnostics get the rest.
+fn degraded_words(reason: &str) -> (&'static str, Option<String>) {
+    if reason == "device offline in the cloud" {
+        return ("device offline in the cloud", None);
+    }
+    if reason == "the producer has not connected" {
+        return ("camera is not responding", None);
+    }
+    let short = if reason.starts_with("go2rtc") {
+        "stream engine unavailable"
+    } else if reason.starts_with("auth error") {
+        "sign-in expired"
+    } else if ["http error", "api error", "parse error", "io error"]
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+    {
+        "cloud service unavailable"
+    } else {
+        "stream unavailable"
+    };
+    (short, Some(diagnostic_detail(reason)))
+}
+
+/// The reason as a diagnostics view may show it: a URL keeps its endpoint
+/// and loses its query, where a mint's credentials ride, and a credential
+/// that survives elsewhere is redacted too.
+fn diagnostic_detail(reason: &str) -> String {
+    redact_credentials(&strip_url_queries(reason))
+}
+
+/// Schemes whose query string can carry a minted stream's credentials.
+const URL_SCHEMES: [&str; 6] = [
+    "https://", "http://", "rtsps://", "rtsp://", "wss://", "ws://",
+];
+
+fn strip_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = URL_SCHEMES
+            .iter()
+            .filter_map(|scheme| rest.find(scheme).map(|at| (at, *scheme)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, scheme)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + scheme.len()..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\'' | '>'))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        out.push_str(scheme);
+        match url.find('?') {
+            Some(query) => {
+                out.push_str(&url[..query]);
+                out.push_str("?<redacted>");
+            }
+            None => out.push_str(url),
+        }
+        rest = &tail[end..];
+    }
+}
+
+/// Parameter names a mint's credentials ride under, stored in the cloud's
+/// own lowercase spelling and matched case-insensitively.
+const CREDENTIAL_KEYS: [&str; 5] = [
+    "wowzatoken",
+    "sessionid",
+    "useruuid",
+    "camsessionid",
+    "token",
+];
+
+fn redact_credentials(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    loop {
+        let next = CREDENTIAL_KEYS
+            .iter()
+            .filter_map(|key| lower[at..].find(key).map(|off| (at + off, *key)))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, key)) = next else {
+            out.push_str(&text[at..]);
+            return out;
+        };
+        let after_key = start + key.len();
+        // The key is part of a parameter name; a suffix on it
+        // (`wowzatokenhash`) is still the credential's own parameter.
+        let mut name_end = after_key;
+        while let Some(&byte) = bytes.get(name_end) {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                name_end += 1;
+            } else {
+                break;
+            }
+        }
+        let sep = match bytes.get(name_end) {
+            Some(b'=') => Some(1),
+            _ => encoded_len(bytes, name_end, b'3', b'd'),
+        };
+        let Some(sep) = sep else {
+            out.push_str(&text[at..after_key]);
+            at = after_key;
+            continue;
+        };
+        let value_start = name_end + sep;
+        let end = value_end(bytes, value_start);
+        out.push_str(&text[at..value_start]);
+        out.push_str("<redacted>");
+        at = value_start + end;
+    }
+}
+
+/// The length of an encoded `=` or `&`, accepting lowercase hex and any
+/// number of `%25` escapes for the percent itself (`%3d`, `%253D`, `%25253d`).
+fn encoded_len(bytes: &[u8], at: usize, lead: u8, tail: u8) -> Option<usize> {
+    if bytes.get(at) != Some(&b'%') {
+        return None;
+    }
+    let mut i = at + 1;
+    while bytes.len() >= i + 2 && &bytes[i..i + 2] == b"25" {
+        i += 2;
+    }
+    if bytes.len() >= i + 2 && bytes[i] == lead && bytes[i + 1].eq_ignore_ascii_case(&tail) {
+        Some(i + 2 - at)
+    } else {
+        None
+    }
+}
+
+/// How far a credential's value runs before a separator: raw or encoded
+/// `&`, whitespace, or the punctuation that ends a quoted URL.
+fn value_end(bytes: &[u8], at: usize) -> usize {
+    let mut i = at;
+    while let Some(&byte) = bytes.get(i) {
+        let ends = byte.is_ascii_whitespace()
+            || matches!(byte, b'&' | b')' | b']' | b'"' | b'\'' | b'#' | b'\\')
+            || (byte == b'%' && encoded_len(bytes, i, b'2', b'6').is_some());
+        if ends {
+            break;
+        }
+        i += 1;
+    }
+    i - at
 }
 
 #[derive(Deserialize)]
@@ -1224,4 +1383,52 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_degraded_reason_speaks_in_one_short_sentence() {
+        assert_eq!(
+            degraded_words("auth error: User Token expired, Access denied").0,
+            "sign-in expired"
+        );
+        assert_eq!(
+            degraded_words("http error: 500 Internal Server Error").0,
+            "cloud service unavailable"
+        );
+        assert_eq!(
+            degraded_words("device offline in the cloud"),
+            ("device offline in the cloud", None)
+        );
+        assert_eq!(
+            degraded_words("the producer has not connected").0,
+            "camera is not responding"
+        );
+    }
+
+    #[test]
+    fn a_degraded_reason_keeps_its_endpoint_and_loses_its_credentials() {
+        let raw = "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?name=cam-high&src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%3Dsekrit%26sessionid%3Dsid-1%26useruuid%3Duser-1%26camsessionid%3Dcam-1)";
+        let (short, details) = degraded_words(raw);
+        assert_eq!(short, "stream engine unavailable");
+        assert_eq!(
+            details.as_deref(),
+            Some(
+                "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)"
+            ),
+            "the endpoint stays and the query - the mint's credentials - goes"
+        );
+    }
+
+    #[test]
+    fn a_credential_outside_a_url_query_is_redacted() {
+        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1&wowzaToken=MixedSecret&token=raw-secret&wowzatokenhash=suffix-secret";
+        assert_eq!(
+            diagnostic_detail(raw),
+            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>&wowzaToken=<redacted>&token=<redacted>&wowzatokenhash=<redacted>"
+        );
+    }
 }

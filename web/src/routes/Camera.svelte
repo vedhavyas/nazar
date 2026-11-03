@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   import { ApiError, api, type Camera as CameraInfo, type Quality } from '../lib/api';
   import { pictureWatch } from '../lib/liveness';
@@ -33,6 +33,10 @@
   /** The server is still waking this stream: the player's start window is
    * held until its own word says otherwise. */
   let waiting = $state(false);
+  /** The screen's poll is running; one loop at a time. */
+  let polling = false;
+  /** The screen left: a standing poll must not write to it after teardown. */
+  let gone = false;
   /** The picture is not moving: 'start' never negotiated, 'frozen' stopped. */
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
@@ -76,6 +80,10 @@
     void load();
   });
 
+  onDestroy(() => {
+    gone = true;
+  });
+
   async function load() {
     try {
       const page = await api.cameras();
@@ -99,9 +107,10 @@
     }
   }
 
-  /** Ask the server for this camera's stream of the chosen quality. */
-  async function start() {
-    const started = await api.watch(id, quality);
+  /** Ask the server for this camera's stream of the chosen quality. `retry`
+   * is the person's own Try again, which skips the supervisor's backoff. */
+  async function start(retry = false) {
+    const started = await api.watch(id, quality, retry);
     // A freshly minted stream can wake for up to the server's own window;
     // the screen otherwise reads the state once, so it keeps reading
     // while the waking lasts - the player's window must not run against
@@ -112,20 +121,31 @@
     void waitOutWaking();
   }
 
+  /** Read the server's state until the stream is live or the screen is
+   * gone. A degraded stream is still being healed there - the producer
+   * takes seconds to connect - so it is read like a waking one, the way
+   * Home reads its degraded tiles. */
   async function waitOutWaking() {
-    while (waiting) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      if (!waiting) return;
-      try {
-        const page = await api.cameras();
-        const found = page.cameras.find((entry) => entry.id === id) ?? null;
-        // The poll is also the screen's only look at the server's own
-        // word: a stream that leaves waking into trouble says so here.
-        if (found) camera = found;
-        waiting = found?.state === 'waking';
-      } catch {
-        waiting = false;
+    if (polling) return;
+    polling = true;
+    try {
+      while (!gone && (waiting || camera?.state === 'degraded')) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        if (gone) return;
+        if (!waiting && camera?.state !== 'degraded') return;
+        try {
+          const page = await api.cameras();
+          const found = page.cameras.find((entry) => entry.id === id) ?? null;
+          // The poll is also the screen's only look at the server's own
+          // word: a stream that leaves waking into trouble says so here.
+          if (found) camera = found;
+          waiting = found?.state === 'waking';
+        } catch {
+          waiting = false;
+        }
       }
+    } finally {
+      polling = false;
     }
   }
 
@@ -133,8 +153,9 @@
   function retry() {
     rebuild.settled();
     stalled = null;
+    fallingBack = false;
     waiting = false;
-    void start().catch((err) => {
+    void start(true).catch((err) => {
       error = err instanceof Error ? err.message : String(err);
     });
   }
@@ -282,6 +303,7 @@
           onsettled={(state) => {
             waiting = false;
             if (state === 'start' || state === 'frozen') {
+              fallingBack = false;
               stalled = state;
               rebuild.schedule(state);
               return;
@@ -301,7 +323,12 @@
     </div>
   </PtzDrag>
 
-  {#if stalled === 'start'}
+  {#if camera?.state === 'degraded'}
+    <!-- The server's reason outranks the player's own stall: it is the
+         diagnosis, and it keeps the retry the fallback note would lose. -->
+    <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
+    <button class="btn" onclick={retry}>Try again</button>
+  {:else if stalled === 'start'}
     <p class="note">The video did not start. The camera link may be blocked on this network.</p>
     <button class="btn" onclick={retry}>Try again</button>
   {:else if stalled === 'frozen'}
@@ -311,9 +338,13 @@
     <!-- The tile already says this; a screen that swapped its picture for
          another and explained nothing read as broken. -->
     <p class="note">WebRTC could not connect here; showing the compatibility stream.</p>
-  {:else if camera?.state === 'degraded'}
-    <p class="note">{camera.reason ?? 'The stream is having trouble.'}</p>
-    <button class="btn" onclick={retry}>Try again</button>
+  {/if}
+
+  {#if camera?.state === 'degraded' && camera.details}
+    <details class="diag">
+      <summary>Diagnostics</summary>
+      <pre>{camera.details}</pre>
+    </details>
   {/if}
 
   <div class="controls">
@@ -397,6 +428,33 @@
 
   .screen-stage :global(.stage) {
     border-radius: var(--radius);
+  }
+
+  .note {
+    overflow-wrap: anywhere;
+  }
+
+  .diag {
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: var(--fs-label);
+  }
+
+  .diag summary {
+    cursor: pointer;
+  }
+
+  .diag pre {
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: var(--fs-label);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   .controls {

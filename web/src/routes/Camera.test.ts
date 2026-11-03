@@ -25,6 +25,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   localStorage.clear();
+  // The player's vendored script lands in <head>, which cleanup does not
+  // empty.
+  for (const script of document.querySelectorAll('script[src="/hls.min.js"]')) {
+    script.remove();
+  }
 });
 
 function json(body: unknown): Response {
@@ -127,19 +132,31 @@ test('a stalled picture shows the note and Try again on the camera screen', asyn
     String(url).startsWith('/api/cameras/cam-1/live'),
   ).length;
   expect(after, 'and Try again asks for the stream again').toBeGreaterThan(before);
+  const retried = mock.mock.calls
+    .map(([url]) => String(url))
+    .filter((url) => url.startsWith('/api/cameras/cam-1/live'))
+    .pop();
+  expect(retried, 'the click skips the supervisor backoff').toContain('retry=true');
 });
 
 test('a waking stream shows a spinner, and a degraded one its reason', async () => {
   vi.useFakeTimers();
   let state = 'waking';
-  const reason = 'the producer has not connected';
+  const reason = 'camera is not responding';
+  const details = 'the producer has not connected';
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string) => {
       if (String(url) === '/api/cameras') {
         return json({
           cameras: [
-            { id: 'cam-1', name: 'Hall', state, reason: state === 'degraded' ? reason : null },
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state,
+              reason: state === 'degraded' ? reason : null,
+              details: state === 'degraded' ? details : null,
+            },
           ],
           needsLogin: false,
         });
@@ -166,6 +183,223 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
     expect(screen.getByText(reason), 'a degraded stream shows its reason').toBeTruthy();
   });
   expect(screen.getByText('Try again'), 'and offers Try again').toBeTruthy();
+  expect(document.querySelector('.note')?.textContent, 'the note is the short reason alone').toBe(
+    reason,
+  );
+  const diag = document.querySelector('details.diag');
+  expect(diag, 'the technical detail sits behind a diagnostics disclosure').toBeTruthy();
+  expect((diag as HTMLDetailsElement).open, 'closed until asked for').toBe(false);
+  expect(diag?.querySelector('pre')?.textContent, 'and holds the server detail').toBe(details);
+
+  // Past the player's own start window, and the fallback cannot take the
+  // picture: that failure is the stall that used to replace this note.
+  const before = document.querySelectorAll('script[src="/hls.min.js"]').length;
+  await vi.advanceTimersByTimeAsync(20000);
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  expect(scripts.length, 'a fresh attempt fetched the fallback').toBeGreaterThan(before);
+  scripts.item(scripts.length - 1)?.dispatchEvent(new Event('error'));
+  await vi.advanceTimersByTimeAsync(50);
+
+  expect(screen.getByText(reason), 'the reason outlasts the stall').toBeTruthy();
+  expect(screen.queryByText(/did not start/), 'the stall note does not replace it').toBeNull();
+  expect(screen.getByText('Try again'), 'and Try again stays').toBeTruthy();
+});
+
+test('a healthy camera renders no diagnostics even with a detail', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            { id: 'cam-1', name: 'Hall', state: 'live', reason: null, details: 'stale detail' },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is mounted').toBeTruthy(),
+  );
+  expect(
+    document.querySelector('details.diag'),
+    'a healthy camera has no diagnostics to show',
+  ).toBeNull();
+});
+
+test('a degraded camera without a detail renders no diagnostics', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'camera is not responding',
+              details: null,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  await vi.waitFor(() =>
+    expect(screen.getByText('camera is not responding'), 'the reason shows').toBeTruthy(),
+  );
+  expect(document.querySelector('details.diag'), 'no detail means no disclosure').toBeNull();
+});
+
+test('a degraded camera is read until it goes live', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  let state = 'degraded';
+  const mock = vi.fn(async (url: string) => {
+    if (String(url) === '/api/cameras') {
+      return json({
+        cameras: [
+          {
+            id: 'cam-1',
+            name: 'Hall',
+            state,
+            reason: state === 'degraded' ? 'camera is not responding' : null,
+            details: null,
+          },
+        ],
+        needsLogin: false,
+      });
+    }
+    if (String(url).startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    return json({ privacy: false });
+  });
+  vi.stubGlobal('fetch', mock);
+  open();
+
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(screen.getByText('camera is not responding'), 'the degraded reason shows').toBeTruthy();
+
+  // Still degraded on the next read: the screen keeps reading, since the
+  // server heals the producer on its own.
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(screen.getByText('camera is not responding'), 'a degraded stream stays read').toBeTruthy();
+
+  // The producer connects; the next read clears it with no click.
+  state = 'live';
+  await vi.advanceTimersByTimeAsync(3500);
+  expect(
+    screen.queryByText('camera is not responding'),
+    'the recovered stream clears the reason',
+  ).toBeNull();
+
+  const reads = () => mock.mock.calls.filter(([url]) => String(url) === '/api/cameras').length;
+  const settled = reads();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(reads(), 'a live camera is no longer read').toBe(settled);
+});
+
+test('leaving the screen stops its reads', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  const mock = vi.fn(async (url: string) => {
+    if (String(url) === '/api/cameras') {
+      return json({
+        cameras: [
+          {
+            id: 'cam-1',
+            name: 'Hall',
+            state: 'degraded',
+            reason: 'camera is not responding',
+            details: null,
+          },
+        ],
+        needsLogin: false,
+      });
+    }
+    if (String(url).startsWith('/api/cameras/cam-1/live')) {
+      return json({ stream: 'cam-1-high' });
+    }
+    return json({ privacy: false });
+  });
+  vi.stubGlobal('fetch', mock);
+  open();
+  await vi.advanceTimersByTimeAsync(3500);
+
+  const reads = () => mock.mock.calls.filter(([url]) => String(url) === '/api/cameras').length;
+  const seen = reads();
+  cleanup();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(reads(), 'a screen that left is not read for').toBe(seen);
+});
+
+test('Try again drops the compatibility-stream state', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  class StubHls {
+    static isSupported = () => true;
+    loadSource() {}
+    attachMedia() {}
+    destroy() {}
+  }
+  vi.stubGlobal('Hls', StubHls);
+  let state = 'degraded';
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state,
+              reason: state === 'degraded' ? 'stream engine unavailable' : null,
+              details: null,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  // The fallback takes the stage while the stream is degraded.
+  await vi.advanceTimersByTimeAsync(4000);
+  await vi.advanceTimersByTimeAsync(13000);
+  expect(document.querySelector('video.hls'), 'the fallback took the stage').toBeTruthy();
+
+  // The person retries; the server comes back live on the next read.
+  screen.getByText('Try again').click();
+  state = 'live';
+  await vi.advanceTimersByTimeAsync(3500);
+
+  expect(
+    screen.queryByText(/compatibility stream/),
+    'the old fallback is not claimed after a retry',
+  ).toBeNull();
+  expect(screen.queryByText('stream engine unavailable'), 'and the reason is clear').toBeNull();
 });
 
 test('a fallback on the camera screen is named, not left unexplained', async () => {
@@ -189,6 +423,57 @@ test('a fallback on the camera screen is named, not left unexplained', async () 
     screen.getByText(/compatibility stream/),
     'the screen names the compatibility stream',
   ).toBeTruthy();
+});
+
+test('a degraded reason outranks the compatibility-stream note', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
+  class StubHls {
+    static isSupported = () => true;
+    loadSource() {}
+    attachMedia() {}
+    destroy() {}
+  }
+  vi.stubGlobal('Hls', StubHls);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'stream engine unavailable',
+              details: null,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  // The fallback takes the stage; the server's diagnosis is still the
+  // better answer, and the retry must not disappear with it.
+  await vi.advanceTimersByTimeAsync(4000);
+  await vi.advanceTimersByTimeAsync(13000);
+  expect(document.querySelector('video.hls'), 'the fallback took the stage').toBeTruthy();
+  expect(
+    screen.getByText('stream engine unavailable'),
+    'the reason keeps the screen',
+  ).toBeTruthy();
+  expect(screen.getByText('Try again'), 'and Try again is offered').toBeTruthy();
+  expect(
+    screen.queryByText(/compatibility stream/),
+    'the generic fallback note is outranked',
+  ).toBeNull();
 });
 
 test('a stalled picture is asked for again on its own', async () => {
