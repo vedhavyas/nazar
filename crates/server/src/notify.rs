@@ -18,6 +18,7 @@ use crate::episodes::EpisodeStore;
 use crate::events::EventBus;
 use crate::go2rtc::Go2rtc;
 use crate::mqtt::UnitEvent;
+use crate::redact::redact_credentials;
 
 /// How many notifications the store keeps.
 const RING: usize = 200;
@@ -295,7 +296,8 @@ impl Snapshots {
         let streams = match self.go2rtc.streams().await {
             Ok(streams) => streams,
             Err(err) => {
-                tracing::warn!(%err, "the snapshot check could not read go2rtc");
+                let reason = redact_credentials(&err.to_string());
+                tracing::warn!(%reason, "the snapshot check could not read go2rtc");
                 return None;
             }
         };
@@ -312,7 +314,8 @@ impl Snapshots {
         let frame = match self.go2rtc.frame(&name).await {
             Ok(frame) => frame,
             Err(err) => {
-                tracing::warn!(%err, stream = %name, "no frame for the snapshot");
+                let reason = redact_credentials(&err.to_string());
+                tracing::warn!(%reason, stream = %name, "no frame for the snapshot");
                 return None;
             }
         };

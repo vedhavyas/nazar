@@ -34,6 +34,7 @@ use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
 use crate::recordings::clips_for;
+use crate::redact::{redact_credentials, strip_url_queries};
 use crate::supervisor::{
     StreamSrc, StreamState, Supervisor, SupervisorError, parse_stream_src, stream_name,
 };
@@ -202,7 +203,9 @@ impl From<QuboError> for ApiError {
         } else {
             StatusCode::BAD_GATEWAY
         };
-        Self::new(status, err.to_string())
+        // A refusal can quote the minted URL it failed on, the same carrier
+        // the engine errors are masked for.
+        Self::new(status, diagnostic_detail(&err.to_string()))
     }
 }
 
@@ -570,7 +573,8 @@ async fn persist_login(state: &AppState, session: Session) -> Result<(), ApiErro
     state.qubo.clear_pending_profiles();
     state.supervisor.warm_on_discovery();
     if let Err(err) = state.supervisor.refresh_devices().await {
-        tracing::warn!(%err, "device discovery after login failed");
+        let reason = diagnostic_detail(&err.to_string());
+        tracing::warn!(%reason, "device discovery after login failed");
     }
     Ok(())
 }
@@ -658,126 +662,6 @@ fn degraded_words(reason: &str) -> (&'static str, Option<String>) {
 /// that survives elsewhere is redacted too.
 fn diagnostic_detail(reason: &str) -> String {
     redact_credentials(&strip_url_queries(reason))
-}
-
-/// Schemes whose query string can carry a minted stream's credentials.
-const URL_SCHEMES: [&str; 6] = [
-    "https://", "http://", "rtsps://", "rtsp://", "wss://", "ws://",
-];
-
-fn strip_url_queries(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let next = URL_SCHEMES
-            .iter()
-            .filter_map(|scheme| rest.find(scheme).map(|at| (at, *scheme)))
-            .min_by_key(|(at, _)| *at);
-        let Some((at, scheme)) = next else {
-            out.push_str(rest);
-            return out;
-        };
-        out.push_str(&rest[..at]);
-        let tail = &rest[at + scheme.len()..];
-        let end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\'' | '>'))
-            .unwrap_or(tail.len());
-        let url = &tail[..end];
-        out.push_str(scheme);
-        match url.find('?') {
-            Some(query) => {
-                out.push_str(&url[..query]);
-                out.push_str("?<redacted>");
-            }
-            None => out.push_str(url),
-        }
-        rest = &tail[end..];
-    }
-}
-
-/// Parameter names a mint's credentials ride under, stored in the cloud's
-/// own lowercase spelling and matched case-insensitively.
-const CREDENTIAL_KEYS: [&str; 5] = [
-    "wowzatoken",
-    "sessionid",
-    "useruuid",
-    "camsessionid",
-    "token",
-];
-
-fn redact_credentials(text: &str) -> String {
-    let lower = text.to_ascii_lowercase();
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    loop {
-        let next = CREDENTIAL_KEYS
-            .iter()
-            .filter_map(|key| lower[at..].find(key).map(|off| (at + off, *key)))
-            .min_by_key(|(start, _)| *start);
-        let Some((start, key)) = next else {
-            out.push_str(&text[at..]);
-            return out;
-        };
-        let after_key = start + key.len();
-        // The key is part of a parameter name; a suffix on it
-        // (`wowzatokenhash`) is still the credential's own parameter.
-        let mut name_end = after_key;
-        while let Some(&byte) = bytes.get(name_end) {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
-                name_end += 1;
-            } else {
-                break;
-            }
-        }
-        let sep = match bytes.get(name_end) {
-            Some(b'=') => Some(1),
-            _ => encoded_len(bytes, name_end, b'3', b'd'),
-        };
-        let Some(sep) = sep else {
-            out.push_str(&text[at..after_key]);
-            at = after_key;
-            continue;
-        };
-        let value_start = name_end + sep;
-        let end = value_end(bytes, value_start);
-        out.push_str(&text[at..value_start]);
-        out.push_str("<redacted>");
-        at = value_start + end;
-    }
-}
-
-/// The length of an encoded `=` or `&`, accepting lowercase hex and any
-/// number of `%25` escapes for the percent itself (`%3d`, `%253D`, `%25253d`).
-fn encoded_len(bytes: &[u8], at: usize, lead: u8, tail: u8) -> Option<usize> {
-    if bytes.get(at) != Some(&b'%') {
-        return None;
-    }
-    let mut i = at + 1;
-    while bytes.len() >= i + 2 && &bytes[i..i + 2] == b"25" {
-        i += 2;
-    }
-    if bytes.len() >= i + 2 && bytes[i] == lead && bytes[i + 1].eq_ignore_ascii_case(&tail) {
-        Some(i + 2 - at)
-    } else {
-        None
-    }
-}
-
-/// How far a credential's value runs before a separator: raw or encoded
-/// `&`, whitespace, or the punctuation that ends a quoted URL.
-fn value_end(bytes: &[u8], at: usize) -> usize {
-    let mut i = at;
-    while let Some(&byte) = bytes.get(i) {
-        let ends = byte.is_ascii_whitespace()
-            || matches!(byte, b'&' | b')' | b']' | b'"' | b'\'' | b'#' | b'\\')
-            || (byte == b'%' && encoded_len(bytes, i, b'2', b'6').is_some());
-        if ends {
-            break;
-        }
-        i += 1;
-    }
-    i - at
 }
 
 #[derive(Deserialize)]
@@ -1404,7 +1288,8 @@ fn to_upstream(message: Message) -> tokio_tungstenite::tungstenite::Message {
 fn to_browser(message: tokio_tungstenite::tungstenite::Message) -> Message {
     use tokio_tungstenite::tungstenite::Message as Upstream;
     match message {
-        Upstream::Text(text) => Message::text(text.to_string()),
+        // Error frames can quote the source URL go2rtc failed on.
+        Upstream::Text(text) => Message::text(redact_credentials(text.as_str())),
         Upstream::Binary(bytes) => Message::binary(bytes.to_vec()),
         Upstream::Ping(bytes) => Message::Ping(bytes.to_vec().into()),
         Upstream::Pong(bytes) => Message::Pong(bytes.to_vec().into()),
@@ -1566,6 +1451,56 @@ mod tests {
         assert_eq!(
             diagnostic_detail(raw),
             "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>&wowzaToken=<redacted>&token=<redacted>&wowzatokenhash=<redacted>"
+        );
+    }
+
+    /// A cloud refusal can quote the minted URL it failed on; the API error
+    /// carries the endpoint, not the session.
+    #[test]
+    fn a_cloud_refusal_loses_the_url_it_quoted() {
+        let err = QuboError::Api {
+            code: "ERR_STM_500".to_owned(),
+            message: "mint refused for https://cloud.example/live?sessionId=sid-1&token=tok-2"
+                .to_owned(),
+        };
+        assert_eq!(
+            ApiError::from(err).message,
+            "api error ERR_STM_500: mint refused for https://cloud.example/live?<redacted>"
+        );
+    }
+
+    /// go2rtc's error frames can quote the source URL; the browser gets the
+    /// endpoint and not the session.
+    #[test]
+    fn a_forwarded_text_frame_loses_the_credentials_it_quotes() {
+        let frame = tokio_tungstenite::tungstenite::Message::Text(
+            "error: src=rtsps://w.ex/c?wowzaToken%3Dsek&sessionId=sid".into(),
+        );
+        assert_eq!(
+            to_browser(frame).to_text().ok(),
+            Some("error: src=rtsps://w.ex/c?wowzaToken%3D<redacted>&sessionId=<redacted>")
+        );
+    }
+
+    /// The supervisor stores a reason it has already redacted, so the strip
+    /// meets the mask inside the URL. The mask must not end the scan, or
+    /// every parameter behind the first credential reaches the details.
+    #[test]
+    fn a_pre_redacted_reason_still_loses_its_whole_query() {
+        let raw = "go2rtc api: error sending request for url (https://cloud.example/live/cam?sessionId=sid-1&unitUUID=unit-7&sourceDevice=dev-9#input=nazar)";
+        let stored = redact_credentials(raw);
+        assert!(
+            stored.contains("sessionId=<redacted>"),
+            "the supervisor masks in place: {stored}"
+        );
+        let (short, details) = degraded_words(&stored);
+        assert_eq!(short, "stream engine unavailable");
+        assert_eq!(
+            details.as_deref(),
+            Some(
+                "go2rtc api: error sending request for url (https://cloud.example/live/cam?<redacted>)"
+            ),
+            "the whole query goes, not only the first credential"
         );
     }
 }

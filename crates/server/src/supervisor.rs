@@ -22,6 +22,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, RwLock};
 
 use crate::go2rtc::{Go2rtc, Go2rtcError, live_source, low_source};
+use crate::redact::redact_credentials;
 
 /// A consumer narar keeps on its own stream, so go2rtc's producer stays
 /// warm for every viewer: a client that connects finds a picture already
@@ -321,9 +322,9 @@ struct MintFailure {
 }
 
 impl MintFailure {
-    fn transient(reason: String) -> Self {
+    fn transient(reason: &str) -> Self {
         Self {
-            reason,
+            reason: redact_credentials(reason),
             stale_source: false,
         }
     }
@@ -337,14 +338,14 @@ impl MintFailure {
                 stale_source: true,
             }
         } else {
-            Self::transient(redact(&err.to_string()))
+            Self::transient(&err.to_string())
         }
     }
 }
 
 impl From<String> for MintFailure {
     fn from(reason: String) -> Self {
-        Self::transient(reason)
+        Self::transient(&reason)
     }
 }
 
@@ -815,8 +816,17 @@ impl Supervisor {
                     match stored {
                         Some(current) if current.access_token != session.access_token => current,
                         _ => {
-                            let refreshed =
-                                qubo::auth::refresh_session(&self.qubo, &session).await?;
+                            // A fixed reason: the refresh URL carries the
+                            // account id as a path segment, and a transport
+                            // error echoes the whole URL.
+                            // A fixed reason: a transport failure echoes the
+                            // refresh URL, whose path carries the account id.
+                            let refreshed = qubo::auth::refresh_session(&self.qubo, &session)
+                                .await
+                                .map_err(|_| qubo::QuboError::Auth {
+                                    code: None,
+                                    message: "the refresh could not be spent; log in".to_owned(),
+                                })?;
                             self.sessions.save(&refreshed)?;
                             tracing::info!(
                                 "the stored session healed: a refused call spent the refresh"
@@ -989,7 +999,7 @@ impl Supervisor {
                     self.settle(&name, self.status_for_name(&high).await).await;
                 }
                 Err(err) => {
-                    let reason = redact(&err);
+                    let reason = redact_credentials(&err);
                     tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
                     self.mark_degraded(&name, reason).await;
                 }
@@ -1039,7 +1049,7 @@ impl Supervisor {
         self.go2rtc
             .put_stream(&name, &live_source(&mint.url))
             .await
-            .map_err(|err| SupervisorError::Go2rtc(redact(&err.to_string())))?;
+            .map_err(|err| SupervisorError::Go2rtc(redact_credentials(&err.to_string())))?;
         // The live path's contract, kept: the entry must be held, or the
         // mint went nowhere. Connectedness is deliberately NOT demanded
         // here, and the live path cannot demand it at this instant either:
@@ -1053,14 +1063,15 @@ impl Supervisor {
             .go2rtc
             .streams()
             .await
-            .map_err(|err| SupervisorError::Go2rtc(redact(&err.to_string())))?
+            .map_err(|err| SupervisorError::Go2rtc(redact_credentials(&err.to_string())))?
             .iter()
             .any(|stream| stream.name == name && stream.live);
         if !held {
             // The source landed but go2rtc lost it between the ack and
             // the read: leave nothing behind for nobody to release.
             if let Err(err) = self.go2rtc.delete_stream(&name).await {
-                tracing::warn!(stream = %name, %err, "the untaken playback stream could not be dropped");
+                let reason = redact_credentials(&err.to_string());
+                tracing::warn!(stream = %name, %reason, "the untaken playback stream could not be dropped");
             }
             tracing::warn!(stream = %name, "go2rtc did not take the playback stream");
             return Err(SupervisorError::Go2rtc(
@@ -1136,7 +1147,8 @@ impl Supervisor {
             _ => return false,
         }
         if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::warn!(stream = name, %err, "the playback stream could not be released");
+            let reason = redact_credentials(&err.to_string());
+            tracing::warn!(stream = name, %reason, "the playback stream could not be released");
         }
         tracing::info!(stream = name, "playback released");
         true
@@ -1323,12 +1335,14 @@ impl Supervisor {
                     Err(reason) => {
                         // The session could not serve a source: end it, so
                         // its pump and camera call do not run unreferenced.
+                        let reason = redact_credentials(&reason);
                         tracing::info!(stream = %name, %reason, "the fast-lane session ended; using the cloud path");
                         session.shutdown();
                         self.armed.write().await.remove(&device.device_id);
                     }
                 },
                 Err(reason) => {
+                    let reason = redact_credentials(&reason);
                     tracing::info!(stream = %name, %reason, "fast lane unavailable; using the cloud path");
                 }
             }
@@ -1362,12 +1376,13 @@ impl Supervisor {
     /// error.
     async fn swap_source(&self, name: &str, source: &str) -> Result<(), String> {
         if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::debug!(stream = %name, %err, "no predecessor to reap on the swap");
+            let reason = redact_credentials(&err.to_string());
+            tracing::debug!(stream = %name, %reason, "no predecessor to reap on the swap");
         }
         self.go2rtc
             .put_stream(name, source)
             .await
-            .map_err(|err| redact(&err.to_string()))
+            .map_err(|err| redact_credentials(&err.to_string()))
     }
 
     /// Hand the source to go2rtc and confirm the entry is held, or the
@@ -1383,7 +1398,7 @@ impl Supervisor {
             .go2rtc
             .streams()
             .await
-            .map_err(|err| redact(&err.to_string()))?
+            .map_err(|err| redact_credentials(&err.to_string()))?
             .iter()
             .any(|stream| stream.name == name && stream.live);
         if !held {
@@ -1403,7 +1418,8 @@ impl Supervisor {
         let streams = match self.go2rtc.streams().await {
             Ok(streams) => streams,
             Err(err) => {
-                tracing::warn!(stream = %name, %err, "the liveness watch could not read go2rtc");
+                let reason = redact_credentials(&err.to_string());
+                tracing::warn!(stream = %name, %reason, "the liveness watch could not read go2rtc");
                 return ProducerWatch::Unreadable;
             }
         };
@@ -1556,7 +1572,7 @@ impl Supervisor {
                 self.settle(&low, live).await;
             }
             Err(err) => {
-                let reason = redact(&err);
+                let reason = redact_credentials(&err);
                 tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
                 self.mark_degraded(&low, reason).await;
             }
@@ -1686,7 +1702,8 @@ impl Supervisor {
             Err(Go2rtcError::Rejected { status: 400, body }) if body.contains("path not exist") => {
             }
             Err(err) => {
-                tracing::warn!(stream = %name, %err, "the stale source could not be dropped");
+                let reason = redact_credentials(&err.to_string());
+                tracing::warn!(stream = %name, %reason, "the stale source could not be dropped");
             }
         }
     }
@@ -1750,26 +1767,6 @@ fn new_waking() -> Tracked {
     }
 }
 
-/// Minted URLs carry a session token and errors echo the URL they failed
-/// on; nothing with a token attached reaches logs or the browser's reason.
-fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("token=") {
-        out.push_str(&rest[..start]);
-        out.push_str("token=<redacted>");
-        let after = &rest[start + "token=".len()..];
-        // `#` matters: the source rides as `?token=..#input=nazar..`, and
-        // without it the whole tail of the message is swallowed.
-        let end = after
-            .find(['&', ' ', '"', '\'', ')', ']', '\\', '#'])
-            .unwrap_or(after.len());
-        rest = &after[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     //! The pure seams: the defaults' ordering, the hold registry's
@@ -1802,6 +1799,71 @@ mod tests {
             pacing.connect_grace < pacing.connect_window,
             "the first attempt waits out a whole slow dial before the window can end it"
         );
+    }
+
+    /// The cloud's refusal echoes the URL the mint failed on; the stored
+    /// reason carries the mask, not the session the URL held.
+    #[test]
+    fn a_refused_mints_reason_is_masked_before_it_is_stored() {
+        let failure = MintFailure::from_error(&qubo::QuboError::Api {
+            code: "ERR_STM_500".to_owned(),
+            message: "mint refused for https://cloud.example/live/cam?sessionId=sid-1&token=tok-2"
+                .to_owned(),
+        });
+        assert!(!failure.reason.contains("sid-1"), "{}", failure.reason);
+        assert!(!failure.reason.contains("tok-2"), "{}", failure.reason);
+        assert!(
+            !failure.stale_source,
+            "only the offline code condemns the source"
+        );
+    }
+
+    /// A refresh that cannot be spent reports a fixed reason: a transport
+    /// failure echoes the refresh URL, which carries the account id in its
+    /// path and is masked by neither scanner.
+    #[tokio::test]
+    async fn a_refresh_failure_names_no_account() {
+        let dir = std::env::temp_dir().join(format!("nazar-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let sessions = SessionStore::new(dir.join("session.json"));
+        sessions
+            .save(&qubo::Session {
+                access_token: "token-dead".to_owned(),
+                uuid: "user-uuid-1".to_owned(),
+                email: None,
+                refresh_token: Some("refresh-1".to_owned()),
+            })
+            .expect("the durable session saves");
+        let supervisor = Supervisor::new(
+            // Nothing listens: the refresh fails in transit, and the
+            // requester's error quotes the URL it dialled.
+            QuboClient::new(
+                "http://127.0.0.1:9".parse().expect("a url"),
+                qubo::ServiceProvider::default(),
+            ),
+            sessions,
+            Go2rtc::connect("http://127.0.0.1:9".parse().expect("a url")).expect("a client"),
+            Pacing::default(),
+        );
+
+        let err = supervisor
+            .with_fresh_session(|_| async {
+                Err::<(), _>(qubo::QuboError::Auth {
+                    code: None,
+                    message: "refused".to_owned(),
+                })
+            })
+            .await
+            .expect_err("the refresh fails");
+        assert!(
+            !err.to_string().contains("user-uuid-1"),
+            "the account id stays out of the reason: {err}"
+        );
+        assert!(
+            matches!(err, qubo::QuboError::Auth { .. }),
+            "an unspendable refresh leaves the session refused: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A hold whose lease is observable: enough for the registry test.
@@ -1955,6 +2017,87 @@ mod tests {
             1,
             "a call that never refused logs no heal"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine refuses a source and quotes the URL it rejected; the
+    /// refusal's warning line keeps the URL's endpoint and carries none of
+    /// the credential values, in every spelling the cloud mints them. The
+    /// body stays inside go2rtc's 200-char snippet so each shape reaches
+    /// the log the assertion reads.
+    #[tokio::test]
+    async fn a_refused_mints_warning_keeps_no_credentials() {
+        const SECRETS: [&str; 9] = [
+            "sek-a", "sid-b", "usr-c", "cam-d", "pln-e", "pln-f", "hsh-g", "csn-j", "dbl-m",
+        ];
+        // go2rtc keeps the first 200 chars of a rejection body, so the
+        // assertion only covers the shapes that fit inside that prefix.
+        const BODY: &str = "src=rtsps://w.ex/c?wowzaToken%253Dsek-a%26sessionId%3Dsid-b%26userUUID%3Dusr-c%26camSessionId%3Dcam-d&wowzaToken=pln-e&token=pln-f&wowzatokenhash=hsh-g&a=camSessionId%3Dcsn-j&b=wowzaToken%25253Ddbl-m";
+        assert!(
+            BODY.len() <= 200,
+            "the whole body fits inside go2rtc's snippet: {} bytes",
+            BODY.len()
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/api/streams"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string(BODY))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("nazar-redact-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let supervisor = Supervisor::new(
+            QuboClient::new(
+                "http://127.0.0.1:9".parse().expect("a url"),
+                qubo::ServiceProvider::default(),
+            ),
+            SessionStore::new(dir.join("session.json")),
+            Go2rtc::connect(server.uri().parse().expect("a url")).expect("a client"),
+            Pacing::default(),
+        );
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!("redaction capture probe");
+
+        // The path a refused chain takes: the PUT fails, the error becomes
+        // the mint's reason, and the settle logs it.
+        let failure = supervisor
+            .put_and_confirm(
+                "cam-high",
+                "ffmpeg:rtsps://wowza.example/live/cam?wowzaToken=sek-a&sessionId=sid-b",
+            )
+            .await
+            .map_err(MintFailure::from)
+            .expect_err("the engine refuses the source");
+        supervisor.settle_mint_failure("cam-high", failure).await;
+
+        let logs = captured.text();
+        assert!(
+            logs.contains("capture probe"),
+            "the capture is live: {logs}"
+        );
+        assert!(
+            logs.contains("stream re-mint failed"),
+            "the refusal is logged: {logs}"
+        );
+        assert!(
+            logs.contains("rtsps://w.ex/c"),
+            "the URL's endpoint survives: {logs}"
+        );
+        assert_eq!(
+            logs.matches("<redacted>").count(),
+            SECRETS.len(),
+            "every shape in the body was masked, none fell outside the snippet: {logs}"
+        );
+        for secret in SECRETS {
+            assert!(!logs.contains(secret), "the log carries {secret}: {logs}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
