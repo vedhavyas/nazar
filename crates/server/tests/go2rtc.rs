@@ -719,7 +719,7 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
     let bin = dir.join("fake-ffmpeg.sh");
     std::fs::write(
         &bin,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/ffmpeg.args\"\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/ffmpeg.pid\"\nexec sleep 60\n",
+        "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nprintf '%s\\n' \"$@\" > \"$d/ffmpeg.args.tmp\"\nmv \"$d/ffmpeg.args.tmp\" \"$d/ffmpeg.args\"\nprintf '%s' \"$$\" > \"$d/ffmpeg.pid.tmp\"\nmv \"$d/ffmpeg.pid.tmp\" \"$d/ffmpeg.pid\"\nexec sleep 60\n",
     )
     .expect("the stand-in writes");
     #[cfg(unix)]
