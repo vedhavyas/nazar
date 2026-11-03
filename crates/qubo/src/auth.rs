@@ -43,6 +43,7 @@ pub struct AccountProfile {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Refreshed {
+    #[serde(deserialize_with = "non_empty")]
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
@@ -274,7 +275,12 @@ pub async fn refresh_session(client: &QuboClient, session: &Session) -> Result<S
         "refreshToken": refresh_token,
     });
     let response = client.post_json(&path, &body, Some(session)).await?;
-    let refreshed: Refreshed = serde_json::from_value(response)?;
+    // A fixed reason: serde's invalid-type Display echoes the offending
+    // value, and the refresh answer can carry tokens.
+    let refreshed: Refreshed = serde_json::from_value(response).map_err(|_| QuboError::Http {
+        status: None,
+        message: "the refresh answer was not understood".to_owned(),
+    })?;
     // An empty token is no token: a rotation that answers "" keeps the
     // stored one rather than poisoning it.
     let rotated = refreshed.refresh_token.filter(|token| !token.is_empty());

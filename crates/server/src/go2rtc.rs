@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::redact::redact_credentials;
 use crate::supervisor::{HoldLease, StreamHold};
+use crate::throttle::{Repeat, RepeatLog};
 
 /// Where the generated config puts go2rtc's API.
 pub const API_BASE: &str = "http://127.0.0.1:1984";
@@ -666,6 +667,161 @@ fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
+/// A failure's words with ffmpeg's per-process address removed, so the same
+/// failure keeps one signature across runs. The shape is the `0x` word
+/// directly after `@` in `[tcp @ 0x...]`; a later hex word is part of the
+/// message and stays.
+fn failure_signature(reason: &str) -> String {
+    let words: Vec<&str> = reason.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    for (index, word) in words.iter().enumerate() {
+        if word.starts_with("0x") && index > 0 && words[index - 1] == "@" {
+            continue;
+        }
+        kept.push(word);
+    }
+    kept.join(" ")
+}
+
+/// How the child ended, as the throttle's key sees it: the exit code, or
+/// the signal that killed it, even when ffmpeg says nothing. SIGKILL and
+/// SIGSEGV are different failures.
+fn exit_class(status: &Result<std::process::ExitStatus, std::io::Error>) -> String {
+    match status {
+        Ok(status) => status
+            .code()
+            .map_or_else(|| signal_class(*status), |code| format!("exit {code}")),
+        Err(err) => format!("wait failed: {err}"),
+    }
+}
+
+#[cfg(unix)]
+fn signal_class(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+    status
+        .signal()
+        .map_or_else(|| "signal".to_owned(), |signal| format!("signal {signal}"))
+}
+
+#[cfg(not(unix))]
+fn signal_class(_status: std::process::ExitStatus) -> String {
+    "signal".to_owned()
+}
+
+/// A young death, through the throttle: the first of a streak in full, the
+/// rest counted.
+fn log_hold_exit(
+    key: &str,
+    stream: &str,
+    ran_for: Duration,
+    status: &Result<std::process::ExitStatus, std::io::Error>,
+    failures: u32,
+    reason: &str,
+    repeats: &RepeatLog,
+) {
+    let cause = format!("{} {}", failure_signature(reason), exit_class(status));
+    match repeats.note(key, &cause) {
+        Repeat::First => tracing::warn!(
+            stream = %stream,
+            ran_for = ?ran_for,
+            ?status,
+            failures,
+            reason = %reason,
+            "the hold consumer exited"
+        ),
+        Repeat::Suppressed => {}
+        Repeat::Summary { suppressed } => tracing::warn!(
+            stream = %stream,
+            ran_for = ?ran_for,
+            ?status,
+            failures,
+            suppressed,
+            reason = %reason,
+            "the hold consumer is still exiting"
+        ),
+    }
+}
+
+/// The consumer's command: read the stream, copy it, write nothing.
+fn hold_command(ffmpeg: &Path, target: &str) -> Command {
+    let mut command = Command::new(ffmpeg);
+    command
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            target,
+            "-c",
+            "copy",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+/// A run that outlived [`HOLD_HEALTHY_RUN`]: it ends the failure streak,
+/// names the count it suppressed, and logs the exit itself.
+fn log_hold_healthy_run(
+    exit_key: &str,
+    spawn_key: &str,
+    stream: &str,
+    ran_for: Duration,
+    status: &Result<std::process::ExitStatus, std::io::Error>,
+    reason: &str,
+    repeats: &RepeatLog,
+) {
+    let ended = repeats.recovered_now(exit_key);
+    let started = repeats.recovered_now(spawn_key);
+    if ended.is_some() || started.is_some() {
+        tracing::info!(
+            stream = %stream,
+            suppressed = ended.unwrap_or(0) + started.unwrap_or(0),
+            "the hold consumer ran healthy; the failure streak is over"
+        );
+    }
+    tracing::warn!(
+        stream = %stream,
+        ran_for = ?ran_for,
+        ?status,
+        failures = 0,
+        reason = %reason,
+        "the hold consumer exited"
+    );
+}
+
+/// A failed spawn, through the throttle, like [`log_hold_exit`].
+fn log_hold_spawn_failure(
+    key: &str,
+    stream: &str,
+    err: &std::io::Error,
+    failures: u32,
+    repeats: &RepeatLog,
+) {
+    match repeats.note(key, &failure_signature(&err.to_string())) {
+        Repeat::First => {
+            tracing::warn!(stream = %stream, %err, failures, "the hold consumer could not start");
+        }
+        Repeat::Suppressed => {}
+        Repeat::Summary { suppressed } => {
+            tracing::warn!(
+                stream = %stream,
+                %err,
+                failures,
+                suppressed,
+                "the hold consumer still cannot start"
+            );
+        }
+    }
+}
+
 /// The base delay before a hold reconnects: long enough that a camera
 /// that is away is not dialled every second, short enough that a viewer
 /// arriving after a failure waits seconds, not minutes. Consecutive young
@@ -752,35 +908,24 @@ impl StreamHold for FfmpegHold {
         let ffmpeg = self.ffmpeg.clone();
         let target = format!("rtsp://{RTSP_ADDR}/{name}");
         let stream = name.to_owned();
+        // A death and a failure to start are different failures even when
+        // their words coincide, so they never share a record.
+        let exit_key = format!("{stream}:exit");
+        let spawn_key = format!("{stream}:spawn");
         let attached = Arc::new(AtomicBool::new(false));
         let deaths = Arc::clone(&self.deaths);
+        let repeats = RepeatLog::default();
         let worker = {
             let attached = Arc::clone(&attached);
+            let stream = stream.clone();
+            let exit_key = exit_key.clone();
+            let spawn_key = spawn_key.clone();
+            let repeats = repeats.clone();
             tokio::spawn(async move {
                 let mut failures: u32 = 0;
                 loop {
                     let started = Instant::now();
-                    match Command::new(&ffmpeg)
-                        .args([
-                            "-nostdin",
-                            "-v",
-                            "error",
-                            "-rtsp_transport",
-                            "tcp",
-                            "-i",
-                            &target,
-                            "-c",
-                            "copy",
-                            "-f",
-                            "null",
-                            "-",
-                        ])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::piped())
-                        .kill_on_drop(true)
-                        .spawn()
-                    {
+                    match hold_command(&ffmpeg, &target).spawn() {
                         Ok(mut child) => {
                             let drain = child.stderr.take().map(drain_tail);
                             // Attached means the consumer REGISTERED, not
@@ -801,35 +946,43 @@ impl StreamHold for FfmpegHold {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .insert(stream.clone(), Instant::now());
                             let reason = match drain {
-                                Some(handle) => {
-                                    String::from_utf8_lossy(&handle.await.unwrap_or_default())
-                                        .into_owned()
-                                }
+                                Some(handle) => match handle.await {
+                                    Ok(tail) => String::from_utf8_lossy(&tail).into_owned(),
+                                    Err(err) => {
+                                        // A panicked or cancelled drain says
+                                        // nothing; the exit still does.
+                                        tracing::warn!(
+                                            stream = %stream,
+                                            %err,
+                                            "the hold consumer's stderr drain did not finish"
+                                        );
+                                        String::new()
+                                    }
+                                },
                                 None => String::new(),
                             };
-                            if started.elapsed() >= HOLD_HEALTHY_RUN {
+                            let ran_for = started.elapsed();
+                            let reason = snippet(&redact_credentials(&reason));
+                            if ran_for >= HOLD_HEALTHY_RUN {
+                                // A healthy run ends the failure streak: the
+                                // next young death logs its detail again.
                                 failures = 0;
+                                log_hold_healthy_run(
+                                    &exit_key, &spawn_key, &stream, ran_for, &status, &reason,
+                                    &repeats,
+                                );
                             } else {
                                 failures += 1;
+                                log_hold_exit(
+                                    &exit_key, &stream, ran_for, &status, failures, &reason,
+                                    &repeats,
+                                );
                             }
-                            tracing::warn!(
-                                stream = %stream,
-                                ran_for = ?started.elapsed(),
-                                ?status,
-                                failures,
-                                reason = %snippet(&redact_credentials(&reason)),
-                                "the hold consumer exited"
-                            );
                         }
                         Err(err) => {
                             attached.store(false, Ordering::SeqCst);
                             failures += 1;
-                            tracing::warn!(
-                                stream = %stream,
-                                %err,
-                                failures,
-                                "the hold consumer could not start"
-                            );
+                            log_hold_spawn_failure(&spawn_key, &stream, &err, failures, &repeats);
                         }
                     }
                     if failures == HOLD_ESCALATE_AT {
@@ -843,7 +996,14 @@ impl StreamHold for FfmpegHold {
                 }
             })
         };
-        Arc::new(FfmpegLease { worker, attached })
+        Arc::new(FfmpegLease {
+            worker,
+            attached,
+            stream,
+            exit_key,
+            spawn_key,
+            repeats,
+        })
     }
 }
 
@@ -852,6 +1012,10 @@ impl StreamHold for FfmpegHold {
 struct FfmpegLease {
     worker: tokio::task::JoinHandle<()>,
     attached: Arc<AtomicBool>,
+    stream: String,
+    exit_key: String,
+    spawn_key: String,
+    repeats: RepeatLog,
 }
 
 impl HoldLease for FfmpegLease {
@@ -864,6 +1028,22 @@ impl Drop for FfmpegLease {
     fn drop(&mut self) {
         self.worker.abort();
         self.attached.store(false, Ordering::SeqCst);
+        // The worker dies with the lease, taking whatever it had counted
+        // but not yet summarised; a released hold must not swallow that. A
+        // failure already logged in full has nothing pending, so only a
+        // positive count is announced. One note can still be lost if the
+        // abort lands between the worker's check and its record: the bound
+        // is one line, not the streak.
+        let ended = self.repeats.recovered_now(&self.exit_key);
+        let started = self.repeats.recovered_now(&self.spawn_key);
+        let suppressed = ended.unwrap_or(0) + started.unwrap_or(0);
+        if suppressed > 0 {
+            tracing::warn!(
+                stream = %self.stream,
+                suppressed,
+                "a held stream is released with a pending failure count"
+            );
+        }
     }
 }
 
@@ -885,6 +1065,88 @@ mod tests {
             )
         );
         assert_eq!(redacted_line(b" \n"), None, "a blank line is not emitted");
+    }
+
+    #[test]
+    fn a_hold_failure_signature_ignores_ffmpeg_addresses() {
+        let first = "[tcp @ 0x5f225addb5c0] Connection to tcp://127.0.0.1:8554?timeout=0 failed: Connection refused";
+        let second = "[tcp @ 0x59d0d9c2f5c0] Connection to tcp://127.0.0.1:8554?timeout=0 failed: Connection refused";
+        assert_eq!(
+            failure_signature(first),
+            failure_signature(second),
+            "the per-process address is not part of the failure"
+        );
+        assert!(
+            failure_signature(first).contains("Connection refused"),
+            "the failure's own words survive"
+        );
+        let reset = first.replace("Connection refused", "Connection reset by peer");
+        assert_ne!(
+            failure_signature(first),
+            failure_signature(&reset),
+            "distinct causes keep distinct signatures"
+        );
+        assert!(
+            failure_signature("frame 0xdeadbeef missing").contains("0xdeadbeef"),
+            "a hex word that is not an ffmpeg address stays in the signature"
+        );
+        let two = failure_signature("[tcp @ 0x1234 0x5678] Connection refused");
+        assert!(
+            !two.contains("0x1234") && two.contains("0x5678"),
+            "only the word directly after @ goes: {two}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_run_names_the_count_it_suppressed() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let repeats = RepeatLog::default();
+        let exit_key = "hall-high:exit";
+        let spawn_key = "hall-high:spawn";
+        assert_eq!(repeats.note(exit_key, "connection refused"), Repeat::First);
+        assert_eq!(
+            repeats.note(exit_key, "connection refused"),
+            Repeat::Suppressed
+        );
+        let captured = crate::capture::Captured::start();
+        log_hold_healthy_run(
+            exit_key,
+            spawn_key,
+            "hall-high",
+            HOLD_HEALTHY_RUN,
+            &Ok(std::process::ExitStatus::from_raw(0)),
+            "connection refused",
+            &repeats,
+        );
+        let text = captured.text();
+        assert!(
+            text.contains("the hold consumer ran healthy; the failure streak is over")
+                && text.contains("suppressed=1"),
+            "the healthy run reports the count it suppressed: {text}"
+        );
+        assert_eq!(repeats.recovered_now(exit_key), None, "the record is gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_class_names_the_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let killed = Ok(std::process::ExitStatus::from_raw(9));
+        let faulted = Ok(std::process::ExitStatus::from_raw(11));
+        assert_ne!(
+            exit_class(&killed),
+            exit_class(&faulted),
+            "SIGKILL and SIGSEGV are different failures"
+        );
+        assert_eq!(exit_class(&killed), "signal 9");
+        assert_eq!(
+            exit_class(&Ok(std::process::ExitStatus::from_raw(1 << 8))),
+            "exit 1",
+            "a normal code is the class"
+        );
     }
 
     #[test]

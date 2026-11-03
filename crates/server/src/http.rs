@@ -1459,6 +1459,7 @@ mod tests {
     #[test]
     fn a_cloud_refusal_loses_the_url_it_quoted() {
         let err = QuboError::Api {
+            status: 500,
             code: "ERR_STM_500".to_owned(),
             message: "mint refused for https://cloud.example/live?sessionId=sid-1&token=tok-2"
                 .to_owned(),

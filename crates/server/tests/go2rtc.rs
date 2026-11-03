@@ -877,3 +877,110 @@ async fn the_ffmpeg_hold_restarts_after_the_child_dies() {
     drop(lease);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hold released after a failure it already logged in full has nothing
+/// pending, so its teardown is silent.
+#[tokio::test]
+async fn a_released_hold_with_nothing_pending_is_quiet() {
+    let dir = temp_dir();
+    let bin = dir.join("dying-ffmpeg.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nsleep 0.1\nexit 1\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+
+    let captured = common::capture::Captured::start();
+    let hold = server::go2rtc::FfmpegHold::new(bin);
+    let lease = hold.hold("hall-high");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && captured.text().matches("the hold consumer exited").count() != 1
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        captured.text().matches("the hold consumer exited").count() == 1,
+        "the first exit logs in full: {}",
+        captured.text()
+    );
+
+    drop(lease);
+    assert!(
+        !captured
+            .text()
+            .contains("a held stream is released with a pending failure count"),
+        "a logged failure leaves nothing pending: {}",
+        captured.text()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hold that keeps dying young reports the exit once, not once per
+/// respawn: the retained hub log carried 2,408 of these lines during the
+/// outage.
+#[tokio::test]
+async fn a_dying_hold_reports_its_exit_once() {
+    let dir = temp_dir();
+    let bin = dir.join("dying-ffmpeg.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'x' >> \"$(dirname \"$0\")/runs.log\"\nsleep 0.1\nprintf 'e' >> \"$(dirname \"$0\")/exits.log\"\nexit 1\n",
+    )
+    .expect("the stand-in writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is executable");
+    }
+
+    let captured = common::capture::Captured::start();
+
+    let hold = server::go2rtc::FfmpegHold::new(bin);
+    let lease = hold.hold("hall-high");
+    let exits_path = dir.join("exits.log");
+
+    // Pin the first line before the second death can race it: the final
+    // count only means something once the first was seen.
+    assert!(
+        await_text_where(&exits_path, |text| !text.is_empty())
+            .await
+            .is_some(),
+        "the hold died once"
+    );
+    assert!(
+        common::eventually(|| async {
+            captured.text().matches("the hold consumer exited").count() == 1
+        })
+        .await,
+        "the first exit logs in full: {}",
+        captured.text()
+    );
+
+    // The second exit lands one backoff later (the base doubled once), and
+    // must add nothing; the settle lets an unthrottled line land before the
+    // count is read.
+    assert!(
+        await_text_where(&exits_path, |text| text.len() >= 2)
+            .await
+            .is_some(),
+        "the hold re-ran and died twice"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        captured.text().matches("the hold consumer exited").count(),
+        1,
+        "one exit line for the streak: {}",
+        captured.text()
+    );
+
+    drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
+}

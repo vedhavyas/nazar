@@ -787,7 +787,7 @@ async fn an_error_message_surfaces_verbatim() {
         .expect("fixture message")
         .to_owned();
     match err {
-        QuboError::Api { code, message } => {
+        QuboError::Api { code, message, .. } => {
             assert_eq!(code, "ERR_SM_057", "the API code is preserved");
             assert_eq!(message, expected, "the server's message surfaces verbatim");
         }
@@ -940,6 +940,43 @@ async fn a_refresh_spends_both_tokens_and_takes_the_fresh_pair() {
     let body: Value = serde_json::from_slice(&requests[0].body).expect("a json body");
     assert_eq!(body["accessToken"], json!("gm-access-token"));
     assert_eq!(body["refreshToken"], json!("gm-refresh-token"));
+}
+
+/// An empty access token is not a rotation: saving it would leave every
+/// later discovery re-refreshing with a session that cannot authenticate.
+#[tokio::test]
+async fn a_refresh_refuses_an_empty_access_token() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        REFRESH_PATH,
+        200,
+        r#"{"accessToken":"","refreshToken":"gm-refresh-token-2"}"#,
+    )
+    .await;
+    let client = client_for(&server);
+    let stored = Session {
+        access_token: "gm-access-token".to_owned(),
+        uuid: "user-uuid-1".to_owned(),
+        email: None,
+        refresh_token: Some("gm-refresh-token".to_owned()),
+    };
+
+    let err = refresh_session(&client, &stored)
+        .await
+        .expect_err("an empty token is not a rotation");
+    match err {
+        QuboError::Http {
+            status: None,
+            message,
+        } => {
+            assert!(
+                message.contains("not understood"),
+                "the fixed reason: {message}"
+            );
+        }
+        other => panic!("expected the fixed Http reason, got {other:?}"),
+    }
 }
 
 #[tokio::test]

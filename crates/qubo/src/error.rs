@@ -15,8 +15,14 @@ pub enum QuboError {
     },
 
     /// A non-2xx response carrying the API's `{code, message}` envelope.
+    /// The status is kept: a 4xx refusal and a 5xx outage are different
+    /// events to every caller that routes on them.
     #[error("api error {code}: {message}")]
-    Api { code: String, message: String },
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
 
     /// 401/403 - the session is missing, expired or refused.
     #[error("auth error: {message}")]
@@ -38,9 +44,34 @@ impl From<reqwest::Error> for QuboError {
     fn from(err: reqwest::Error) -> Self {
         Self::Http {
             status: err.status().map(|status| status.as_u16()),
-            message: err.to_string(),
+            message: transport_message(&err),
         }
     }
+}
+
+/// A transport failure's words with the URL scrubbed: its class, then the
+/// cause chain. reqwest's own Display echoes the URL, which can carry an
+/// account id or a token, and it prints one sentence for very different
+/// failures - the class and the chain are what tell them apart.
+fn transport_message(err: &reqwest::Error) -> String {
+    let mut text = String::from(if err.is_timeout() {
+        "timeout"
+    } else if err.is_dns() {
+        "dns"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_body() || err.is_decode() {
+        "body"
+    } else {
+        "request"
+    });
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 /// Map a non-2xx response to the right variant, reading the API's error
@@ -61,7 +92,11 @@ pub(crate) fn error_for_status(status: StatusCode, body: &str) -> QuboError {
                 message,
             }
         } else {
-            QuboError::Api { code, message }
+            QuboError::Api {
+                status: status.as_u16(),
+                code,
+                message,
+            }
         };
     }
 
@@ -98,4 +133,30 @@ fn body_snippet(body: &str) -> Option<String> {
         return None;
     }
     Some(body.chars().take(200).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_api_envelope_carries_its_status_and_code() -> Result<(), String> {
+        let err = error_for_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":"RATE","message":"slow down"}"#,
+        );
+        match err {
+            QuboError::Api {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(code, "RATE");
+                assert_eq!(message, "slow down");
+                Ok(())
+            }
+            other => Err(format!("expected Api, got {other:?}")),
+        }
+    }
 }
