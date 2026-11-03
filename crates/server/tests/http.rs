@@ -402,7 +402,7 @@ async fn health_reads_an_unparsable_api_body_as_down() {
 #[tokio::test]
 async fn health_logs_a_transition_once() {
     let h = harness().await;
-    let captured = common::Captured::start();
+    let captured = common::capture::Captured::start();
     let downs = |text: &str| {
         text.matches("the stream engine is not answering fully")
             .count()

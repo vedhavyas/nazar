@@ -105,6 +105,15 @@ fn temp_path() -> PathBuf {
     ))
 }
 
+/// The `suppressed` count on the line carrying `needle`, when it has one.
+fn suppressed_on(text: &str, needle: &str) -> Option<u64> {
+    text.lines()
+        .find(|line| line.contains(needle))
+        .and_then(|line| line.split("suppressed=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+}
+
 fn mint_body(quality: &str) -> String {
     json!({
         "streamURL": format!("rtsps://wowza2.platform.quboworld.com:443/hero-iot-live/{DEVICE_ID}_{quality}?token=tok"),
@@ -753,7 +762,7 @@ async fn a_dead_engine_logs_its_liveness_failure_once() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let captured = common::Captured::start();
+    let captured = common::capture::Captured::start();
     let downs = |text: &str| {
         text.matches("the liveness watch could not read go2rtc")
             .count()
@@ -785,6 +794,10 @@ async fn a_dead_engine_logs_its_liveness_failure_once() {
     let text = captured.text();
     assert_eq!(ups(&text), 1, "one recovery line: {text}");
     assert_eq!(downs(&text), 1, "the recovery adds no failure line: {text}");
+    assert!(
+        suppressed_on(&text, "the liveness watch can read go2rtc again").is_some_and(|n| n > 0),
+        "the recovery names what it suppressed: {text}"
+    );
 }
 
 /// The tile chain reports a dead engine once, not once per loop slice, and
@@ -799,7 +812,7 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
         .expect("the tile wakes");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let captured = common::Captured::start();
+    let captured = common::capture::Captured::start();
     let downs = |text: &str| text.matches("the tile's chain did not take").count();
     let ups = |text: &str| text.matches("the tile's chain took again").count();
 
@@ -829,6 +842,10 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
     let text = captured.text();
     assert_eq!(ups(&text), 1, "one recovery line: {text}");
     assert_eq!(downs(&text), 1, "the recovery adds no failure line: {text}");
+    assert!(
+        suppressed_on(&text, "the tile's chain took again").is_some_and(|n| n > 0),
+        "the recovery names what it suppressed: {text}"
+    );
 }
 
 #[tokio::test]

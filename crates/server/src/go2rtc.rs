@@ -667,9 +667,10 @@ fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
-/// A failure's words with ffmpeg's per-process address (`@ 0x...`) removed,
-/// so the same failure keeps one signature across runs. Only the address
-/// shape goes; any other hex word is part of the message.
+/// A failure's words with ffmpeg's per-process address removed, so the same
+/// failure keeps one signature across runs. The shape is the `0x` word
+/// directly after `@` in `[tcp @ 0x...]`; any other hex word is part of
+/// the message and stays.
 fn failure_signature(reason: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     for word in reason.split_whitespace() {
@@ -681,15 +682,29 @@ fn failure_signature(reason: &str) -> String {
     kept.join(" ")
 }
 
-/// How the child ended, as the throttle's key sees it: a clean code and a
-/// signal are different failures even when ffmpeg says nothing.
+/// How the child ended, as the throttle's key sees it: the exit code, or
+/// the signal that killed it, even when ffmpeg says nothing. SIGKILL and
+/// SIGSEGV are different failures.
 fn exit_class(status: &Result<std::process::ExitStatus, std::io::Error>) -> String {
     match status {
         Ok(status) => status
             .code()
-            .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}")),
+            .map_or_else(|| signal_class(*status), |code| format!("exit {code}")),
         Err(err) => format!("wait failed: {err}"),
     }
+}
+
+#[cfg(unix)]
+fn signal_class(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+    status
+        .signal()
+        .map_or_else(|| "signal".to_owned(), |signal| format!("signal {signal}"))
+}
+
+#[cfg(not(unix))]
+fn signal_class(_status: std::process::ExitStatus) -> String {
+    "signal".to_owned()
 }
 
 /// A young death, through the throttle: the first of a streak in full, the
@@ -1028,6 +1043,58 @@ mod tests {
         assert!(
             failure_signature("frame 0xdeadbeef missing").contains("0xdeadbeef"),
             "a hex word that is not an ffmpeg address stays in the signature"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_run_names_the_count_it_suppressed() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let repeats = RepeatLog::default();
+        let exit_key = "hall-high:exit";
+        let spawn_key = "hall-high:spawn";
+        assert_eq!(repeats.note(exit_key, "connection refused"), Repeat::First);
+        assert_eq!(
+            repeats.note(exit_key, "connection refused"),
+            Repeat::Suppressed
+        );
+        let captured = crate::capture::Captured::start();
+        log_hold_healthy_run(
+            exit_key,
+            spawn_key,
+            "hall-high",
+            HOLD_HEALTHY_RUN,
+            &Ok(std::process::ExitStatus::from_raw(0)),
+            "connection refused",
+            &repeats,
+        );
+        let text = captured.text();
+        assert!(
+            text.contains("the hold consumer ran healthy; the failure streak is over")
+                && text.contains("suppressed=1"),
+            "the healthy run reports the count it suppressed: {text}"
+        );
+        assert_eq!(repeats.recovered_now(exit_key), None, "the record is gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_class_names_the_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let killed = Ok(std::process::ExitStatus::from_raw(9));
+        let faulted = Ok(std::process::ExitStatus::from_raw(11));
+        assert_ne!(
+            exit_class(&killed),
+            exit_class(&faulted),
+            "SIGKILL and SIGSEGV are different failures"
+        );
+        assert_eq!(exit_class(&killed), "signal 9");
+        assert_eq!(
+            exit_class(&Ok(std::process::ExitStatus::from_raw(1 << 8))),
+            "exit 1",
+            "a normal code is the class"
         );
     }
 

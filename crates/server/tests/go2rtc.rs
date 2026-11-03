@@ -897,7 +897,7 @@ async fn a_dying_hold_reports_its_exit_once() {
             .expect("the stand-in is executable");
     }
 
-    let captured = common::Captured::start();
+    let captured = common::capture::Captured::start();
 
     let hold = server::go2rtc::FfmpegHold::new(bin);
     let lease = hold.hold("hall-high");

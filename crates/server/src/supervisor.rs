@@ -243,12 +243,36 @@ pub enum SupervisorError {
 /// see, and `signature` adds the error's cause chain - reqwest prints one
 /// sentence for a refusal, a reset and a timeout, so the chain is what
 /// tells them apart. Both are redacted; a token can ride a cause.
-struct SwapFailure {
+struct EngineFailure {
     reason: String,
     signature: String,
 }
 
-fn failure_detail(err: &Go2rtcError) -> SwapFailure {
+/// A failed refresh keeps its own kind: a transport blip is not a refusal,
+/// and must not route the person to login. Every message is fixed, because
+/// the refresh URL carries the account id as a path segment and a transport
+/// error echoes the whole URL. Parse and IO carry no URL, so their own
+/// errors stay.
+fn refresh_failure(err: qubo::QuboError) -> qubo::QuboError {
+    const WHY: &str = "the refresh could not be spent";
+    match err {
+        qubo::QuboError::Auth { .. } => qubo::QuboError::Auth {
+            code: None,
+            message: format!("{WHY}; log in"),
+        },
+        qubo::QuboError::Http { status, .. } => qubo::QuboError::Http {
+            status,
+            message: WHY.to_owned(),
+        },
+        qubo::QuboError::Api { code, .. } => qubo::QuboError::Api {
+            code,
+            message: WHY.to_owned(),
+        },
+        other => other,
+    }
+}
+
+fn failure_detail(err: &Go2rtcError) -> EngineFailure {
     let mut detail = err.to_string();
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
@@ -256,7 +280,7 @@ fn failure_detail(err: &Go2rtcError) -> SwapFailure {
         detail.push_str(&cause.to_string());
         source = cause.source();
     }
-    SwapFailure {
+    EngineFailure {
         reason: redact_credentials(&err.to_string()),
         signature: redact_credentials(&detail),
     }
@@ -848,17 +872,9 @@ impl Supervisor {
                     match stored {
                         Some(current) if current.access_token != session.access_token => current,
                         _ => {
-                            // A fixed reason: the refresh URL carries the
-                            // account id as a path segment, and a transport
-                            // error echoes the whole URL.
-                            // A fixed reason: a transport failure echoes the
-                            // refresh URL, whose path carries the account id.
                             let refreshed = qubo::auth::refresh_session(&self.qubo, &session)
                                 .await
-                                .map_err(|_| qubo::QuboError::Auth {
-                                    code: None,
-                                    message: "the refresh could not be spent; log in".to_owned(),
-                                })?;
+                                .map_err(refresh_failure)?;
                             self.sessions.save(&refreshed)?;
                             tracing::info!(
                                 "the stored session healed: a refused call spent the refresh"
@@ -1038,7 +1054,7 @@ impl Supervisor {
                     self.settle(&name, self.status_for_name(&high).await).await;
                 }
                 Err(failure) => {
-                    let SwapFailure { reason, signature } = failure;
+                    let EngineFailure { reason, signature } = failure;
                     match self.chain_repeats.note(&name, &signature) {
                         Repeat::First => {
                             tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
@@ -1426,7 +1442,7 @@ impl Supervisor {
     /// ffmpeg never starves out on its own. Every re-PUT in this file goes
     /// through here; an absent entry's delete finds nothing and is not an
     /// error.
-    async fn swap_source(&self, name: &str, source: &str) -> Result<(), SwapFailure> {
+    async fn swap_source(&self, name: &str, source: &str) -> Result<(), EngineFailure> {
         if let Err(err) = self.go2rtc.delete_stream(name).await {
             let reason = redact_credentials(&err.to_string());
             tracing::debug!(stream = %name, %reason, "no predecessor to reap on the swap");
@@ -1481,8 +1497,8 @@ impl Supervisor {
                 streams
             }
             Err(err) => {
-                let reason = redact_credentials(&err.to_string());
-                match self.liveness_repeats.note(name, &reason) {
+                let EngineFailure { reason, signature } = failure_detail(&err);
+                match self.liveness_repeats.note(name, &signature) {
                     Repeat::First => {
                         tracing::warn!(stream = %name, %reason, "the liveness watch could not read go2rtc");
                     }
@@ -1638,6 +1654,9 @@ impl Supervisor {
             .await
             .is_ok_and(|streams| streams.iter().any(|stream| stream.name == low));
         if present {
+            // A present entry is the chain holding, and the failure it
+            // contradicts was "did not take", so it counts as a success
+            // toward the recovery streak.
             if let Some(suppressed) = self.chain_repeats.recovered(&low) {
                 tracing::info!(stream = %low, suppressed, "the tile's chain took again");
             }
@@ -1654,7 +1673,7 @@ impl Supervisor {
                 self.settle(&low, live).await;
             }
             Err(failure) => {
-                let SwapFailure { reason, signature } = failure;
+                let EngineFailure { reason, signature } = failure;
                 match self.chain_repeats.note(&low, &signature) {
                     Repeat::First => {
                         tracing::warn!(stream = %low, %reason, "the tile's chain did not take");
@@ -1873,6 +1892,8 @@ mod tests {
 
     use super::*;
 
+    use crate::capture::Captured;
+
     /// A supervisor that answers nothing: the test path makes no call it
     /// would have to fake.
     fn quiet_supervisor() -> Supervisor {
@@ -1955,8 +1976,13 @@ mod tests {
             "the account id stays out of the reason: {err}"
         );
         assert!(
-            matches!(err, qubo::QuboError::Auth { .. }),
-            "an unspendable refresh leaves the session refused: {err}"
+            matches!(err, qubo::QuboError::Http { .. }),
+            "a refresh that fails in transit is not a refusal: {err}"
+        );
+        supervisor.settle_auth(&err);
+        assert!(
+            !supervisor.needs_login(),
+            "a transport blip does not route the person to login"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2184,68 +2210,5 @@ mod tests {
             assert!(!logs.contains(secret), "the log carries {secret}: {logs}");
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    std::thread_local! {
-        /// The buffer this thread's events land in, when a test captures.
-        static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// This thread's tracing output. The subscriber is process-global and
-    /// routes each event to the emitting thread's buffer: tracing caches a
-    /// callsite's interest process-wide, so a thread-local subscriber can
-    /// go silent once a sibling test has run the same line without one.
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl Captured {
-        fn start() -> Self {
-            static INSTALL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            INSTALL.get_or_init(|| {
-                let subscriber = tracing_subscriber::fmt()
-                    .with_writer(CaptureWriter)
-                    .with_ansi(false)
-                    .finish();
-                let _ = tracing::subscriber::set_global_default(subscriber);
-            });
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&buffer)));
-            Self(buffer)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("the buffer")).into_owned()
-        }
-    }
-
-    impl Drop for Captured {
-        fn drop(&mut self) {
-            CAPTURE.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    struct CaptureWriter;
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            CAPTURE.with(|slot| {
-                if let Some(buffer) = slot.borrow().as_ref() {
-                    buffer.lock().expect("the buffer").extend_from_slice(buf);
-                }
-            });
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CaptureWriter
-        }
     }
 }

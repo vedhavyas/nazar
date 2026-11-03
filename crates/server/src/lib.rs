@@ -4,6 +4,8 @@
 // `unused_crate_dependencies` is deliberately not denied here: this
 // package's binary needs deps its library does not (the tracing
 // subscriber, anyhow).
+#[cfg(test)]
+mod capture;
 pub mod config;
 pub mod episodes;
 pub mod events;
@@ -16,4 +18,4 @@ pub mod notify;
 pub mod recordings;
 mod redact;
 pub mod supervisor;
-pub mod throttle;
+mod throttle;
