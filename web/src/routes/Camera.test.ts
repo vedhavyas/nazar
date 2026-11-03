@@ -132,14 +132,21 @@ test('a stalled picture shows the note and Try again on the camera screen', asyn
 test('a waking stream shows a spinner, and a degraded one its reason', async () => {
   vi.useFakeTimers();
   let state = 'waking';
-  const reason = 'the producer has not connected';
+  const reason = 'camera is not responding';
+  const details = 'the producer has not connected';
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string) => {
       if (String(url) === '/api/cameras') {
         return json({
           cameras: [
-            { id: 'cam-1', name: 'Hall', state, reason: state === 'degraded' ? reason : null },
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state,
+              reason: state === 'degraded' ? reason : null,
+              details: state === 'degraded' ? details : null,
+            },
           ],
           needsLogin: false,
         });
@@ -166,6 +173,13 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
     expect(screen.getByText(reason), 'a degraded stream shows its reason').toBeTruthy();
   });
   expect(screen.getByText('Try again'), 'and offers Try again').toBeTruthy();
+  expect(document.querySelector('.note')?.textContent, 'the note is the short reason alone').toBe(
+    reason,
+  );
+  const diag = document.querySelector('details.diag');
+  expect(diag, 'the technical detail sits behind a diagnostics disclosure').toBeTruthy();
+  expect((diag as HTMLDetailsElement).open, 'closed until asked for').toBe(false);
+  expect(diag?.querySelector('pre')?.textContent, 'and holds the server detail').toBe(details);
 });
 
 test('a fallback on the camera screen is named, not left unexplained', async () => {

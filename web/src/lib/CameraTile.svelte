@@ -162,10 +162,13 @@
 
 <style>
   .tile {
+    min-width: 0;
     padding: 14px;
     border: 1px solid var(--line);
     border-radius: var(--radius);
     background: var(--surface);
+    /* A long reason must never cross the tile's edge. */
+    overflow-wrap: anywhere;
   }
 
   header {

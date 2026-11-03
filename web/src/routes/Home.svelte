@@ -44,7 +44,8 @@
         return current &&
           current.name === next.name &&
           current.state === next.state &&
-          (current.reason ?? null) === (next.reason ?? null)
+          (current.reason ?? null) === (next.reason ?? null) &&
+          (current.details ?? null) === (next.details ?? null)
           ? current
           : next;
       });
@@ -198,6 +199,12 @@
     display: grid;
     gap: 16px;
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
+
+  /* Grid items default to min-width: auto, so one long word widens its
+     track and runs over the neighbours. */
+  .house > div {
+    min-width: 0;
   }
 
   /* The hero takes the full row above the tiles. */

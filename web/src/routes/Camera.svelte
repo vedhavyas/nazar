@@ -316,6 +316,13 @@
     <button class="btn" onclick={retry}>Try again</button>
   {/if}
 
+  {#if camera?.state === 'degraded' && camera.details}
+    <details class="diag">
+      <summary>Diagnostics</summary>
+      <pre>{camera.details}</pre>
+    </details>
+  {/if}
+
   <div class="controls">
     <button class="btn" onclick={() => setQuality(quality === 'high' ? 'low' : 'high')}>
       {quality === 'high' ? 'High quality' : 'Low quality'}
@@ -397,6 +404,33 @@
 
   .screen-stage :global(.stage) {
     border-radius: var(--radius);
+  }
+
+  .note {
+    overflow-wrap: anywhere;
+  }
+
+  .diag {
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: var(--fs-label);
+  }
+
+  .diag summary {
+    cursor: pointer;
+  }
+
+  .diag pre {
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: var(--fs-label);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   .controls {
