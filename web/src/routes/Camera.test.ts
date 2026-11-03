@@ -189,6 +189,67 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
   expect(screen.getByText('Try again'), 'and Try again stays').toBeTruthy();
 });
 
+test('a healthy camera renders no diagnostics even with a detail', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            { id: 'cam-1', name: 'Hall', state: 'live', reason: null, details: 'stale detail' },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  await vi.waitFor(() =>
+    expect(document.querySelector('video-rtc'), 'the picture is mounted').toBeTruthy(),
+  );
+  expect(
+    document.querySelector('details.diag'),
+    'a healthy camera has no diagnostics to show',
+  ).toBeNull();
+});
+
+test('a degraded camera without a detail renders no diagnostics', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url) === '/api/cameras') {
+        return json({
+          cameras: [
+            {
+              id: 'cam-1',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'camera is not responding',
+              details: null,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (String(url).startsWith('/api/cameras/cam-1/live')) {
+        return json({ stream: 'cam-1-high' });
+      }
+      return json({ privacy: false });
+    }),
+  );
+  open();
+
+  await vi.waitFor(() =>
+    expect(screen.getByText('camera is not responding'), 'the reason shows').toBeTruthy(),
+  );
+  expect(document.querySelector('details.diag'), 'no detail means no disclosure').toBeNull();
+});
+
 test('a fallback on the camera screen is named, not left unexplained', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');
