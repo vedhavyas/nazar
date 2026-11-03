@@ -558,8 +558,8 @@ fn strip_url_queries(text: &str) -> String {
     }
 }
 
-/// Parameter names a mint's credentials ride under, in the lowercase
-/// spelling the cloud's own URLs use; matched case-insensitively.
+/// Parameter names a mint's credentials ride under, stored in the cloud's
+/// own lowercase spelling and matched case-insensitively.
 const CREDENTIAL_KEYS: [&str; 5] = [
     "wowzatoken",
     "sessionid",
@@ -583,16 +583,26 @@ fn redact_credentials(text: &str) -> String {
             return out;
         };
         let after_key = start + key.len();
-        let sep = match bytes.get(after_key) {
+        // The key is part of a parameter name; a suffix on it
+        // (`wowzatokenhash`) is still the credential's own parameter.
+        let mut name_end = after_key;
+        while let Some(&byte) = bytes.get(name_end) {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                name_end += 1;
+            } else {
+                break;
+            }
+        }
+        let sep = match bytes.get(name_end) {
             Some(b'=') => Some(1),
-            _ => encoded_len(bytes, after_key, b'3', b'd'),
+            _ => encoded_len(bytes, name_end, b'3', b'd'),
         };
         let Some(sep) = sep else {
             out.push_str(&text[at..after_key]);
             at = after_key;
             continue;
         };
-        let value_start = after_key + sep;
+        let value_start = name_end + sep;
         let end = value_end(bytes, value_start);
         out.push_str(&text[at..value_start]);
         out.push_str("<redacted>");
@@ -1415,10 +1425,10 @@ mod tests {
 
     #[test]
     fn a_credential_outside_a_url_query_is_redacted() {
-        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1&wowzaToken=MixedSecret&token=raw-secret";
+        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1&wowzaToken=MixedSecret&token=raw-secret&wowzatokenhash=suffix-secret";
         assert_eq!(
             diagnostic_detail(raw),
-            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>&wowzaToken=<redacted>&token=<redacted>"
+            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>&wowzaToken=<redacted>&token=<redacted>&wowzatokenhash=<redacted>"
         );
     }
 }
