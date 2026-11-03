@@ -46,6 +46,7 @@ struct Harness {
     go2rtc: FakeApi,
     supervisor: Supervisor,
     lane: Arc<FakeLane>,
+    _probe: common::ProbeEngine,
 }
 
 /// A harness with the fast lane installed for `prefer`; `remint` is the
@@ -60,6 +61,7 @@ async fn harness(
 ) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     let data_dir = std::env::temp_dir().join(format!(
         "nazar-fast-lane-{}-{}",
         std::process::id(),
@@ -108,8 +110,7 @@ async fn harness(
             sessions,
             qubo: client,
             supervisor: supervisor.clone(),
-            go2rtc_api: go2rtc.base.to_string(),
-            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+            engine: probe.engine(),
             events: EventBus::new(),
             motion: Arc::new(std::sync::Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -153,6 +154,7 @@ async fn harness(
         go2rtc,
         supervisor,
         lane,
+        _probe: probe,
     }
 }
 

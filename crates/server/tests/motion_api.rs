@@ -43,6 +43,7 @@ struct Harness {
     supervisor: Supervisor,
     go2rtc: common::FakeApi,
     events: EventBus,
+    _probe: common::ProbeEngine,
 }
 
 /// A go2rtc handle on the fake API; each piece builds its own client.
@@ -81,6 +82,7 @@ fn pacing() -> Pacing {
 async fn harness() -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     let data_dir = temp_dir("motion");
     let sessions = SessionStore::new(data_dir.join("session.json"));
     sessions
@@ -141,8 +143,7 @@ async fn harness() -> Harness {
             sessions,
             qubo: client,
             supervisor: supervisor.clone(),
-            go2rtc_api: go2rtc.base.to_string(),
-            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+            engine: probe.engine(),
             events: events.clone(),
             motion,
             notifications: Arc::new(NotificationStore::open(
@@ -164,6 +165,7 @@ async fn harness() -> Harness {
         supervisor,
         go2rtc,
         events,
+        _probe: probe,
     }
 }
 

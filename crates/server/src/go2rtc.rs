@@ -6,6 +6,7 @@
 //! reference with `#input=`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +27,7 @@ pub const API_BASE: &str = "http://127.0.0.1:1984";
 
 /// Where the generated config's RTSP listener answers; the media half the
 /// health probe checks, as `FfmpegHold` dials it.
-pub const RTSP_ADDR: &str = "127.0.0.1:8554";
+pub const RTSP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8554);
 
 /// How long a go2rtc call may take before it gives up. The API is loopback
 /// and answers in milliseconds; the bound exists so an API that accepts and
@@ -116,7 +117,33 @@ pub struct Go2rtc {
     http: reqwest::Client,
     supervisor: Option<ChildSupervisor>,
     config_path: PathBuf,
-    rtsp: String,
+}
+
+/// The engine's two listeners, narrowed to reads: the API the proxy calls
+/// and the RTSP listener the hold dials. The HTTP surface holds this, not
+/// the full handle, so no handler can put, delete or stop a stream.
+#[derive(Clone)]
+pub struct Engine {
+    api: Url,
+    http: reqwest::Client,
+    rtsp: SocketAddr,
+}
+
+impl Engine {
+    /// The API base every go2rtc call and proxy target is built from.
+    pub fn api_base(&self) -> &str {
+        self.api.as_str()
+    }
+
+    /// Where the engine's RTSP listener answers.
+    pub fn rtsp_addr(&self) -> SocketAddr {
+        self.rtsp
+    }
+
+    /// The streams go2rtc holds, read-only.
+    pub async fn streams(&self) -> Result<Vec<StreamStatus>, Go2rtcError> {
+        read_streams(&self.http, &self.api).await
+    }
 }
 
 /// The task that owns the spawned go2rtc: it waits on the child, restarts
@@ -135,7 +162,6 @@ impl Clone for Go2rtc {
             http: self.http.clone(),
             supervisor: None,
             config_path: PathBuf::new(),
-            rtsp: self.rtsp.clone(),
         }
     }
 }
@@ -184,7 +210,6 @@ impl Go2rtc {
             http,
             supervisor: Some(ChildSupervisor { shutdown, task }),
             config_path,
-            rtsp: RTSP_ADDR.to_owned(),
         })
     }
 
@@ -195,21 +220,17 @@ impl Go2rtc {
             http: api_client()?,
             supervisor: None,
             config_path: PathBuf::new(),
-            rtsp: RTSP_ADDR.to_owned(),
         })
     }
 
-    /// Point the handle's RTSP check at another address (tests run their
-    /// own stand-in).
-    #[must_use]
-    pub fn with_rtsp(mut self, rtsp: &str) -> Self {
-        rtsp.clone_into(&mut self.rtsp);
-        self
-    }
-
-    /// The engine's RTSP endpoint, for the health probe.
-    pub fn rtsp_addr(&self) -> &str {
-        &self.rtsp
+    /// A read-only view on the same API and client, pointed at `rtsp`: the
+    /// HTTP surface's handle. Tests point it at their own stand-in.
+    pub fn engine(&self, rtsp: SocketAddr) -> Engine {
+        Engine {
+            api: self.api.clone(),
+            http: self.http.clone(),
+            rtsp,
+        }
     }
 
     /// The generated config's path, when this instance spawned go2rtc.
@@ -281,30 +302,7 @@ impl Go2rtc {
 
     /// Every stream go2rtc currently holds, by name.
     pub async fn streams(&self) -> Result<Vec<StreamStatus>, Go2rtcError> {
-        let response = self.http.get(self.api_for("/api/streams")?).send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(Go2rtcError::Rejected {
-                status: status.as_u16(),
-                body: snippet(&text),
-            });
-        }
-        let entries: BTreeMap<String, StreamEntry> = serde_json::from_str(&text)?;
-        Ok(entries
-            .into_iter()
-            .map(|(name, entry)| StreamStatus {
-                name,
-                live: !entry.producers.is_empty(),
-                connected: entry.producers.iter().any(|producer| {
-                    producer
-                        .get("remote_addr")
-                        .and_then(Value::as_str)
-                        .is_some_and(|addr| !addr.is_empty())
-                }),
-                consumers: entry.consumers.map_or(0, |consumers| consumers.len()),
-            })
-            .collect())
+        read_streams(&self.http, &self.api).await
     }
 
     /// Kill the spawned process, if this instance owns one.
@@ -323,10 +321,41 @@ impl Go2rtc {
     }
 
     fn api_for(&self, path: &str) -> Result<Url, Go2rtcError> {
-        self.api
-            .join(path)
-            .map_err(|err| Go2rtcError::Url(err.to_string()))
+        api_url(&self.api, path)
     }
+}
+
+fn api_url(api: &Url, path: &str) -> Result<Url, Go2rtcError> {
+    api.join(path)
+        .map_err(|err| Go2rtcError::Url(err.to_string()))
+}
+
+/// The streams go2rtc holds; both handles read them through here.
+async fn read_streams(http: &reqwest::Client, api: &Url) -> Result<Vec<StreamStatus>, Go2rtcError> {
+    let response = http.get(api_url(api, "/api/streams")?).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        return Err(Go2rtcError::Rejected {
+            status: status.as_u16(),
+            body: snippet(&text),
+        });
+    }
+    let entries: BTreeMap<String, StreamEntry> = serde_json::from_str(&text)?;
+    Ok(entries
+        .into_iter()
+        .map(|(name, entry)| StreamStatus {
+            name,
+            live: !entry.producers.is_empty(),
+            connected: entry.producers.iter().any(|producer| {
+                producer
+                    .get("remote_addr")
+                    .and_then(Value::as_str)
+                    .is_some_and(|addr| !addr.is_empty())
+            }),
+            consumers: entry.consumers.map_or(0, |consumers| consumers.len()),
+        })
+        .collect())
 }
 
 /// Write the config via a temporary file, so a crash mid-write cannot
@@ -580,9 +609,6 @@ fn snippet(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
-/// Where the generated config's rtsp listener answers.
-pub const RTSP_BASE: &str = "rtsp://127.0.0.1:8554";
-
 /// The base delay before a hold reconnects: long enough that a camera
 /// that is away is not dialled every second, short enough that a viewer
 /// arriving after a failure waits seconds, not minutes. Consecutive young
@@ -667,7 +693,7 @@ impl StreamHold for FfmpegHold {
 
     fn hold(&self, name: &str) -> Arc<dyn HoldLease> {
         let ffmpeg = self.ffmpeg.clone();
-        let target = format!("{RTSP_BASE}/{name}");
+        let target = format!("rtsp://{RTSP_ADDR}/{name}");
         let stream = name.to_owned();
         let attached = Arc::new(AtomicBool::new(false));
         let deaths = Arc::clone(&self.deaths);

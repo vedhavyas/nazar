@@ -75,11 +75,13 @@ fn entry(id: &str, device: &str, start_ms: i64, snapshot: Option<&str>) -> Value
 struct Harness {
     base: String,
     qubo: MockServer,
+    _probe: common::ProbeEngine,
 }
 
 async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     let data_dir = temp_dir("recordings-harness");
     let sessions = SessionStore::new(data_dir.join("session.json"));
     sessions
@@ -121,8 +123,7 @@ async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
             sessions,
             qubo: client,
             supervisor,
-            go2rtc_api: go2rtc.base.to_string(),
-            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+            engine: probe.engine(),
             events,
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -138,7 +139,11 @@ async fn harness(episodes: Arc<EpisodeStore>) -> Harness {
     tokio::spawn(async move {
         axum::serve(listener, app(state)).await.expect("serves");
     });
-    Harness { base, qubo }
+    Harness {
+        base,
+        qubo,
+        _probe: probe,
+    }
 }
 
 async fn mount_discovery(server: &MockServer) {

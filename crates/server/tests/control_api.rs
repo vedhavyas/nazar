@@ -37,11 +37,13 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 struct Harness {
     base: String,
     qubo: MockServer,
+    _probe: common::ProbeEngine,
 }
 
 async fn harness() -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
+    let probe = common::ProbeEngine::start(go2rtc.base.as_str()).await;
     let data_dir = std::env::temp_dir().join(format!(
         "nazar-control-{}-{}",
         std::process::id(),
@@ -84,8 +86,7 @@ async fn harness() -> Harness {
             sessions,
             qubo: client,
             supervisor,
-            go2rtc_api: go2rtc.base.to_string(),
-            go2rtc: Go2rtc::connect(go2rtc.base.clone()).expect("a client"),
+            engine: probe.engine(),
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -111,7 +112,11 @@ async fn harness() -> Harness {
     tokio::spawn(async move {
         axum::serve(listener, app(state)).await.expect("serves");
     });
-    Harness { base, qubo }
+    Harness {
+        base,
+        qubo,
+        _probe: probe,
+    }
 }
 
 /// Answer shadow reads with `bodies` in order, repeating the last one.

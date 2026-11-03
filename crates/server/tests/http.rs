@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,8 +45,8 @@ struct Harness {
     qubo: MockServer,
     data_dir: PathBuf,
     go2rtc: common::FakeApi,
-    /// A bound RTSP stand-in: the health probe's media half connects here.
-    _rtsp: TcpListener,
+    /// The stand-in the probe dials when the test does not replace it.
+    _rtsp: Option<common::RtspStandIn>,
 }
 
 fn test_pacing() -> Pacing {
@@ -75,19 +76,24 @@ async fn harness_with(pacing: Pacing) -> Harness {
 
 /// The harness with the go2rtc API base and RTSP address overridden - the
 /// proxy and the health probe share the base - so a test can point the
-/// probe at a dead, wedged or unbindable engine while the rest talks to
-/// the fake.
-async fn harness_with_api(pacing: Pacing, api: Option<String>, rtsp: Option<String>) -> Harness {
+/// probe at a dead, wedged or foreign engine while the rest talks to the
+/// fake.
+async fn harness_with_api(
+    pacing: Pacing,
+    api: Option<String>,
+    rtsp: Option<SocketAddr>,
+) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
-    let rtsp_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("an rtsp port");
-    let rtsp_default = rtsp_listener.local_addr().expect("the address").to_string();
+    let stand_in = match rtsp {
+        Some(_) => None,
+        None => Some(common::RtspStandIn::start().await),
+    };
+    let rtsp_addr = rtsp.unwrap_or_else(|| stand_in.as_ref().expect("a stand-in").addr());
     let api = api.unwrap_or_else(|| go2rtc.base.to_string());
     let probe = Go2rtc::connect(api.parse().expect("a url"))
         .expect("a client")
-        .with_rtsp(&rtsp.unwrap_or(rtsp_default));
+        .engine(rtsp_addr);
     let data_dir = std::env::temp_dir().join(format!(
         "nazar-http-{}-{}",
         std::process::id(),
@@ -117,8 +123,7 @@ async fn harness_with_api(pacing: Pacing, api: Option<String>, rtsp: Option<Stri
             sessions,
             qubo: client,
             supervisor,
-            go2rtc_api: api,
-            go2rtc: probe,
+            engine: probe,
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -143,7 +148,7 @@ async fn harness_with_api(pacing: Pacing, api: Option<String>, rtsp: Option<Stri
         qubo,
         data_dir,
         go2rtc,
-        _rtsp: rtsp_listener,
+        _rtsp: stand_in,
     }
 }
 
@@ -197,10 +202,12 @@ async fn health_is_open_and_carries_the_version() {
 /// restart backoff.
 #[tokio::test]
 async fn health_reports_a_dead_engine_without_failing() {
-    // Held, not dropped: the port stays bound with no one serving it,
-    // which is the bind-failed child's shape.
-    let api = TcpListener::bind("127.0.0.1:0").await.expect("a port");
-    let addr = api.local_addr().expect("the address");
+    // Dropped: the connect is refused, which is the shape a child whose
+    // bind failed leaves behind.
+    let addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        listener.local_addr().expect("the address")
+    };
     let h = harness_with_api(test_pacing(), Some(format!("http://{addr}")), None).await;
     let response = client()
         .get(format!("{}/api/health", h.base))
@@ -222,9 +229,10 @@ async fn health_reports_a_dead_engine_without_failing() {
     );
 }
 
-/// A go2rtc that accepts and never answers must not hold the health
-/// endpoint: the probe is bounded, and the body reports the engine down.
-/// The accept must be proven, or a fast connection failure would pass.
+/// The timeout path: a go2rtc that accepts and never answers must not hold
+/// the health endpoint. The probe is bounded, and the body reports the
+/// engine down. The accept must be proven, or a fast connection failure
+/// would pass for the bound.
 #[tokio::test]
 async fn health_bounds_a_wedged_engine_probe() {
     use tokio::io::AsyncReadExt as _;
@@ -262,16 +270,13 @@ async fn health_bounds_a_wedged_engine_probe() {
 }
 
 /// The API can answer while the RTSP listener (what FfmpegHold dials)
-/// cannot bind; the engine still reads down.
+/// cannot bind; the engine still reads down. TEST-NET-1 is reserved and
+/// never routed, so nothing can take the address between the test and the
+/// probe.
 #[tokio::test]
 async fn health_reports_a_dead_rtsp_listener() {
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
-        let addr = listener.local_addr().expect("the address");
-        drop(listener);
-        addr.to_string()
-    };
-    let h = harness_with_api(test_pacing(), None, Some(closed)).await;
+    let dead: SocketAddr = "192.0.2.1:8554".parse().expect("an address");
+    let h = harness_with_api(test_pacing(), None, Some(dead)).await;
     let response = client()
         .get(format!("{}/api/health", h.base))
         .send()
@@ -283,6 +288,42 @@ async fn health_reports_a_dead_rtsp_listener() {
         body["go2rtc"],
         json!(false),
         "the media half must answer too"
+    );
+}
+
+/// A foreign listener can hold the RTSP port: a squatter, or whatever took
+/// it after a failed bind. A bare connect would read it as the engine, so
+/// the probe asks for RTSP and a listener answering another protocol is
+/// down.
+#[tokio::test]
+async fn health_rejects_a_listener_that_does_not_speak_rtsp() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 512];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            });
+        }
+    });
+    let h = harness_with_api(test_pacing(), None, Some(addr)).await;
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("json")["go2rtc"],
+        json!(false),
+        "a listener that answers HTTP is not the engine's RTSP server"
     );
 }
 

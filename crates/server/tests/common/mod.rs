@@ -14,6 +14,74 @@ pub fn episodes_in(dir: &std::path::Path) -> std::sync::Arc<server::episodes::Ep
     ))
 }
 
+/// A loopback RTSP endpoint that answers the health probe's OPTIONS. Every
+/// harness wires its engine through [`ProbeEngine`], so no test can point
+/// the probe at the host's own 8554.
+pub struct RtspStandIn {
+    addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RtspStandIn {
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an rtsp port");
+        let addr = listener.local_addr().expect("the address");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0_u8; 512];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        Self { addr, task }
+    }
+
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for RtspStandIn {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A read-only engine on the fake API and a stand-in RTSP listener: the
+/// pairing every harness wires, kept together so the listener outlives the
+/// engine that probes it.
+pub struct ProbeEngine {
+    engine: server::go2rtc::Engine,
+    _rtsp: RtspStandIn,
+}
+
+impl ProbeEngine {
+    pub async fn start(api: &str) -> Self {
+        let rtsp = RtspStandIn::start().await;
+        let engine = server::go2rtc::Go2rtc::connect(api.parse().expect("a url"))
+            .expect("a client")
+            .engine(rtsp.addr());
+        Self {
+            engine,
+            _rtsp: rtsp,
+        }
+    }
+
+    pub fn engine(&self) -> server::go2rtc::Engine {
+        self.engine.clone()
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
