@@ -556,52 +556,79 @@ fn strip_url_queries(text: &str) -> String {
     }
 }
 
-/// Parameter names a mint's credentials ride under, as the cloud's RTSPS
-/// URLs spell them.
+/// Parameter names a mint's credentials ride under, in the lowercase
+/// spelling the cloud's own URLs use; matched case-insensitively.
 const CREDENTIAL_KEYS: [&str; 5] = [
-    "wowzaToken",
-    "sessionId",
-    "userUUID",
-    "camSessionId",
+    "wowzatoken",
+    "sessionid",
+    "useruuid",
+    "camsessionid",
     "token",
 ];
 
 fn redact_credentials(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut at = 0;
     loop {
         let next = CREDENTIAL_KEYS
             .iter()
-            .filter_map(|key| rest.find(key).map(|at| (at, *key)))
-            .min_by_key(|(at, _)| *at);
-        let Some((at, key)) = next else {
-            out.push_str(rest);
+            .filter_map(|key| lower[at..].find(key).map(|off| (at + off, *key)))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, key)) = next else {
+            out.push_str(&text[at..]);
             return out;
         };
-        out.push_str(&rest[..at]);
-        let after = &rest[at + key.len()..];
-        // `%3D` is how the parameter separator survives inside an encoded
-        // `src` value.
-        let value = after
-            .strip_prefix('=')
-            .map(|tail| (1, tail))
-            .or_else(|| after.strip_prefix("%3D").map(|tail| (3, tail)));
-        let Some((sep, tail)) = value else {
-            out.push_str(key);
-            rest = after;
+        let after_key = start + key.len();
+        let sep = match bytes.get(after_key) {
+            Some(b'=') => Some(1),
+            _ => encoded_len(bytes, after_key, b'3', b'd'),
+        };
+        let Some(sep) = sep else {
+            out.push_str(&text[at..after_key]);
+            at = after_key;
             continue;
         };
-        let end = tail
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '&' | ')' | ']' | '"' | '\'' | '#' | '\\')
-            })
-            .unwrap_or(tail.len())
-            .min(tail.find("%26").unwrap_or(tail.len()));
-        out.push_str(key);
-        out.push_str(&after[..sep]);
+        let value_start = after_key + sep;
+        let end = value_end(bytes, value_start);
+        out.push_str(&text[at..value_start]);
         out.push_str("<redacted>");
-        rest = &tail[end..];
+        at = value_start + end;
     }
+}
+
+/// The length of an encoded `=` or `&`, accepting lowercase hex and any
+/// number of `%25` escapes for the percent itself (`%3d`, `%253D`, `%25253d`).
+fn encoded_len(bytes: &[u8], at: usize, lead: u8, tail: u8) -> Option<usize> {
+    if bytes.get(at) != Some(&b'%') {
+        return None;
+    }
+    let mut i = at + 1;
+    while bytes.len() >= i + 2 && &bytes[i..i + 2] == b"25" {
+        i += 2;
+    }
+    if bytes.len() >= i + 2 && bytes[i] == lead && bytes[i + 1].eq_ignore_ascii_case(&tail) {
+        Some(i + 2 - at)
+    } else {
+        None
+    }
+}
+
+/// How far a credential's value runs before a separator: raw or encoded
+/// `&`, whitespace, or the punctuation that ends a quoted URL.
+fn value_end(bytes: &[u8], at: usize) -> usize {
+    let mut i = at;
+    while let Some(&byte) = bytes.get(i) {
+        let ends = byte.is_ascii_whitespace()
+            || matches!(byte, b'&' | b')' | b']' | b'"' | b'\'' | b'#' | b'\\')
+            || (byte == b'%' && encoded_len(bytes, i, b'2', b'6').is_some());
+        if ends {
+            break;
+        }
+        i += 1;
+    }
+    i - at
 }
 
 #[derive(Deserialize)]
@@ -1372,7 +1399,7 @@ mod tests {
 
     #[test]
     fn a_degraded_reason_keeps_its_endpoint_and_loses_its_credentials() {
-        let raw = "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?name=cam-high&src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3Dsekrit%26sessionId%3Dsid-1%26userUUID%3Duser-1%26camSessionId%3Dcam-1)";
+        let raw = "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?name=cam-high&src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%3Dsekrit%26sessionid%3Dsid-1%26useruuid%3Duser-1%26camsessionid%3Dcam-1)";
         let (short, details) = degraded_words(raw);
         assert_eq!(short, "stream engine unavailable");
         assert_eq!(
@@ -1386,10 +1413,10 @@ mod tests {
 
     #[test]
     fn a_credential_outside_a_url_query_is_redacted() {
-        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3Dsekrit%26sessionId%3Dsid-1";
+        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-1";
         assert_eq!(
             diagnostic_detail(raw),
-            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3D<redacted>%26sessionId%3D<redacted>"
+            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3Fwowzatoken%253D<redacted>%26sessionid%3d<redacted>"
         );
     }
 }
