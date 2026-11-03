@@ -784,6 +784,11 @@ async fn a_dead_engine_logs_its_liveness_failure_once() {
         "one line for the outage, not one per slice: {}",
         captured.text()
     );
+    assert!(
+        captured.text().contains("cause="),
+        "the failing cause is named on the line: {}",
+        captured.text()
+    );
 
     h.go2rtc.set_streams_error(false);
     assert!(
@@ -829,6 +834,11 @@ async fn a_dead_engine_logs_the_broken_chain_once() {
         downs(&captured.text()),
         1,
         "one line, not one per slice: {}",
+        captured.text()
+    );
+    assert!(
+        captured.text().contains("cause="),
+        "the failing cause is named on the line: {}",
         captured.text()
     );
 

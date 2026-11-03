@@ -15,13 +15,14 @@ const RECOVERY_AFTER: u32 = 3;
 /// A cause with no traffic for this long is forgotten.
 const STALE_AFTER: Duration = Duration::from_hours(6);
 
-/// How many causes one stream may remember: the cap is local, so one noisy
-/// stream cannot evict another stream's records.
-const MAX_PER_STREAM: usize = 8;
+/// How many causes one key may remember. A key is a stream at one site (the
+/// hold keeps an exit key and a spawn key), so a stream holds at most twice
+/// this. The cap is local, so one noisy stream cannot evict another's.
+const MAX_PER_KEY: usize = 8;
 
 /// What a repeated failure should log.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Repeat {
+pub(crate) enum Repeat {
     /// The cause is new for this stream: log it in full.
     First,
     /// The same cause again, before its summary is due: log nothing.
@@ -30,7 +31,7 @@ pub enum Repeat {
     Summary { suppressed: u64 },
 }
 
-/// One cause failing on one stream. Keying by the cause, not the stream
+/// One cause failing on one key. Keying by the cause, not the stream
 /// alone, keeps alternating failures from replacing one another's counts.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Record {
@@ -44,6 +45,14 @@ struct Entry {
     last_seen: Instant,
 }
 
+/// A record the log had to give up, with the count it held.
+struct Dropped {
+    key: String,
+    cause: String,
+    suppressed: u64,
+    why: &'static str,
+}
+
 #[derive(Default)]
 struct State {
     entries: HashMap<Record, Entry>,
@@ -51,8 +60,8 @@ struct State {
     streaks: HashMap<String, u32>,
 }
 
-/// Per-stream, per-cause failure deduplication. A new cause logs at once,
-/// an identical repeat is counted, a summary carrying the count lands every
+/// Per-key, per-cause failure deduplication. A new cause logs at once, an
+/// identical repeat is counted, a summary carrying the count lands every
 /// `summary_every`, and recovery clears the stream's records and hands back
 /// the suppressed total they held.
 #[derive(Clone)]
@@ -81,40 +90,51 @@ impl RepeatLog {
 
     pub(crate) fn note(&self, key: &str, cause: &str) -> Repeat {
         let now = Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A failure interrupts any run of successes.
-        state.streaks.remove(key);
-        // A cause with no traffic inside the staleness window is forgotten,
-        // so its return reads as a first failure, not a summary.
-        drop_stale(&mut state.entries, now, self.stale_after);
-        let record = Record {
-            key: key.to_owned(),
-            cause: cause.to_owned(),
-        };
-        if let Some(entry) = state.entries.get_mut(&record) {
-            entry.suppressed += 1;
-            entry.last_seen = now;
-            if now.duration_since(entry.last_line) < self.summary_every {
-                return Repeat::Suppressed;
-            }
-            entry.last_line = now;
-            return Repeat::Summary {
-                suppressed: std::mem::take(&mut entry.suppressed),
+        let (repeat, dropped) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let State { entries, streaks } = &mut *state;
+            // A failure interrupts any run of successes.
+            streaks.remove(key);
+            // A cause with no traffic inside the staleness window is
+            // forgotten, so its return reads as a first failure, not a
+            // summary.
+            let mut dropped = drop_stale(entries, streaks, now, self.stale_after);
+            let record = Record {
+                key: key.to_owned(),
+                cause: cause.to_owned(),
             };
-        }
-        evict_within_key(&mut state.entries, key);
-        state.entries.insert(
-            record,
-            Entry {
-                suppressed: 0,
-                last_line: now,
-                last_seen: now,
-            },
-        );
-        Repeat::First
+            let repeat = if let Some(entry) = entries.get_mut(&record) {
+                entry.suppressed += 1;
+                entry.last_seen = now;
+                if now.duration_since(entry.last_line) < self.summary_every {
+                    Repeat::Suppressed
+                } else {
+                    entry.last_line = now;
+                    Repeat::Summary {
+                        suppressed: std::mem::take(&mut entry.suppressed),
+                    }
+                }
+            } else {
+                if let Some(victim) = evict_within_key(entries, key) {
+                    dropped.push(victim);
+                }
+                entries.insert(
+                    record,
+                    Entry {
+                        suppressed: 0,
+                        last_line: now,
+                        last_seen: now,
+                    },
+                );
+                Repeat::First
+            };
+            (repeat, dropped)
+        };
+        report(dropped);
+        repeat
     }
 
     /// One success for `key`. After `recovery_after` consecutive ones the
@@ -123,34 +143,51 @@ impl RepeatLog {
     /// when nothing was failing. A record older than the staleness window
     /// is already dead and clears nothing.
     pub(crate) fn recovered(&self, key: &str) -> Option<u64> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop_stale(&mut state.entries, Instant::now(), self.stale_after);
-        if !state.entries.keys().any(|record| record.key == key) {
-            state.streaks.remove(key);
-            return None;
-        }
-        let streak = state.streaks.entry(key.to_owned()).or_insert(0);
-        *streak += 1;
-        if *streak < self.recovery_after {
-            return None;
-        }
-        state.streaks.remove(key);
-        take(&mut state.entries, key)
+        let (recovered, dropped) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let State { entries, streaks } = &mut *state;
+            let now = Instant::now();
+            let dropped = drop_stale(entries, streaks, now, self.stale_after);
+            let recovered = if entries.keys().all(|record| record.key != key) {
+                streaks.remove(key);
+                None
+            } else {
+                let streak = {
+                    let value = streaks.entry(key.to_owned()).or_insert(0);
+                    *value += 1;
+                    *value
+                };
+                if streak < self.recovery_after {
+                    None
+                } else {
+                    streaks.remove(key);
+                    take(entries, key)
+                }
+            };
+            (recovered, dropped)
+        };
+        report(dropped);
+        recovered
     }
 
     /// Clear now and return the suppressed total: for a caller whose own
     /// quiet rule (the hold's healthy run) is the debounce.
     pub(crate) fn recovered_now(&self, key: &str) -> Option<u64> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.streaks.remove(key);
-        drop_stale(&mut state.entries, Instant::now(), self.stale_after);
-        take(&mut state.entries, key)
+        let (recovered, dropped) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let State { entries, streaks } = &mut *state;
+            let dropped = drop_stale(entries, streaks, Instant::now(), self.stale_after);
+            streaks.remove(key);
+            (take(entries, key), dropped)
+        };
+        report(dropped);
+        recovered
     }
 }
 
@@ -168,46 +205,64 @@ fn take(entries: &mut HashMap<Record, Entry>, key: &str) -> Option<u64> {
     had.then_some(suppressed)
 }
 
-/// Forget every record with no traffic inside the window. A record whose
-/// count never reached a summary or a recovery is a loss, so it is said.
-fn drop_stale(entries: &mut HashMap<Record, Entry>, now: Instant, stale_after: Duration) {
+/// Forget every record with no traffic inside the window, and the streak it
+/// belonged to. A record whose count never reached a summary or a recovery
+/// is a loss, so it is said.
+fn drop_stale(
+    entries: &mut HashMap<Record, Entry>,
+    streaks: &mut HashMap<String, u32>,
+    now: Instant,
+    stale_after: Duration,
+) -> Vec<Dropped> {
+    let mut dropped = Vec::new();
     entries.retain(|record, entry| {
         let stale = now.duration_since(entry.last_seen) >= stale_after;
-        if stale && entry.suppressed > 0 {
-            tracing::warn!(
-                stream = %record.key,
-                cause = %record.cause,
-                suppressed = entry.suppressed,
-                "a stale failure record is dropped"
-            );
+        if stale {
+            streaks.remove(&record.key);
+            if entry.suppressed > 0 {
+                dropped.push(Dropped {
+                    key: record.key.clone(),
+                    cause: record.cause.clone(),
+                    suppressed: entry.suppressed,
+                    why: "a stale failure record is dropped",
+                });
+            }
         }
         !stale
     });
+    dropped
 }
 
-/// Make room for one more cause of `key`. The cap is per stream: one noisy
+/// Make room for one more cause of `key`. The cap is per key, so one noisy
 /// stream cannot evict another's records. A record with nothing pending is
 /// preferred for eviction; a count that would be lost is said.
-fn evict_within_key(entries: &mut HashMap<Record, Entry>, key: &str) {
-    if entries.keys().filter(|record| record.key == key).count() < MAX_PER_STREAM {
-        return;
+fn evict_within_key(entries: &mut HashMap<Record, Entry>, key: &str) -> Option<Dropped> {
+    if entries.keys().filter(|record| record.key == key).count() < MAX_PER_KEY {
+        return None;
     }
     let victim = entries
         .iter()
         .filter(|(record, _)| record.key == key)
         .min_by_key(|(_, entry)| (entry.suppressed != 0, entry.last_seen))
-        .map(|(record, _)| record.clone());
-    let Some(victim) = victim else {
-        return;
-    };
-    if let Some(entry) = entries.remove(&victim)
-        && entry.suppressed > 0
-    {
+        .map(|(record, _)| record.clone())?;
+    let entry = entries.remove(&victim)?;
+    (entry.suppressed > 0).then_some(Dropped {
+        key: victim.key,
+        cause: victim.cause,
+        suppressed: entry.suppressed,
+        why: "a failure record is evicted at the key's cap",
+    })
+}
+
+/// Say what the log had to give up, outside the lock the caller held.
+fn report(dropped: Vec<Dropped>) {
+    for record in dropped {
         tracing::warn!(
-            stream = %victim.key,
-            cause = %victim.cause,
-            suppressed = entry.suppressed,
-            "a failure record is evicted at the stream's cap"
+            key = %record.key,
+            cause = %record.cause,
+            suppressed = record.suppressed,
+            "{}",
+            record.why
         );
     }
 }
@@ -226,7 +281,7 @@ mod tests {
 
     /// Only the summary window is short.
     fn windowed() -> RepeatLog {
-        RepeatLog::new(Duration::from_millis(20), 3, Duration::from_secs(60))
+        RepeatLog::new(Duration::from_millis(50), 3, Duration::from_secs(60))
     }
 
     /// Only the staleness window is short.
@@ -239,7 +294,7 @@ mod tests {
         let log = windowed();
         assert_eq!(log.note("hall", "connection refused"), Repeat::First);
         assert_eq!(log.note("hall", "connection refused"), Repeat::Suppressed);
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
             log.note("hall", "connection refused"),
             Repeat::Summary { suppressed: 2 },
@@ -265,7 +320,7 @@ mod tests {
         let log = windowed();
         assert_eq!(log.note("hall", "connection refused"), Repeat::First);
         assert_eq!(log.note("hall", "connection refused"), Repeat::Suppressed);
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
             log.note("hall", "connection refused"),
             Repeat::Summary { suppressed: 2 }
@@ -275,7 +330,7 @@ mod tests {
             Repeat::Suppressed,
             "the next window starts empty"
         );
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
             log.note("hall", "connection refused"),
             Repeat::Summary { suppressed: 2 },
@@ -396,6 +451,19 @@ mod tests {
     }
 
     #[test]
+    fn recovered_now_ignores_a_stale_record() {
+        let log = stale();
+        assert_eq!(log.note("hall", "connection refused"), Repeat::First);
+        assert_eq!(log.note("hall", "connection refused"), Repeat::Suppressed);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            log.recovered_now("hall"),
+            None,
+            "a long-dead record reports no recovery"
+        );
+    }
+
+    #[test]
     fn recovered_now_clears_immediately_and_reports_the_count() {
         let log = quick();
         assert_eq!(log.note("hall", "connection refused"), Repeat::First);
@@ -414,26 +482,27 @@ mod tests {
     }
 
     #[test]
-    fn a_streams_cap_evicts_only_its_own_records() {
+    fn a_keys_cap_evicts_only_its_own_records() {
         let log = quick();
-        for index in 0..MAX_PER_STREAM {
+        // Porch first, so a global least-recently-seen policy would evict it.
+        assert_eq!(log.note("porch", "connection refused"), Repeat::First);
+        for index in 0..MAX_PER_KEY {
             assert_eq!(log.note("hall", &format!("cause {index}")), Repeat::First);
         }
-        assert_eq!(log.note("porch", "connection refused"), Repeat::First);
         assert_eq!(
             log.note("hall", "one cause too many"),
             Repeat::First,
-            "the cap makes room for the stream's new cause"
+            "the cap makes room for the key's new cause"
         );
         assert_eq!(
             log.note("hall", "cause 0"),
             Repeat::First,
-            "the stream's least recently seen cause was evicted"
+            "the key's least recently seen cause was evicted"
         );
         assert_eq!(
             log.note("porch", "connection refused"),
             Repeat::Suppressed,
-            "another stream's record survives the cap"
+            "another key's record survives the cap"
         );
     }
 
@@ -444,7 +513,7 @@ mod tests {
         // newer and hold nothing.
         assert_eq!(log.note("hall", "cause 0"), Repeat::First);
         assert_eq!(log.note("hall", "cause 0"), Repeat::Suppressed);
-        for index in 1..MAX_PER_STREAM {
+        for index in 1..MAX_PER_KEY {
             assert_eq!(log.note("hall", &format!("cause {index}")), Repeat::First);
         }
         assert_eq!(log.note("hall", "one cause too many"), Repeat::First);
@@ -457,6 +526,41 @@ mod tests {
             log.note("hall", "cause 1"),
             Repeat::First,
             "a record with nothing pending was evicted instead"
+        );
+    }
+
+    #[test]
+    fn a_stale_dropped_count_is_announced() {
+        let log = stale();
+        assert_eq!(log.note("hall", "connection refused"), Repeat::First);
+        assert_eq!(log.note("hall", "connection refused"), Repeat::Suppressed);
+        let captured = crate::capture::Captured::start();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(log.note("hall", "connection refused"), Repeat::First);
+        let text = captured.text();
+        assert!(
+            text.contains("a stale failure record is dropped") && text.contains("suppressed=1"),
+            "the dropped count is named: {text}"
+        );
+    }
+
+    #[test]
+    fn an_evicted_count_is_announced() {
+        let log = quick();
+        for index in 0..MAX_PER_KEY {
+            assert_eq!(log.note("hall", &format!("cause {index}")), Repeat::First);
+            assert_eq!(
+                log.note("hall", &format!("cause {index}")),
+                Repeat::Suppressed
+            );
+        }
+        let captured = crate::capture::Captured::start();
+        assert_eq!(log.note("hall", "one cause too many"), Repeat::First);
+        let text = captured.text();
+        assert!(
+            text.contains("a failure record is evicted at the key's cap")
+                && text.contains("suppressed=1"),
+            "the evicted count is named: {text}"
         );
     }
 }

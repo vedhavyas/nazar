@@ -38,9 +38,46 @@ impl From<reqwest::Error> for QuboError {
     fn from(err: reqwest::Error) -> Self {
         Self::Http {
             status: err.status().map(|status| status.as_u16()),
-            message: err.to_string(),
+            message: transport_message(&err),
         }
     }
+}
+
+/// A transport failure's words with the URL scrubbed: its class, then the
+/// cause chain. reqwest's own Display echoes the URL, which can carry an
+/// account id or a token, and it prints one sentence for very different
+/// failures - the class and the chain are what tell them apart.
+fn transport_message(err: &reqwest::Error) -> String {
+    let mut text = String::from(if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        if is_dns(err) { "dns" } else { "connect" }
+    } else if err.is_body() || err.is_decode() {
+        "body"
+    } else {
+        "request"
+    });
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// Whether a connect failure was name resolution: hyper carries the
+/// resolver's words in the cause chain.
+fn is_dns(err: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let text = cause.to_string().to_ascii_lowercase();
+        if text.contains("dns") || text.contains("lookup") || text.contains("resolve") {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Map a non-2xx response to the right variant, reading the API's error

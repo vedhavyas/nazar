@@ -669,12 +669,13 @@ fn snippet(body: &str) -> String {
 
 /// A failure's words with ffmpeg's per-process address removed, so the same
 /// failure keeps one signature across runs. The shape is the `0x` word
-/// directly after `@` in `[tcp @ 0x...]`; any other hex word is part of
-/// the message and stays.
+/// directly after `@` in `[tcp @ 0x...]`; a later hex word is part of the
+/// message and stays.
 fn failure_signature(reason: &str) -> String {
-    let mut kept: Vec<&str> = Vec::new();
-    for word in reason.split_whitespace() {
-        if word.starts_with("0x") && kept.last() == Some(&"@") {
+    let words: Vec<&str> = reason.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    for (index, word) in words.iter().enumerate() {
+        if word.starts_with("0x") && index > 0 && words[index - 1] == "@" {
             continue;
         }
         kept.push(word);
@@ -739,6 +740,31 @@ fn log_hold_exit(
             "the hold consumer is still exiting"
         ),
     }
+}
+
+/// The consumer's command: read the stream, copy it, write nothing.
+fn hold_command(ffmpeg: &Path, target: &str) -> Command {
+    let mut command = Command::new(ffmpeg);
+    command
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            target,
+            "-c",
+            "copy",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
 }
 
 /// A run that outlived [`HOLD_HEALTHY_RUN`]: it ends the failure streak,
@@ -888,34 +914,18 @@ impl StreamHold for FfmpegHold {
         let spawn_key = format!("{stream}:spawn");
         let attached = Arc::new(AtomicBool::new(false));
         let deaths = Arc::clone(&self.deaths);
+        let repeats = RepeatLog::default();
         let worker = {
             let attached = Arc::clone(&attached);
+            let stream = stream.clone();
+            let exit_key = exit_key.clone();
+            let spawn_key = spawn_key.clone();
+            let repeats = repeats.clone();
             tokio::spawn(async move {
                 let mut failures: u32 = 0;
-                let repeats = RepeatLog::default();
                 loop {
                     let started = Instant::now();
-                    match Command::new(&ffmpeg)
-                        .args([
-                            "-nostdin",
-                            "-v",
-                            "error",
-                            "-rtsp_transport",
-                            "tcp",
-                            "-i",
-                            &target,
-                            "-c",
-                            "copy",
-                            "-f",
-                            "null",
-                            "-",
-                        ])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::piped())
-                        .kill_on_drop(true)
-                        .spawn()
-                    {
+                    match hold_command(&ffmpeg, &target).spawn() {
                         Ok(mut child) => {
                             let drain = child.stderr.take().map(drain_tail);
                             // Attached means the consumer REGISTERED, not
@@ -977,7 +987,14 @@ impl StreamHold for FfmpegHold {
                 }
             })
         };
-        Arc::new(FfmpegLease { worker, attached })
+        Arc::new(FfmpegLease {
+            worker,
+            attached,
+            stream,
+            exit_key,
+            spawn_key,
+            repeats,
+        })
     }
 }
 
@@ -986,6 +1003,10 @@ impl StreamHold for FfmpegHold {
 struct FfmpegLease {
     worker: tokio::task::JoinHandle<()>,
     attached: Arc<AtomicBool>,
+    stream: String,
+    exit_key: String,
+    spawn_key: String,
+    repeats: RepeatLog,
 }
 
 impl HoldLease for FfmpegLease {
@@ -998,6 +1019,17 @@ impl Drop for FfmpegLease {
     fn drop(&mut self) {
         self.worker.abort();
         self.attached.store(false, Ordering::SeqCst);
+        // The worker dies with the lease, taking whatever it had counted
+        // but not yet summarised; a released hold must not swallow that.
+        let ended = self.repeats.recovered_now(&self.exit_key);
+        let started = self.repeats.recovered_now(&self.spawn_key);
+        if ended.is_some() || started.is_some() {
+            tracing::warn!(
+                stream = %self.stream,
+                suppressed = ended.unwrap_or(0) + started.unwrap_or(0),
+                "a held stream is released with a pending failure count"
+            );
+        }
     }
 }
 

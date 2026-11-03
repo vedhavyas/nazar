@@ -15,7 +15,10 @@ thread_local! {
 }
 
 /// The events this thread logs while the value lives.
-pub struct Captured(Arc<Mutex<Vec<u8>>>);
+pub struct Captured {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    previous: Option<Arc<Mutex<Vec<u8>>>>,
+}
 
 impl Captured {
     pub fn start() -> Self {
@@ -25,16 +28,21 @@ impl Captured {
                 .with_writer(CaptureWriter)
                 .with_ansi(false)
                 .finish();
-            let _ = tracing::subscriber::set_global_default(subscriber);
+            let installed = tracing::subscriber::set_global_default(subscriber);
+            assert!(
+                installed.is_ok(),
+                "the capture subscriber could not be installed: {:?}",
+                installed.err()
+            );
         });
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&buffer)));
-        Self(buffer)
+        let previous = CAPTURE.with(|slot| slot.replace(Some(Arc::clone(&buffer))));
+        Self { buffer, previous }
     }
 
     pub fn text(&self) -> String {
         let buffer = self
-            .0
+            .buffer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&buffer).into_owned()
@@ -43,7 +51,8 @@ impl Captured {
 
 impl Drop for Captured {
     fn drop(&mut self) {
-        CAPTURE.with(|slot| *slot.borrow_mut() = None);
+        let previous = self.previous.take();
+        CAPTURE.with(|slot| *slot.borrow_mut() = previous);
     }
 }
 
