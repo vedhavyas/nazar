@@ -4,5 +4,6 @@
 # each other's), then idles until the test kills it. `exec` matters: the
 # kill must reach the sleeping process itself, or it outlives the test as a
 # leak.
-printf '%s\n' "$@" > "$2.args"
+printf '%s\n' "$@" > "$2.args.tmp"
+mv "$2.args.tmp" "$2.args"
 exec sleep 60
