@@ -265,8 +265,9 @@ struct Stall {
     /// is given ever-longer windows instead of a metronome that replaces
     /// its URL forever. A connect resets it.
     mints_unconnected: u32,
-    /// The run's last mint refusal: the cloud's own reason outranks the
-    /// generic producer line while the run is open.
+    /// The run's last mint failure: any refusal's reason - not only the
+    /// offline code's - outranks the generic producer line while the run
+    /// is open.
     mint_error: Option<String>,
 }
 
@@ -977,7 +978,14 @@ impl Supervisor {
             // slice: a tile must not wait out a cadence, and a re-assert
             // is what re-arms a chain go2rtc lost.
             match self.swap_source(&name, &low_source(&high)).await {
-                Ok(()) => self.settle(&name, high_state).await,
+                Ok(()) => {
+                    // The loop can drop the high while this PUT is in
+                    // flight: what just landed dials a source that is gone.
+                    if self.is_dropped(&high) {
+                        self.drop_source(&name).await;
+                    }
+                    self.settle(&name, self.status_for_name(&high).await).await;
+                }
                 Err(err) => {
                     let reason = redact(&err);
                     tracing::warn!(stream = %name, %reason, "the tile's chain did not take");
@@ -1245,8 +1253,6 @@ impl Supervisor {
                     if held.is_none() {
                         held = self.start_hold(&name);
                     }
-                    // The mint replaced the source: the chain may ride again.
-                    self.mark_minted(&name);
                     self.reconcile_low(&name).await;
                     if stall.since.is_none() {
                         // A recovered stream starts its backoff over: the
@@ -1261,7 +1267,8 @@ impl Supervisor {
                     Instant::now() + self.pacing.remint
                 }
                 Err(failure) => {
-                    stall.mint_error = Some(self.settle_mint_failure(&name, failure).await);
+                    self.note_failed_mint(&name, failure, &mut stall, &mut held_low)
+                        .await;
                     failed = true;
                     // The starvation clock is not restarted: a refused mint
                     // is another way the picture is dead, not a fresh
@@ -1294,6 +1301,7 @@ impl Supervisor {
                 Ok(session) => match session.source_for(&name) {
                     Ok(source) => match self.put_and_confirm(&name, &source).await {
                         Ok(()) => {
+                            self.mark_minted(&name);
                             tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
                             return Ok(());
                         }
@@ -1337,6 +1345,7 @@ impl Supervisor {
         };
         self.put_and_confirm(&name, &live_source(&mint.url)).await?;
         self.needs_login.store(false, Ordering::SeqCst);
+        self.mark_minted(&name);
         Ok(())
     }
 
@@ -1619,10 +1628,29 @@ impl Supervisor {
         }
     }
 
+    /// A refused mint's loop-side bookkeeping: its reason rides an open
+    /// run, and a stale drop takes the tile's hold down with the chain.
+    async fn note_failed_mint(
+        &self,
+        name: &str,
+        failure: MintFailure,
+        stall: &mut Stall,
+        held_low: &mut Option<HeldStream>,
+    ) {
+        let dropped = failure.stale_source;
+        let reason = self.settle_mint_failure(name, failure).await;
+        if stall.since.is_some() {
+            stall.mint_error = Some(reason);
+        }
+        if dropped {
+            *held_low = None;
+        }
+    }
+
     /// A refused mint: report it, and drop the source when the cloud says
     /// the device is offline (the URL we hold cannot serve until it is
     /// back, and leaving it has go2rtc dialling a dead source). Returns
-    /// the reason the run carries.
+    /// the refusal's reason; only an open run carries it.
     async fn settle_mint_failure(&self, name: &str, failure: MintFailure) -> String {
         tracing::warn!(
             stream = %name,
@@ -1646,13 +1674,15 @@ impl Supervisor {
         reason
     }
 
-    /// Drop a stream's source; an entry that is already gone is not a
+    /// Drop a stream's source; go2rtc's no-streams answer is not a
     /// failure.
     async fn drop_source(&self, name: &str) {
         match self.go2rtc.delete_stream(name).await {
-            // An entry that is already gone is not a failure: the
-            // predecessor was reaped by a swap.
-            Ok(()) | Err(Go2rtcError::Rejected { status: 404, .. }) => {}
+            Ok(()) => {}
+            // go2rtc 1.9.14 answers 400 "yaml: path not exist" when its
+            // config has no streams section at all: nothing to drop.
+            Err(Go2rtcError::Rejected { status: 400, body }) if body.contains("path not exist") => {
+            }
             Err(err) => {
                 tracing::warn!(stream = %name, %err, "the stale source could not be dropped");
             }

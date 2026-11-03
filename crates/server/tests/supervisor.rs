@@ -1831,18 +1831,33 @@ async fn a_dropped_chain_is_neither_reasserted_nor_held() {
     .await;
     let high = stream_name(DEVICE_ID, Quality::High);
     let low = stream_name(DEVICE_ID, Quality::Low);
+    // A go2rtc under load answers DELETEs slowly: the drop predicate must
+    // not mistake a mint swap's delete half for the offline drop.
+    h.go2rtc.set_delete_delay(Duration::from_millis(50));
     h.go2rtc.disconnect_producer(&high);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the high stream registers");
+    // The drop is established only with its reason and the whole pair:
+    // every mint swap also deletes, so a lone delete can be a swap caught
+    // between its delete and its put.
     let dropped = common::eventually(|| async {
         let ops = h.go2rtc.ops();
         last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason } if reason == "device offline in the cloud"
+            )
     })
     .await;
-    assert!(dropped, "the offline high is dropped: {:?}", h.go2rtc.ops());
+    assert!(
+        dropped,
+        "the offline drop is established with its reason: {:?}",
+        h.go2rtc.ops()
+    );
 
     // The tile's Try again arrives while the high is gone: it must not
     // put the chain back.
@@ -1850,27 +1865,42 @@ async fn a_dropped_chain_is_neither_reasserted_nor_held() {
         .ensure(DEVICE_ID, Quality::Low, true)
         .await
         .expect("the tile's ask answers");
-    assert_eq!(
-        h.go2rtc
-            .puts()
-            .iter()
-            .filter(|(name, _)| name == &low)
-            .count(),
-        0,
-        "a dropped chain is never re-asserted by a retry: {:?}",
-        h.go2rtc.ops()
+
+    // The tile takes the cloud's reason once the drop has landed: the
+    // high's own stall window may legitimately read waking before that.
+    let rejected = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Degraded { reason } if reason == "device offline in the cloud"
+        )
+    })
+    .await;
+    assert!(
+        rejected,
+        "the dropped tile mirrors the cloud's reason: {:?}",
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await
     );
-    assert_eq!(
-        h.go2rtc.stream_view(&low).0,
-        0,
-        "and no hold is started on a chain with no high to ride"
-    );
-    match h.supervisor.status_for(DEVICE_ID, Quality::Low).await {
-        StreamState::Degraded { reason } => assert_eq!(
-            reason, "device offline in the cloud",
-            "the tile mirrors the cloud's reason"
-        ),
-        other => panic!("the dropped tile must read degraded, got {other:?}"),
+
+    // Neither the retry nor any loop slice inside this window may
+    // re-assert the chain or start a hold on it: one read right after the
+    // ask would race the loop's own slice.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            h.go2rtc
+                .puts()
+                .iter()
+                .filter(|(name, _)| name == &low)
+                .count(),
+            0,
+            "a dropped chain is never re-asserted by a retry: {:?}",
+            h.go2rtc.ops()
+        );
+        assert_eq!(
+            h.go2rtc.stream_view(&low).0,
+            0,
+            "no hold is started on a chain with no high to ride"
+        );
     }
 
     // The camera is back: the successful mint rebuilds the chain and the
@@ -2338,6 +2368,107 @@ async fn the_tile_chain_is_held_warm() {
         held,
         "the tile's chain carries narar's own consumer: {:?}",
         h.go2rtc.stream_view(&low)
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile's hold is narar's own consumer on the chain: when the high is
+/// dropped, the hold goes with it, or its consumer keeps dialling a
+/// stream that is gone. The recovery holds the chain again.
+#[tokio::test]
+async fn an_offline_drop_releases_the_tile_chains_hold() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    // The first mint lands; every re-mint is refused.
+    mint_mock(200, &mint_body("one"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let warm = common::eventually(|| async {
+        h.go2rtc.stream_view(&high).1 && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        warm,
+        "the chain is open and held first: {:?} {:?}",
+        h.go2rtc.stream_view(&high),
+        h.go2rtc.stream_view(&low)
+    );
+    let low_puts_before = h
+        .go2rtc
+        .puts()
+        .iter()
+        .filter(|(name, _)| name == &low)
+        .count();
+
+    // The camera goes offline under the held producer: the next re-mint
+    // is refused and the drop takes both streams.
+    h.go2rtc.disconnect_producer(&high);
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason } if reason == "device offline in the cloud"
+            )
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop is established: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The tile's hold on the chain is released with it.
+    let released = common::eventually(|| async { h.go2rtc.stream_view(&low).0 == 0 }).await;
+    assert!(
+        released,
+        "the tile chain's hold is released with the dropped chain: {:?}",
+        h.go2rtc.stream_view(&low)
+    );
+
+    // The camera is back: the rebuilt chain is held again.
+    mint_mock(200, &mint_body("again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    let rebuilt = common::eventually(|| async {
+        let low_puts = h
+            .go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &low)
+            .count();
+        low_puts > low_puts_before && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        rebuilt,
+        "the recovered chain is rebuilt and held: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
