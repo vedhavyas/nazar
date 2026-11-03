@@ -27,6 +27,7 @@ use qubo::{
 
 use crate::episodes::EpisodeStore;
 use crate::events::EventBus;
+use crate::go2rtc::Go2rtc;
 use crate::motion::{Hysteresis, MotionOrder};
 use crate::mqtt::UnitEvent;
 use crate::notify::{Notification, NotificationStore, Snapshots};
@@ -318,8 +319,22 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// How long the health probe waits for the engine's API. The endpoint
+/// answers inside the Docker healthcheck's window even when the engine is
+/// wedged, and the status never fails for the engine.
+const HEALTH_PROBE: Duration = Duration::from_millis(1000);
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "ok": true, "version": state.version }))
+    let go2rtc = match state.go2rtc_api.parse() {
+        Ok(url) => match Go2rtc::connect(url) {
+            Ok(client) => tokio::time::timeout(HEALTH_PROBE, client.streams())
+                .await
+                .is_ok_and(|answer| answer.is_ok()),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    Json(json!({ "ok": true, "version": state.version, "go2rtc": go2rtc }))
 }
 
 #[derive(Deserialize)]

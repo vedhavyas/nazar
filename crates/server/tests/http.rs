@@ -46,8 +46,8 @@ struct Harness {
     go2rtc: common::FakeApi,
 }
 
-async fn harness() -> Harness {
-    harness_with(Pacing {
+fn test_pacing() -> Pacing {
+    Pacing {
         remint: Duration::from_secs(30),
         retry_base: Duration::from_secs(30),
         retry_max: Duration::from_secs(30),
@@ -60,11 +60,20 @@ async fn harness() -> Harness {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
-    })
-    .await
+    }
+}
+
+async fn harness() -> Harness {
+    harness_with(test_pacing()).await
 }
 
 async fn harness_with(pacing: Pacing) -> Harness {
+    harness_with_api(pacing, None).await
+}
+
+/// The harness with the health probe's API base overridden, so a test can
+/// point it at a dead or wedged engine while the rest talks to the fake.
+async fn harness_with_api(pacing: Pacing, api: Option<String>) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     let data_dir = std::env::temp_dir().join(format!(
@@ -96,7 +105,7 @@ async fn harness_with(pacing: Pacing) -> Harness {
             sessions,
             qubo: client,
             supervisor,
-            go2rtc_api: go2rtc.base.to_string(),
+            go2rtc_api: api.unwrap_or_else(|| go2rtc.base.to_string()),
             events: EventBus::new(),
             motion: Arc::new(Mutex::new(MotionOrder::new())),
             notifications: Arc::new(NotificationStore::open(
@@ -163,8 +172,71 @@ async fn health_is_open_and_carries_the_version() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
         response.json::<Value>().await.expect("json"),
-        json!({ "ok": true, "version": "test" }),
-        "health answers without a session"
+        json!({ "ok": true, "version": "test", "go2rtc": true }),
+        "health answers without a session and reports the engine"
+    );
+}
+
+/// The engine can be alive and unable to bind: its API is unreachable
+/// while the server is fine. The health body must say so and stay 200, so
+/// the container healthcheck does not flip during a restart backoff.
+#[tokio::test]
+async fn health_reports_a_dead_engine_without_failing() {
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the address");
+        drop(listener);
+        format!("http://{addr}")
+    };
+    let h = harness_with_api(test_pacing(), Some(closed)).await;
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the server is fine, so health stays 200"
+    );
+    let body = response.json::<Value>().await.expect("json");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["version"], json!("test"));
+    assert_eq!(
+        body["go2rtc"],
+        json!(false),
+        "the dead engine is surfaced in the body"
+    );
+}
+
+/// A go2rtc that accepts and never answers must not hold the health
+/// endpoint: the probe is bounded, and the body reports the engine down.
+#[tokio::test]
+async fn health_bounds_a_wedged_engine_probe() {
+    use tokio::io::AsyncReadExt as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let addr = listener.local_addr().expect("the address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        std::future::pending::<()>().await;
+    });
+    let h = harness_with_api(test_pacing(), Some(format!("http://{addr}"))).await;
+    let started = std::time::Instant::now();
+    let response = client()
+        .get(format!("{}/api/health", h.base))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.json::<Value>().await.expect("json");
+    assert_eq!(body["go2rtc"], json!(false), "a wedged engine reads down");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the probe is bounded: {:?}",
+        started.elapsed()
     );
 }
 
