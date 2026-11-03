@@ -474,9 +474,7 @@ async fn the_camera_page_redacts_the_engine_detail() {
         .respond_with(
             ResponseTemplate::new(200).set_body_string(
                 json!({
-                    "streamURL": format!(
-                        "rtsps://wowza.example.com:443/hero-iot-live/{DEVICE_ID}%3Fwowzatoken%253Dsekrit-token%26sessionid%3dsess-9d1%26useruuid%3dusr-7f3%26camsessionid%3dcam-4a2"
-                    ),
+                    "streamURL": "rtsps://w/x%3Fwowzatoken%253Dsekrit%26sessionid%3dsess-9d1%26useruuid%3dusr-7f3%26camsessionid%3dcam-4a2",
                     "sessionId": "session-1",
                 })
                 .to_string(),
@@ -484,7 +482,7 @@ async fn the_camera_page_redacts_the_engine_detail() {
         )
         .mount(&h.qubo)
         .await;
-    h.go2rtc.set_put_refused_marker(Some("sekrit-token"));
+    h.go2rtc.set_put_refused_marker(Some("sekrit"));
     let browser = client();
 
     let _ = browser
@@ -517,15 +515,16 @@ async fn the_camera_page_redacts_the_engine_detail() {
     let details = page["cameras"][0]["details"]
         .as_str()
         .expect("the engine's detail");
-    for secret in ["sekrit-token", "sess-9d1", "usr-7f3", "cam-4a2"] {
+    for secret in ["sekrit", "sess-9d1", "usr-7f3", "cam-4a2"] {
         assert!(
             !details.contains(secret),
             "the detail carries the credential {secret}: {details}"
         );
     }
-    assert!(
-        details.contains("<redacted>"),
-        "the detail says what was removed: {details}"
+    assert_eq!(
+        details.matches("<redacted>").count(),
+        4,
+        "all four credentials were present and redacted: {details}"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }
