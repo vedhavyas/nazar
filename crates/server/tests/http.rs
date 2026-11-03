@@ -452,8 +452,13 @@ async fn the_camera_page_carries_the_degraded_reason() {
     assert_eq!(page["cameras"][0]["state"], json!("degraded"));
     assert_eq!(
         page["cameras"][0]["reason"],
+        json!("sign-in expired"),
+        "the tile gets a sentence that fits it, not the cloud's error"
+    );
+    assert_eq!(
+        page["cameras"][0]["details"],
         json!("auth error: User Token expired, Access denied"),
-        "the server's reason reaches the browser verbatim"
+        "the cloud's own words stay behind the diagnostics"
     );
     let _ = std::fs::remove_dir_all(&h.data_dir);
 }

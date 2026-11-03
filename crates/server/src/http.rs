@@ -465,23 +465,143 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
         if !device.is_camera() {
             continue;
         }
-        let (name, reason) = match state.supervisor.status(&device.device_id).await {
-            StreamState::Offline => ("offline", None),
-            StreamState::Waking => ("waking", None),
-            StreamState::Live { .. } => ("live", None),
-            StreamState::Degraded { reason } => ("degraded", Some(reason)),
+        let (name, reason, details) = match state.supervisor.status(&device.device_id).await {
+            StreamState::Offline => ("offline", None, None),
+            StreamState::Waking => ("waking", None, None),
+            StreamState::Live { .. } => ("live", None, None),
+            StreamState::Degraded { reason } => {
+                let (short, detail) = degraded_words(&reason);
+                ("degraded", Some(short), detail)
+            }
         };
         cameras.push(json!({
             "id": device.device_id,
             "name": device.name,
             "state": name,
             "reason": reason,
+            "details": details,
         }));
     }
     Ok(Json(json!({
         "cameras": cameras,
         "needsLogin": state.supervisor.needs_login(),
     })))
+}
+
+/// A degraded stream's sentence for the person, and the technical detail
+/// behind it. The supervisor's reason is an engine or cloud error, often a
+/// whole request URL; the tile gets words that fit it, and the camera
+/// screen's diagnostics get the rest.
+fn degraded_words(reason: &str) -> (&'static str, Option<String>) {
+    if reason == "device offline in the cloud" {
+        return ("device offline in the cloud", None);
+    }
+    if reason == "the producer has not connected" {
+        return ("camera is not responding", None);
+    }
+    let short = if reason.starts_with("go2rtc") {
+        "stream engine unavailable"
+    } else if reason.starts_with("auth error") {
+        "sign-in expired"
+    } else if ["http error", "api error", "parse error", "io error"]
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+    {
+        "cloud service unavailable"
+    } else {
+        "stream unavailable"
+    };
+    (short, Some(diagnostic_detail(reason)))
+}
+
+/// The reason as a diagnostics view may show it: a URL keeps its endpoint
+/// and loses its query, where a mint's credentials ride, and a credential
+/// that survives elsewhere is redacted too.
+fn diagnostic_detail(reason: &str) -> String {
+    redact_credentials(&strip_url_queries(reason))
+}
+
+/// Schemes whose query string can carry a minted stream's credentials.
+const URL_SCHEMES: [&str; 6] = [
+    "https://", "http://", "rtsps://", "rtsp://", "wss://", "ws://",
+];
+
+fn strip_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = URL_SCHEMES
+            .iter()
+            .filter_map(|scheme| rest.find(scheme).map(|at| (at, *scheme)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, scheme)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + scheme.len()..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\'' | '>'))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        out.push_str(scheme);
+        match url.find('?') {
+            Some(query) => {
+                out.push_str(&url[..query]);
+                out.push_str("?<redacted>");
+            }
+            None => out.push_str(url),
+        }
+        rest = &tail[end..];
+    }
+}
+
+/// Parameter names a mint's credentials ride under, as the cloud's RTSPS
+/// URLs spell them.
+const CREDENTIAL_KEYS: [&str; 5] = [
+    "wowzaToken",
+    "sessionId",
+    "userUUID",
+    "camSessionId",
+    "token",
+];
+
+fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = CREDENTIAL_KEYS
+            .iter()
+            .filter_map(|key| rest.find(key).map(|at| (at, *key)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, key)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let after = &rest[at + key.len()..];
+        // `%3D` is how the parameter separator survives inside an encoded
+        // `src` value.
+        let value = after
+            .strip_prefix('=')
+            .map(|tail| (1, tail))
+            .or_else(|| after.strip_prefix("%3D").map(|tail| (3, tail)));
+        let Some((sep, tail)) = value else {
+            out.push_str(key);
+            rest = after;
+            continue;
+        };
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '&' | ')' | ']' | '"' | '\'' | '#' | '\\')
+            })
+            .unwrap_or(tail.len())
+            .min(tail.find("%26").unwrap_or(tail.len()));
+        out.push_str(key);
+        out.push_str(&after[..sep]);
+        out.push_str("<redacted>");
+        rest = &tail[end..];
+    }
 }
 
 #[derive(Deserialize)]
@@ -1224,4 +1344,52 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_degraded_reason_speaks_in_one_short_sentence() {
+        assert_eq!(
+            degraded_words("auth error: User Token expired, Access denied").0,
+            "sign-in expired"
+        );
+        assert_eq!(
+            degraded_words("http error: 500 Internal Server Error").0,
+            "cloud service unavailable"
+        );
+        assert_eq!(
+            degraded_words("device offline in the cloud"),
+            ("device offline in the cloud", None)
+        );
+        assert_eq!(
+            degraded_words("the producer has not connected").0,
+            "camera is not responding"
+        );
+    }
+
+    #[test]
+    fn a_degraded_reason_keeps_its_endpoint_and_loses_its_credentials() {
+        let raw = "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?name=cam-high&src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3Dsekrit%26sessionId%3Dsid-1%26userUUID%3Duser-1%26camSessionId%3Dcam-1)";
+        let (short, details) = degraded_words(raw);
+        assert_eq!(short, "stream engine unavailable");
+        assert_eq!(
+            details.as_deref(),
+            Some(
+                "go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)"
+            ),
+            "the endpoint stays and the query - the mint's credentials - goes"
+        );
+    }
+
+    #[test]
+    fn a_credential_outside_a_url_query_is_redacted() {
+        let raw = "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3Dsekrit%26sessionId%3Dsid-1";
+        assert_eq!(
+            diagnostic_detail(raw),
+            "go2rtc rejected the request (HTTP 400): src=ffmpeg%3Artsp%3A%2F%2Fwowza.example%2Flive%2Fcam%3FwowzaToken%3D<redacted>%26sessionId%3D<redacted>"
+        );
+    }
 }
