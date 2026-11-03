@@ -181,10 +181,15 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
   expect((diag as HTMLDetailsElement).open, 'closed until asked for').toBe(false);
   expect(diag?.querySelector('pre')?.textContent, 'and holds the server detail').toBe(details);
 
-  // Past the player's own start window: the server's reason still wins,
-  // and the retry it carries stays.
+  // Past the player's own start window, and the fallback cannot take the
+  // picture: that failure is the stall that used to replace this note.
   await vi.advanceTimersByTimeAsync(20000);
-  expect(screen.getByText(reason), 'the reason outlasts the player window').toBeTruthy();
+  const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
+  expect(scripts.length, 'the fallback was attempted').toBeGreaterThan(0);
+  scripts.item(scripts.length - 1)?.dispatchEvent(new Event('error'));
+  await vi.advanceTimersByTimeAsync(50);
+
+  expect(screen.getByText(reason), 'the reason outlasts the stall').toBeTruthy();
   expect(screen.queryByText(/did not start/), 'the stall note does not replace it').toBeNull();
   expect(screen.getByText('Try again'), 'and Try again stays').toBeTruthy();
 });
