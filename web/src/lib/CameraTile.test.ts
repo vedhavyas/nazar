@@ -303,7 +303,7 @@ test('a live tile waiting on its stream name says so', () => {
 
 test('a degraded tile shows its short reason and never the technical detail', () => {
   const details =
-    'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)';
+    'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>) tail-marker';
   const onwatch = vi.fn();
   render(CameraTile, {
     camera: {
@@ -320,10 +320,10 @@ test('a degraded tile shows its short reason and never the technical detail', ()
     screen.getByText('stream engine unavailable'),
     'the tile says why in one sentence',
   ).toBeTruthy();
-  expect(
-    document.body.textContent,
-    'the technical detail never reaches the grid',
-  ).not.toContain(details);
+  const text = document.body.textContent ?? '';
+  expect(text, 'the technical detail never reaches the grid').not.toContain(details);
+  expect(text, 'not even a truncated render').not.toContain('go2rtc api');
+  expect(text, 'and not its tail').not.toContain('tail-marker');
 });
 
 async function videoOf(): Promise<HTMLVideoElement> {
