@@ -157,6 +157,11 @@ fn released_last(h: &Harness) -> bool {
         .is_some_and(|op| op.starts_with("delete:"))
 }
 
+/// The last streams operation for `name`, as `put:<name>` or `delete:<name>`.
+fn last_op(ops: &[String], name: &str) -> Option<String> {
+    ops.iter().rev().find(|op| op.ends_with(name)).cloned()
+}
+
 /// The stream's state once its loop has taken a position: the first mint
 /// runs in the loop, so `Waking` is what a fresh registration reads.
 async fn settled(supervisor: &Supervisor) -> StreamState {
@@ -1454,13 +1459,13 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
     let degraded = common::eventually(|| async {
         matches!(
             h.supervisor.status(DEVICE_ID).await,
-            StreamState::Degraded { reason } if reason == "the producer has not connected"
+            StreamState::Degraded { reason } if reason == "http error: 500 Internal Server Error"
         )
     })
     .await;
     assert!(
         degraded,
-        "the window lands on its own deadline despite the refused mints: {:?}",
+        "the window lands on its own deadline and carries the mint's reason: {:?}",
         h.supervisor.status(DEVICE_ID).await
     );
     // The premise provably ran: the refused mints actually happened.
@@ -1468,6 +1473,767 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         mint_count(&h.qubo).await >= 2,
         "a refused mint ran mid-stall: {} mints",
         mint_count(&h.qubo).await
+    );
+
+    // Sample a window wider than the stall's own (350ms). The early
+    // waking of the grace is legitimate, so the sample starts once the
+    // window's reason is up: past it, a refusal landing mid-run must
+    // never return the stream to waking - that would take the Try again
+    // affordance away - and never launder the refusal's reason.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "http error: 500 Internal Server Error"
+        ),
+        "the reason stands once the window has passed: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let mints_before = mint_count(&h.qubo).await;
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let state = h.supervisor.status(DEVICE_ID).await;
+        assert!(
+            !matches!(state, StreamState::Waking),
+            "a mid-stall refusal never returns the stream to waking: {state:?}"
+        );
+        assert!(
+            matches!(
+                &state,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            ),
+            "the refusal's reason is what the tile keeps: {state:?}"
+        );
+    }
+    assert!(
+        mint_count(&h.qubo).await > mints_before,
+        "at least one refusal landed inside the sample window"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A device the cloud reports offline can never serve the URL the stream holds:
+/// the stale source is dropped, and the cloud's reason is what the tile
+/// keeps saying instead of the generic producer line.
+#[tokio::test]
+async fn an_offline_mint_failure_drops_the_stale_source_and_keeps_the_reason() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    // The first mint lands; every re-mint is refused because the device
+    // has gone offline in the cloud.
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let refused = common::eventually(|| async { mint_count(&h.qubo).await >= 2 }).await;
+    assert!(refused, "the re-mint runs");
+
+    let dropped = common::eventually(|| async {
+        h.go2rtc
+            .ops()
+            .into_iter()
+            .rev()
+            .find(|op| op.ends_with(&name))
+            .is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(dropped, "the stale source is dropped: {:?}", h.go2rtc.ops());
+
+    let reason = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "device offline in the cloud"
+        )
+    })
+    .await;
+    assert!(
+        reason,
+        "the cloud reason is carried, not the generic line: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    // The stall's own window must not launder it back to the generic
+    // line, and neither may any later cycle: sample a whole backoff
+    // cycle, not one instant.
+    let mints_before = mint_count(&h.qubo).await;
+    for sample in 0..40 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let state = h.supervisor.status(DEVICE_ID).await;
+        assert!(
+            !matches!(&state, StreamState::Degraded { reason } if reason == "the producer has not connected"),
+            "the reason never falls back to the generic line: {state:?}"
+        );
+        if sample >= 20 {
+            assert_eq!(
+                state,
+                StreamState::Degraded {
+                    reason: "device offline in the cloud".to_owned()
+                },
+                "the cloud's reason holds across the whole cycle"
+            );
+        }
+    }
+    let refused = mint_count(&h.qubo).await - mints_before;
+    assert!(
+        refused >= 4,
+        "the refusal cycles ran inside the sample window: {refused} mints"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile rendition has no cloud URL of its own: when the offline
+/// refusal drops the high's source, the low must stop dialling it too.
+#[tokio::test]
+async fn an_offline_drop_removes_the_low_chain() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low chain registers");
+    h.go2rtc.set_viewers(&high, 1);
+
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(
+        dropped,
+        "both chains are dropped off the offline high: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The drop is not a moment but a state: while the device is away the
+    // loop keeps refusing mints on its backoff, and not one of those
+    // cycles may put the chain back. A single sample cannot see this -
+    // the old reconcile re-PUT the low on the first slice - so hold the
+    // absence across a whole backoff cycle (about 20, 40, 80, 160,
+    // 200, 200ms here).
+    let at_drop = h.go2rtc.ops().len();
+    let mints_at_drop = mint_count(&h.qubo).await;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ops = h.go2rtc.ops();
+        assert!(
+            !ops[at_drop..].iter().any(|op| *op == format!("put:{low}")),
+            "the dropped low is not re-asserted while the device is away: {ops:?}"
+        );
+    }
+    let refused = mint_count(&h.qubo).await - mints_at_drop;
+    assert!(
+        refused >= 4,
+        "the refusal cycles actually ran inside the absence window: {refused} mints"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The low has no cloud URL of its own: after an offline drop, the next
+/// successful mint must rebuild it off the recovered high.
+#[tokio::test]
+async fn a_mint_after_an_offline_drop_rebuilds_the_low_chain() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low chain registers");
+    h.go2rtc.set_viewers(&high, 1);
+
+    // The rebuild is only meaningful after the drop: wait for both gone.
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop removes both first: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // A full liveness slice first: a reconcile that ignores the dropped
+    // high has re-asserted the chain by now, and a put carried over from
+    // before the recovery would make the rebuild below indistinguishable
+    // from the flap.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let low_puts_before = h
+        .go2rtc
+        .puts()
+        .iter()
+        .filter(|(name, _)| name == &low)
+        .count();
+    assert_eq!(
+        low_puts_before, 1,
+        "the chain was put once, before the drop, and never re-asserted"
+    );
+
+    // The camera is back: the next mint rebuilds the high, and the
+    // reconcile rebuilds the low off it.
+    mint_mock(200, &mint_body("again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    let rebuilt = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        let low_puts = h
+            .go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &low)
+            .count();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("put:")) && low_puts > low_puts_before
+    })
+    .await;
+    assert!(
+        rebuilt,
+        "the recovered mint rebuilds the low with a fresh put: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The camera's push lands on the rebuilt source: the run closes and
+    // the recovered stream reads live, its offline reason gone.
+    h.go2rtc.connect_producer(&high);
+    let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
+    assert!(
+        live,
+        "the reason clears once the camera is back: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The drop is keyed on the cloud's own code, not on the HTTP status: a
+/// 400 carrying a different envelope is a transient refusal, and both
+/// sources stay.
+#[tokio::test]
+async fn a_non_offline_refusal_keeps_the_stale_source() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_002","message":"request rejected"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the low chain registers");
+    h.go2rtc.set_viewers(&high, 1);
+
+    let refused = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason }
+                if reason == "api error ERR_STM_002: request rejected"
+        )
+    })
+    .await;
+    assert!(
+        refused,
+        "a 400 with another code is refused and its reason is carried: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    let ops = h.go2rtc.ops();
+    assert_eq!(
+        last_op(&ops, &high),
+        Some(format!("put:{high}")),
+        "only ERR_STM_010 condemns the high source: {ops:?}"
+    );
+    assert_eq!(
+        last_op(&ops, &low),
+        Some(format!("put:{low}")),
+        "and the chain that rides it is never dropped: {ops:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A dropped chain is not re-asserted by a tile's Try again, and no hold
+/// is started on it: both would dial a high that no longer exists. The
+/// next successful mint rebuilds the chain and the hold with it.
+#[tokio::test]
+async fn a_dropped_chain_is_neither_reasserted_nor_held() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+    // A go2rtc under load answers DELETEs slowly: the drop predicate must
+    // not mistake a mint swap's delete half for the offline drop.
+    h.go2rtc.set_delete_delay(Duration::from_millis(50));
+    h.go2rtc.disconnect_producer(&high);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the high stream registers");
+    // The drop is established only with its reason and the whole pair:
+    // every mint swap also deletes, so a lone delete can be a swap caught
+    // between its delete and its put.
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason } if reason == "device offline in the cloud"
+            )
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop is established with its reason: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The tile's Try again arrives while the high is gone: it must not
+    // put the chain back.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, true)
+        .await
+        .expect("the tile's ask answers");
+
+    // The tile takes the cloud's reason once the drop has landed: the
+    // high's own stall window may legitimately read waking before that.
+    let rejected = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Degraded { reason } if reason == "device offline in the cloud"
+        )
+    })
+    .await;
+    assert!(
+        rejected,
+        "the dropped tile mirrors the cloud's reason: {:?}",
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await
+    );
+
+    // Neither the retry nor any loop slice inside this window may
+    // re-assert the chain or start a hold on it: one read right after the
+    // ask would race the loop's own slice.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            h.go2rtc
+                .puts()
+                .iter()
+                .filter(|(name, _)| name == &low)
+                .count(),
+            0,
+            "a dropped chain is never re-asserted by a retry: {:?}",
+            h.go2rtc.ops()
+        );
+        assert_eq!(
+            h.go2rtc.stream_view(&low).0,
+            0,
+            "no hold is started on a chain with no high to ride"
+        );
+    }
+
+    // The camera is back: the successful mint rebuilds the chain and the
+    // hold restarts on it.
+    mint_mock(200, &mint_body("again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    let rebuilt = common::eventually(|| async {
+        h.go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &low)
+            .count()
+            > 0
+            && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        rebuilt,
+        "the recovered chain is rebuilt and held: {:?}",
+        h.go2rtc.ops()
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A refusal that lands outside a run is not evidence against the next
+/// run: once the producer is back, the stall's reason is the generic
+/// producer line again, not the old refusal replayed.
+#[tokio::test]
+async fn a_refusal_outside_a_run_is_not_replayed_into_the_next_one() {
+    let mut h = harness(Pacing {
+        remint: Duration::from_millis(350),
+        retry_base: Duration::from_millis(1500),
+        retry_max: Duration::from_secs(5),
+        mint_settle: Duration::from_millis(60),
+        connect_grace: Duration::from_millis(60),
+        connect_window: Duration::from_millis(250),
+        liveness_poll: Duration::from_millis(25),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let warm = common::eventually(|| async { h.go2rtc.stream_view(&name).1 }).await;
+    assert!(warm, "the hold warmed the producer");
+
+    // A cadence re-mint is refused while the producer is still up: no
+    // run is open, so the refusal is not any run's reason.
+    let refused = common::eventually(|| async { mint_count(&h.qubo).await >= 2 }).await;
+    assert!(refused, "a cadence re-mint was refused");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The producer dies under the hold: a run opens, and its window lands
+    // well before the next attempt's backoff expires.
+    h.go2rtc.disconnect_producer(&name);
+    let waking = common::eventually(|| async {
+        h.supervisor.status_for(DEVICE_ID, Quality::High).await == StreamState::Waking
+    })
+    .await;
+    assert!(waking, "the run opened and the stream reads waking");
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(degraded, "the run's window lands");
+    let mints_at_window = mint_count(&h.qubo).await;
+    match h.supervisor.status_for(DEVICE_ID, Quality::High).await {
+        StreamState::Degraded { reason } => assert_eq!(
+            reason, "the producer has not connected",
+            "a refusal from before the run is not replayed into it"
+        ),
+        other => panic!("expected the run's own reason, got {other:?}"),
+    }
+
+    // Hold that reading across the rest of the window: the backoff has
+    // not expired, so no fresh refusal can supply the reason.
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            mint_count(&h.qubo).await,
+            mints_at_window,
+            "no attempt lands inside the sample window"
+        );
+        assert_eq!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded {
+                reason: "the producer has not connected".to_owned()
+            },
+            "the reason never falls back to the old refusal"
+        );
+    }
+
+    // The sampled window was real: the next attempt's refusal lands after
+    // it and becomes the reason in its own right.
+    let refreshed = common::eventually(|| async {
+        mint_count(&h.qubo).await > mints_at_window
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refreshed, "the next refusal refreshes the reason");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A refusal that lands outside a run - producer down, nobody watching -
+/// must not be carried as the next run's reason: that run's own window
+/// says the producer has not connected.
+#[tokio::test]
+async fn a_refusal_before_a_run_is_not_carried_into_it() {
+    let h = harness(Pacing {
+        remint: Duration::from_millis(300),
+        retry_base: Duration::from_millis(1500),
+        retry_max: Duration::from_secs(5),
+        mint_settle: Duration::from_millis(60),
+        connect_grace: Duration::from_millis(60),
+        connect_window: Duration::from_millis(250),
+        liveness_poll: Duration::from_millis(25),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.disconnect_producer(&name);
+
+    // The cadence re-mint is refused while nobody is on the stream and
+    // the producer is down: no run is open to own the reason.
+    let refused = common::eventually(|| async {
+        mint_count(&h.qubo).await >= 2
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refused, "a cadence re-mint is refused with no run open");
+    assert!(
+        !h.go2rtc.stream_view(&name).1,
+        "the producer is down and unwatched: no run can be open"
+    );
+
+    // A viewer arrives: the run opens, and its window lands before the
+    // next attempt's backoff does.
+    h.go2rtc.set_viewers(&name, 1);
+    let waking = common::eventually(|| async {
+        h.supervisor.status_for(DEVICE_ID, Quality::High).await == StreamState::Waking
+    })
+    .await;
+    assert!(waking, "the viewer's run opens and reads waking");
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(degraded, "the run's window lands");
+    let mints_at_window = mint_count(&h.qubo).await;
+    match h.supervisor.status_for(DEVICE_ID, Quality::High).await {
+        StreamState::Degraded { reason } => assert_eq!(
+            reason, "the producer has not connected",
+            "a refusal from before the run is not carried into it"
+        ),
+        other => panic!("expected the run's own reason, got {other:?}"),
+    }
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            mint_count(&h.qubo).await,
+            mints_at_window,
+            "no attempt lands inside the sample window"
+        );
+        assert_eq!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded {
+                reason: "the producer has not connected".to_owned()
+            },
+            "the run's own reason stands across the window"
+        );
+    }
+    let refreshed = common::eventually(|| async {
+        mint_count(&h.qubo).await > mints_at_window
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refreshed, "the next refusal lands as the run's own reason");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile's hold is released by a stale drop, not by a refused mint: a
+/// transient 5xx keeps both the source and the hold.
+#[tokio::test]
+async fn a_transient_refusal_keeps_the_tile_hold() {
+    let mut h = harness(Pacing {
+        remint: Duration::from_millis(300),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let warm = common::eventually(|| async {
+        h.go2rtc.stream_view(&high).1 && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        warm,
+        "the chain is open and held first: {:?} {:?}",
+        h.go2rtc.stream_view(&high),
+        h.go2rtc.stream_view(&low)
+    );
+
+    // A cadence re-mint is refused: transient, so neither source goes.
+    let refused = common::eventually(|| async {
+        mint_count(&h.qubo).await >= 2
+            && matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refused, "a cadence re-mint was refused");
+
+    // Sampled over the loop's next slices: a transient refusal keeps the
+    // high's hold and the tile's.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            h.go2rtc.stream_view(&high).0 >= 1,
+            "a transient refusal keeps the high's hold: {:?}",
+            h.go2rtc.stream_view(&high)
+        );
+        assert!(
+            h.go2rtc.stream_view(&low).0 >= 1,
+            "a transient refusal keeps the tile's hold: {:?}",
+            h.go2rtc.stream_view(&low)
+        );
+    }
+    let ops = h.go2rtc.ops();
+    assert_eq!(
+        last_op(&ops, &low),
+        Some(format!("put:{low}")),
+        "a transient refusal never drops the chain: {ops:?}"
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A transient refusal is not proof the URL is dead: the source stays
+/// while the loop keeps its backoff.
+#[tokio::test]
+async fn a_transient_mint_failure_keeps_the_stale_source() {
+    let h = harness(pacing(Duration::from_secs(30))).await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+    h.go2rtc.disconnect_producer(&name);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.set_viewers(&name, 1);
+
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == "http error: 500 Internal Server Error"
+        )
+    })
+    .await;
+    assert!(degraded, "the refusal degrades the stream");
+    let last = h
+        .go2rtc
+        .ops()
+        .into_iter()
+        .rev()
+        .find(|op| op.ends_with(&name));
+    assert_eq!(
+        last,
+        Some(format!("put:{name}")),
+        "a transient refusal keeps the source: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -1772,6 +2538,107 @@ async fn the_tile_chain_is_held_warm() {
         held,
         "the tile's chain carries narar's own consumer: {:?}",
         h.go2rtc.stream_view(&low)
+    );
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile's hold is narar's own consumer on the chain: when the high is
+/// dropped, the hold goes with it, or its consumer keeps dialling a
+/// stream that is gone. The recovery holds the chain again.
+#[tokio::test]
+async fn an_offline_drop_releases_the_tile_chains_hold() {
+    let mut h = harness(pacing(Duration::from_secs(30))).await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    // The first mint lands; every re-mint is refused.
+    mint_mock(200, &mint_body("one"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock(
+        400,
+        r#"{"code":"ERR_STM_010","message":"device is offline"}"#,
+    )
+    .mount(&h.qubo)
+    .await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let warm = common::eventually(|| async {
+        h.go2rtc.stream_view(&high).1 && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        warm,
+        "the chain is open and held first: {:?} {:?}",
+        h.go2rtc.stream_view(&high),
+        h.go2rtc.stream_view(&low)
+    );
+    let low_puts_before = h
+        .go2rtc
+        .puts()
+        .iter()
+        .filter(|(name, _)| name == &low)
+        .count();
+
+    // The camera goes offline under the held producer: the next re-mint
+    // is refused and the drop takes both streams.
+    h.go2rtc.disconnect_producer(&high);
+    let dropped = common::eventually(|| async {
+        let ops = h.go2rtc.ops();
+        last_op(&ops, &high).is_some_and(|op| op.starts_with("delete:"))
+            && last_op(&ops, &low).is_some_and(|op| op.starts_with("delete:"))
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason } if reason == "device offline in the cloud"
+            )
+    })
+    .await;
+    assert!(
+        dropped,
+        "the offline drop is established: {:?}",
+        h.go2rtc.ops()
+    );
+
+    // The tile's hold on the chain is released with it.
+    let released = common::eventually(|| async { h.go2rtc.stream_view(&low).0 == 0 }).await;
+    assert!(
+        released,
+        "the tile chain's hold is released with the dropped chain: {:?}",
+        h.go2rtc.stream_view(&low)
+    );
+
+    // The camera is back: the rebuilt chain is held again.
+    mint_mock(200, &mint_body("again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    let rebuilt = common::eventually(|| async {
+        let low_puts = h
+            .go2rtc
+            .puts()
+            .iter()
+            .filter(|(name, _)| name == &low)
+            .count();
+        low_puts > low_puts_before && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        rebuilt,
+        "the recovered chain is rebuilt and held: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }

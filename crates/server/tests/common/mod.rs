@@ -646,11 +646,13 @@ fn streams_methods(
     let dropped = Arc::clone(deletes);
     let delay = Arc::clone(knobs.delete_delay);
     let ops = Arc::clone(knobs.ops);
+    let taken = Arc::clone(knobs.taken);
     let drop_stream =
         axum::routing::delete(move |Query(params): Query<HashMap<String, String>>| {
             let dropped = Arc::clone(&dropped);
             let delay = Arc::clone(&delay);
             let ops = Arc::clone(&ops);
+            let taken = Arc::clone(&taken);
             async move {
                 // Recorded on arrival, not on answer: a slow DELETE is
                 // still an operation that happened when it was sent, and
@@ -658,6 +660,10 @@ fn streams_methods(
                 let src = params.get("src").cloned().unwrap_or_default();
                 dropped.lock().unwrap().push(src.clone());
                 ops.lock().unwrap().push(format!("delete:{src}"));
+                // A real go2rtc drops the entry: the streams view must no
+                // longer list it, or a reconcile reads a deleted chain as
+                // present.
+                taken.lock().unwrap().retain(|(name, _)| name != &src);
                 let millis = delay.load(Ordering::SeqCst);
                 if millis > 0 {
                     tokio::time::sleep(Duration::from_millis(millis)).await;

@@ -285,14 +285,36 @@ fn args_path(config_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.args", config_path.display()))
 }
 
-async fn await_args(path: &Path) -> Vec<String> {
-    for _ in 0..100 {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            return text.lines().map(str::to_owned).collect();
+/// How long the harness waits for a fake binary to record a file. A
+/// spawned shell can be slow on a box under full load; this window is
+/// patience, not a product latency claim.
+const SPAWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// Poll `path` until `done` accepts its text, within `SPAWN_WINDOW`.
+async fn await_text_where(path: &Path, done: impl Fn(&str) -> bool) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + SPAWN_WINDOW;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && done(&text)
+        {
+            return Some(text);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the fake binary never recorded its argv");
+    None
+}
+
+async fn await_text(path: &Path) -> Option<String> {
+    await_text_where(path, |text| !text.is_empty()).await
+}
+
+async fn await_args(path: &Path) -> Vec<String> {
+    await_text(path)
+        .await
+        .expect("the fake binary never recorded its argv")
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn fake_bin() -> PathBuf {
@@ -333,20 +355,10 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
     let lease = hold.hold("hall-high");
 
     let args_path = dir.join("ffmpeg.args");
-    // The window clears the spawn with slack: a first spawn under load can
-    // be slow, and the hold's retry (5s doubling per failure) is what then
-    // writes the args.
-    let mut args = String::new();
-    for _ in 0..600 {
-        if let Ok(text) = std::fs::read_to_string(&args_path)
-            && !text.is_empty()
-        {
-            args = text;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let args: Vec<&str> = args.lines().collect();
+    let args_text = await_text(&args_path)
+        .await
+        .expect("the stand-in recorded its args");
+    let args: Vec<&str> = args_text.lines().collect();
     let target = args.iter().position(|a| *a == "-i").map(|i| args[i + 1]);
     assert_eq!(
         target,
@@ -355,17 +367,9 @@ async fn the_ffmpeg_hold_targets_the_loopback_stream_and_release_kills_it() {
     );
 
     let pid_path = dir.join("ffmpeg.pid");
-    let mut pid = String::new();
-    for _ in 0..100 {
-        if let Ok(text) = std::fs::read_to_string(&pid_path)
-            && !text.is_empty()
-        {
-            pid = text;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(!pid.is_empty(), "the stand-in recorded its pid");
+    let pid = await_text(&pid_path)
+        .await
+        .expect("the stand-in recorded its pid");
 
     // The attach flag: true once the child outlives its startup (the
     // subtraction counts registered consumers, not spawned processes),
@@ -465,18 +469,11 @@ async fn the_ffmpeg_hold_restarts_after_the_child_dies() {
 
     let runs_path = dir.join("runs.log");
     // Two runs means the retry landed: the first respawn waits the base
-    // doubled once (5s -> 10s), so the window clears it with wide slack
+    // doubled once (5s -> 10s), so SPAWN_WINDOW clears it with wide slack
     // under load.
-    let mut restarted = false;
-    for _ in 0..1200 {
-        if let Ok(text) = std::fs::read_to_string(&runs_path)
-            && text.len() >= 2
-        {
-            restarted = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let restarted = await_text_where(&runs_path, |text| text.len() >= 2)
+        .await
+        .is_some();
     assert!(
         restarted,
         "the hold re-runs its ffmpeg after the child exits: {:?}",
