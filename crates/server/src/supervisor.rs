@@ -21,7 +21,7 @@ use qubo::{Device, Quality, QuboClient, SessionStore, list_devices, mint_live, m
 use serde_json::Value;
 use tokio::sync::{Notify, RwLock};
 
-use crate::go2rtc::{Go2rtc, live_source, low_source};
+use crate::go2rtc::{Go2rtc, Go2rtcError, live_source, low_source};
 
 /// A consumer narar keeps on its own stream, so go2rtc's producer stays
 /// warm for every viewer: a client that connects finds a picture already
@@ -298,12 +298,14 @@ impl Stall {
     /// The producer answered: yield how long the run starved and how many
     /// attempts it took.
     fn close(&mut self) -> Option<(Duration, u32)> {
+        // The run's reason dies with the run, open or not: a refusal
+        // before the run must not be replayed into it.
+        self.mint_error = None;
         let since = self.since.take()?;
         let out = (since.elapsed(), self.attempts);
         self.reported = false;
         self.attempts = 0;
         self.wait = Duration::ZERO;
-        self.mint_error = None;
         Some(out)
     }
 }
@@ -390,6 +392,10 @@ pub struct Supervisor {
     /// only sighting that survives a failed attach, which go2rtc's API
     /// does not trace at all.
     touches: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The high streams whose source was dropped as stale: their chain
+    /// has nothing to ride until a mint succeeds, so the low must not be
+    /// re-asserted in the meantime.
+    dropped: Arc<Mutex<HashSet<String>>>,
     /// The hold narar keeps on its own streams, when one is configured.
     hold: Option<Arc<dyn StreamHold>>,
     /// Set when a login or a boot wants the house warmed; the first
@@ -456,6 +462,7 @@ impl Supervisor {
             needs_login: Arc::new(AtomicBool::new(false)),
             last_discovery: Arc::new(Mutex::new(None)),
             touches: Arc::new(Mutex::new(HashMap::new())),
+            dropped: Arc::new(Mutex::new(HashSet::new())),
             hold: None,
             holds: Arc::new(Mutex::new(HashMap::new())),
             warm_wanted: Arc::new(AtomicBool::new(false)),
@@ -509,6 +516,19 @@ impl Supervisor {
         last_mint.elapsed() >= self.pacing.mint_settle
     }
 
+    /// Start the tile chain's hold once there is a chain to hold: born on
+    /// the first ask, never while the high is dropped.
+    async fn tile_hold(&self, high: &str) -> Option<HeldStream> {
+        if self.is_dropped(high) {
+            return None;
+        }
+        let low = low_name_of(high)?;
+        if !self.state.read().await.contains_key(&low) {
+            return None;
+        }
+        self.start_hold(&low)
+    }
+
     fn start_hold(&self, name: &str) -> Option<HeldStream> {
         let hold = self.hold.as_ref()?;
         let lease = hold.hold(name);
@@ -546,6 +566,32 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name, Instant::now());
+    }
+
+    /// Mark a stream's source dropped as stale: its chain must not be
+    /// re-asserted until a mint succeeds.
+    fn mark_dropped(&self, name: &str) {
+        self.dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned());
+    }
+
+    /// Whether the stream's source is dropped with no mint since: the
+    /// name names a source that does not exist in go2rtc.
+    fn is_dropped(&self, name: &str) -> bool {
+        self.dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    }
+
+    /// A successful mint replaced the source: its chain may ride again.
+    fn mark_minted(&self, name: &str) {
+        self.dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     /// Enable the fast lane: cameras in `prefer` try it before the cloud
@@ -909,6 +955,7 @@ impl Supervisor {
         device_id: &str,
         retry: bool,
     ) -> Result<StreamState, SupervisorError> {
+        let high = stream_name(device_id, Quality::High);
         let high_state = self.ensure_high(device_id, retry).await?;
         let name = stream_name(device_id, Quality::Low);
         let fresh = {
@@ -920,13 +967,15 @@ impl Supervisor {
                 .last_request = Instant::now();
             fresh
         };
-        // The chain lands with the first ask, not with the loop's next
-        // wake: the loop may be minutes into a re-mint cadence, and a tile
-        // nobody will look at until then is a tile that never starts. A
-        // re-ask re-asserts it too, which is what heals a chain go2rtc
-        // refused while it was down.
-        if fresh || retry {
-            let high = stream_name(device_id, Quality::High);
+        // A dropped high has nothing for the chain to ride: a fresh tile
+        // or a Try again must not put the low back on a source that no
+        // longer exists. The next successful mint rebuilds it.
+        if self.is_dropped(&high) {
+            self.settle(&name, high_state).await;
+        } else if fresh || retry {
+            // The chain is asserted on the ask, not on the loop's next
+            // slice: a tile must not wait out a cadence, and a re-assert
+            // is what re-arms a chain go2rtc lost.
             match self.swap_source(&name, &low_source(&high)).await {
                 Ok(()) => self.settle(&name, high_state).await,
                 Err(err) => {
@@ -1127,11 +1176,8 @@ impl Supervisor {
                 // The tile chain is held warm like the high - born on the
                 // first ask, kept afterwards: a tab must never wait out its
                 // chain's spawn (measured through the hub: 30s cold).
-                if held_low.is_none()
-                    && let Some(low) = low_name_of(&name)
-                    && self.state.read().await.contains_key(&low)
-                {
-                    held_low = self.start_hold(&low);
+                if held_low.is_none() {
+                    held_low = self.tile_hold(&name).await;
                 }
                 if self.hold_witness(&name, &mut seen_hold_death, last_mint) {
                     tracing::info!(
@@ -1199,6 +1245,8 @@ impl Supervisor {
                     if held.is_none() {
                         held = self.start_hold(&name);
                     }
+                    // The mint replaced the source: the chain may ride again.
+                    self.mark_minted(&name);
                     self.reconcile_low(&name).await;
                     if stall.since.is_none() {
                         // A recovered stream starts its backoff over: the
@@ -1469,6 +1517,13 @@ impl Supervisor {
         if !self.state.read().await.contains_key(&low) {
             return;
         }
+        // A dropped high has nothing for the chain to ride: re-asserting
+        // the low would dial a source that no longer exists and rewrite
+        // go2rtc's config on every slice. The next successful mint lifts
+        // the mark and rebuilds the chain.
+        if self.is_dropped(high) {
+            return;
+        }
         // Re-asserted only when go2rtc has lost it: every PUT rewrites
         // go2rtc's whole config on disk, and a healthy chain needs none of
         // that on a per-slice heartbeat. An entry that merely exists is
@@ -1577,8 +1632,10 @@ impl Supervisor {
         if failure.stale_source {
             // The device is offline in the cloud: neither the high's URL
             // nor the low chain that dials it can serve. Dropping both
-            // stops go2rtc dialling a dead source; reconcile_low rebuilds
-            // the low on the next successful mint.
+            // stops go2rtc dialling a dead source; the mark keeps
+            // reconcile_low and a tile's retry from rebuilding the chain
+            // until a mint succeeds.
+            self.mark_dropped(name);
             self.drop_source(name).await;
             if let Some(low) = low_name_of(name) {
                 self.drop_source(&low).await;
@@ -1589,11 +1646,16 @@ impl Supervisor {
         reason
     }
 
-    /// Drop a stream's source; an absent entry's delete finds nothing and
-    /// is not an error.
+    /// Drop a stream's source; an entry that is already gone is not a
+    /// failure.
     async fn drop_source(&self, name: &str) {
-        if let Err(err) = self.go2rtc.delete_stream(name).await {
-            tracing::debug!(stream = %name, %err, "the stale source could not be dropped");
+        match self.go2rtc.delete_stream(name).await {
+            // An entry that is already gone is not a failure: the
+            // predecessor was reaped by a swap.
+            Ok(()) | Err(Go2rtcError::Rejected { status: 404, .. }) => {}
+            Err(err) => {
+                tracing::warn!(stream = %name, %err, "the stale source could not be dropped");
+            }
         }
     }
 
