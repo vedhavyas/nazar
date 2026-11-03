@@ -323,8 +323,8 @@ pub struct FakeApi {
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
-    /// Every streams-admin operation in arrival order, `put:<name>` and
-    /// `delete:<name>`: the order tests otherwise cannot see.
+    /// Every streams-admin operation in the order it landed, `put:<name>`
+    /// and `delete:<name>`: the order tests otherwise cannot see.
     ops: Arc<Mutex<Vec<String>>>,
     /// The next DELETE of a stream held at the fake's door: it arrives but
     /// does not land until the test releases it.
@@ -452,8 +452,9 @@ impl FakeApi {
         self.ops.lock().unwrap().clone()
     }
 
-    /// Hold the next DELETE of `name` at the fake's door: the test learns
-    /// when it arrives and decides when it lands.
+    /// Arm the next DELETE of `name` at the fake's door: the test learns
+    /// when it arrives and decides when it lands. A second call replaces
+    /// the first; a DELETE of another stream passes through.
     pub fn hold_delete(&self, name: &str) -> DeleteHold {
         let hold = DeleteHold {
             arrived: Arc::new(Semaphore::new(0)),
@@ -470,13 +471,13 @@ impl FakeApi {
         hold
     }
 
-    /// Whether the fake currently holds a stream by this name.
+    /// Whether the fake currently lists a stream entry by this name.
     pub fn has_stream(&self, name: &str) -> bool {
         self.taken
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .any(|(held, _)| held == name)
+            .any(|(listed, _)| listed == name)
     }
 
     /// Report every stream without a producer, as a go2rtc whose sources
@@ -843,9 +844,9 @@ fn streams_methods(
                 // Held at the door before it lands, so a test can order a
                 // swap's DELETE against operations that would race it.
                 hold_at_door(&gate, &src).await;
-                // Recorded on arrival, not on answer: a slow DELETE is
-                // still an operation that happened when it was sent, and
-                // the op order is what some tests read.
+                // Recorded when the request lands, not when it answers: a
+                // DELETE slowed by `delete_delay` still happened when it was
+                // sent, and the op order is what some tests read.
                 dropped.lock().unwrap().push(src.clone());
                 ops.lock().unwrap().push(format!("delete:{src}"));
                 // A real go2rtc drops the entry: the streams view must no

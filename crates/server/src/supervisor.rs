@@ -992,7 +992,7 @@ impl Supervisor {
                     // The loop can drop the high while this PUT is in
                     // flight: what just landed dials a source that is gone.
                     // Pinned by
-                    // a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped.
+                    // an_ask_put_landing_after_the_offline_drop_drops_the_low_chain.
                     if self.is_dropped(&high) {
                         self.drop_source(&name).await;
                     }

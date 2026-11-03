@@ -1662,9 +1662,10 @@ async fn an_offline_drop_removes_the_low_chain() {
 /// The ask's pre-check and the loop's offline drop are separate decisions:
 /// a PUT that passed the pre-check can still land after the drop. The fake
 /// holds the ask's DELETE at its door, so the drop is ordered ahead of the
-/// PUT the ask sends next, and the guard must take the chain down.
+/// PUT the ask sends next; the ask then answers Ok, and the guard must
+/// leave the low chain dropped.
 #[tokio::test]
-async fn a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped() {
+async fn an_ask_put_landing_after_the_offline_drop_drops_the_low_chain() {
     let h = harness(pacing(Duration::from_secs(30))).await;
     mount_discovery(&h.qubo).await;
     h.supervisor.refresh_devices().await.expect("discovery");
@@ -1678,8 +1679,8 @@ async fn a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped() {
     .with_priority(2)
     .mount(&h.qubo)
     .await;
-    // Every attempt after it waits, so the loop is past its drop and
-    // cannot outrun the ask's own delete with another one.
+    // Every attempt after it waits, so the loop cannot issue another
+    // delete while the ask's own delete is released and its PUT lands.
     Mock::given(method("POST"))
         .and(path(MINT_PATH))
         .respond_with(
@@ -1740,6 +1741,11 @@ async fn a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped() {
         h.go2rtc.ops()
     );
 
+    assert!(
+        !ask.is_finished(),
+        "the ask is still blocked on the held DELETE when the drop lands"
+    );
+
     // The ask's DELETE lands, and the PUT it sends next lands on the
     // dropped high.
     gate.release();
@@ -1748,10 +1754,12 @@ async fn a_tile_ask_whose_put_lands_after_the_offline_drop_is_dropped() {
         .expect("the ask answers");
 
     let ops = h.go2rtc.ops();
+    let low_ops: Vec<&String> = ops.iter().filter(|op| op.ends_with(&low)).collect();
+    let last_two: Vec<&String> = low_ops.iter().rev().take(2).copied().collect();
     assert_eq!(
-        last_op(&ops, &low),
-        Some(format!("delete:{low}")),
-        "the ask's late PUT is dropped once the high is gone: {ops:?}"
+        last_two,
+        vec![&format!("delete:{low}"), &format!("put:{low}")],
+        "the guard's delete follows the ask's PUT, not its DELETE: {ops:?}"
     );
     assert!(
         !h.go2rtc.has_stream(&low),
