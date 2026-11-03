@@ -91,7 +91,7 @@
       streams = { ...streams, [id]: started.stream };
       qualities = { ...qualities, [id]: quality };
       cameras = cameras.map((camera) =>
-        camera.id === id ? { ...camera, state: 'waking', reason: null } : camera,
+        camera.id === id ? { ...camera, state: 'waking', reason: null, details: null } : camera,
       );
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
