@@ -19,6 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
 use crate::config::Config;
+use crate::redact::redact_credentials;
 use crate::supervisor::{HoldLease, StreamHold};
 
 /// Where the generated config puts go2rtc's API.
@@ -150,6 +151,7 @@ impl Go2rtc {
             spawn_child(&cfg.go2rtc_bin, path)
         })
         .map_err(SpawnFailure::into_error)?;
+        attach_logs(&mut child);
         let deadline = Instant::now() + START_GRACE;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -336,14 +338,68 @@ fn delay_after_exit(delay: Duration, ran: Duration) -> Duration {
 
 /// Spawn one go2rtc child against the generated config. The child is
 /// killed on drop, so a handle that goes away never orphans a process.
+/// Its output is piped rather than inherited: go2rtc logs the ffmpeg
+/// source, and on a failed attach that source is the minted URL.
 fn spawn_child(bin: &Path, config_path: &Path) -> Result<Child, Go2rtcError> {
     Ok(Command::new(bin)
         .arg("--config")
         .arg(config_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?)
+}
+
+/// Re-emit a spawned child's output through tracing, one line at a time.
+fn attach_logs(child: &mut Child) {
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(relay_lines(stdout, "stdout"));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(relay_lines(stderr, "stderr"));
+    }
+}
+
+/// Drain one pipe to EOF, emitting each line with its credentials masked.
+/// A line with no newline cannot grow without bound: past the cap it is
+/// emitted as it stands.
+async fn relay_lines<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, source: &'static str) {
+    use tokio::io::AsyncReadExt as _;
+    const LINE_CAP: usize = 8192;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(newline) = pending.iter().position(|&byte| byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=newline).collect();
+                    emit_line(&line, source);
+                }
+                if pending.len() > LINE_CAP {
+                    emit_line(&pending, source);
+                    pending.clear();
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        emit_line(&pending, source);
+    }
+}
+
+/// One output line, trimmed and masked, or `None` when it is blank.
+fn redacted_line(line: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(line);
+    let text = text.trim();
+    (!text.is_empty()).then(|| redact_credentials(text))
+}
+
+fn emit_line(line: &[u8], source: &'static str) {
+    if let Some(line) = redacted_line(line) {
+        tracing::info!(source, line = %line, "go2rtc log");
+    }
 }
 
 /// Why a spawn did not happen: the config write failed first, or the spawn
@@ -431,7 +487,8 @@ async fn supervise(
             }
             delay = next_respawn_delay(delay);
             match spawn_with_config(&config_path, &yaml, |path| spawn_child(&bin, path)) {
-                Ok(next) => {
+                Ok(mut next) => {
+                    attach_logs(&mut next);
                     tracing::info!(
                         bin = %bin.display(),
                         config = %config_path.display(),
@@ -713,7 +770,7 @@ impl StreamHold for FfmpegHold {
                                 ran_for = ?started.elapsed(),
                                 ?status,
                                 failures,
-                                reason = %snippet(&reason),
+                                reason = %snippet(&redact_credentials(&reason)),
                                 "the hold consumer exited"
                             );
                         }
@@ -768,6 +825,20 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    /// go2rtc logs the ffmpeg source on a failed attach; the relay must
+    /// mask it before the line reaches the log.
+    #[test]
+    fn a_go2rtc_line_is_masked_before_it_is_logged() {
+        let line = b"error: failed source src=rtsps://w.ex/c?wowzaToken%3Dsek&sessionId=sid\n";
+        assert_eq!(
+            redacted_line(line).as_deref(),
+            Some(
+                "error: failed source src=rtsps://w.ex/c?wowzaToken%3D<redacted>&sessionId=<redacted>"
+            )
+        );
+        assert_eq!(redacted_line(b" \n"), None, "a blank line is not emitted");
+    }
 
     #[test]
     fn the_hold_backoff_doubles_from_five_and_caps_at_a_minute() {
