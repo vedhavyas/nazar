@@ -25,6 +25,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   localStorage.clear();
+  // The player's vendored script lands in <head>, which cleanup does not
+  // empty.
+  for (const script of document.querySelectorAll('script[src="/hls.min.js"]')) {
+    script.remove();
+  }
 });
 
 function json(body: unknown): Response {
@@ -188,9 +193,10 @@ test('a waking stream shows a spinner, and a degraded one its reason', async () 
 
   // Past the player's own start window, and the fallback cannot take the
   // picture: that failure is the stall that used to replace this note.
+  const before = document.querySelectorAll('script[src="/hls.min.js"]').length;
   await vi.advanceTimersByTimeAsync(20000);
   const scripts = document.querySelectorAll('script[src="/hls.min.js"]');
-  expect(scripts.length, 'the fallback was attempted').toBeGreaterThan(0);
+  expect(scripts.length, 'a fresh attempt fetched the fallback').toBeGreaterThan(before);
   scripts.item(scripts.length - 1)?.dispatchEvent(new Event('error'));
   await vi.advanceTimersByTimeAsync(50);
 
