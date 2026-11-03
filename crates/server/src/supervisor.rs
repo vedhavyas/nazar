@@ -578,8 +578,8 @@ impl Supervisor {
             .insert(name.to_owned());
     }
 
-    /// Whether the stream's source is dropped with no mint since: the
-    /// name names a source that does not exist in go2rtc.
+    /// Whether the stream's source was dropped as stale with no mint
+    /// since: its chain must not ride until a mint replaces it.
     fn is_dropped(&self, name: &str) -> bool {
         self.dropped
             .lock()
@@ -957,7 +957,7 @@ impl Supervisor {
         retry: bool,
     ) -> Result<StreamState, SupervisorError> {
         let high = stream_name(device_id, Quality::High);
-        let high_state = self.ensure_high(device_id, retry).await?;
+        self.ensure_high(device_id, retry).await?;
         let name = stream_name(device_id, Quality::Low);
         let fresh = {
             let mut state = self.state.write().await;
@@ -972,7 +972,7 @@ impl Supervisor {
         // or a Try again must not put the low back on a source that no
         // longer exists. The next successful mint rebuilds it.
         if self.is_dropped(&high) {
-            self.settle(&name, high_state).await;
+            self.settle(&name, self.status_for_name(&high).await).await;
         } else if fresh || retry {
             // The chain is asserted on the ask, not on the loop's next
             // slice: a tile must not wait out a cadence, and a re-assert
@@ -981,6 +981,8 @@ impl Supervisor {
                 Ok(()) => {
                     // The loop can drop the high while this PUT is in
                     // flight: what just landed dials a source that is gone.
+                    // Unpinned: the fake's shared DELETE delay cannot order
+                    // the loop's drop ahead of this PUT.
                     if self.is_dropped(&high) {
                         self.drop_source(&name).await;
                     }
@@ -1648,8 +1650,8 @@ impl Supervisor {
     }
 
     /// A refused mint: report it, and drop the source when the cloud says
-    /// the device is offline (the URL we hold cannot serve until it is
-    /// back, and leaving it has go2rtc dialling a dead source). Returns
+    /// the device is offline (the URL the stream holds cannot serve until
+    /// it is back, and leaving it has go2rtc dialling a dead source). Returns
     /// the refusal's reason; only an open run carries it.
     async fn settle_mint_failure(&self, name: &str, failure: MintFailure) -> String {
         tracing::warn!(

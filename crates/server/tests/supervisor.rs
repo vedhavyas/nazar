@@ -1513,7 +1513,7 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
-/// A device the cloud reports offline can never serve the URL we hold:
+/// A device the cloud reports offline can never serve the URL the stream holds:
 /// the stale source is dropped, and the cloud's reason is what the tile
 /// keeps saying instead of the generic producer line.
 #[tokio::test]
@@ -2024,6 +2024,176 @@ async fn a_refusal_outside_a_run_is_not_replayed_into_the_next_one() {
     })
     .await;
     assert!(refreshed, "the next refusal refreshes the reason");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// A refusal that lands outside a run - producer down, nobody watching -
+/// must not be carried as the next run's reason: that run's own window
+/// says the producer has not connected.
+#[tokio::test]
+async fn a_refusal_before_a_run_is_not_carried_into_it() {
+    let h = harness(Pacing {
+        remint: Duration::from_millis(300),
+        retry_base: Duration::from_millis(1500),
+        retry_max: Duration::from_secs(5),
+        mint_settle: Duration::from_millis(60),
+        connect_grace: Duration::from_millis(60),
+        connect_window: Duration::from_millis(250),
+        liveness_poll: Duration::from_millis(25),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let name = stream_name(DEVICE_ID, Quality::High);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    h.go2rtc.disconnect_producer(&name);
+
+    // The cadence re-mint is refused while nobody is on the stream and
+    // the producer is down: no run is open to own the reason.
+    let refused = common::eventually(|| async {
+        mint_count(&h.qubo).await >= 2
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refused, "a cadence re-mint is refused with no run open");
+    assert!(
+        !h.go2rtc.stream_view(&name).1,
+        "the producer is down and unwatched: no run can be open"
+    );
+
+    // A viewer arrives: the run opens, and its window lands before the
+    // next attempt's backoff does.
+    h.go2rtc.set_viewers(&name, 1);
+    let waking = common::eventually(|| async {
+        h.supervisor.status_for(DEVICE_ID, Quality::High).await == StreamState::Waking
+    })
+    .await;
+    assert!(waking, "the viewer's run opens and reads waking");
+    let degraded = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(degraded, "the run's window lands");
+    let mints_at_window = mint_count(&h.qubo).await;
+    match h.supervisor.status_for(DEVICE_ID, Quality::High).await {
+        StreamState::Degraded { reason } => assert_eq!(
+            reason, "the producer has not connected",
+            "a refusal from before the run is not carried into it"
+        ),
+        other => panic!("expected the run's own reason, got {other:?}"),
+    }
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            mint_count(&h.qubo).await,
+            mints_at_window,
+            "no attempt lands inside the sample window"
+        );
+        assert_eq!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded {
+                reason: "the producer has not connected".to_owned()
+            },
+            "the run's own reason stands across the window"
+        );
+    }
+    let refreshed = common::eventually(|| async {
+        mint_count(&h.qubo).await > mints_at_window
+            && matches!(
+                h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refreshed, "the next refusal lands as the run's own reason");
+    let _ = std::fs::remove_file(&h.sessions_path);
+}
+
+/// The tile's hold is released by a stale drop, not by a refused mint: a
+/// transient 5xx keeps both the source and the hold.
+#[tokio::test]
+async fn a_transient_refusal_keeps_the_tile_hold() {
+    let mut h = harness(Pacing {
+        remint: Duration::from_millis(300),
+        ..pacing(Duration::from_secs(30))
+    })
+    .await;
+    h.supervisor =
+        h.supervisor
+            .clone()
+            .with_hold(std::sync::Arc::new(common::FakeHold::attaching(
+                h.go2rtc.clone(),
+            )));
+    mount_discovery(&h.qubo).await;
+    h.supervisor.refresh_devices().await.expect("discovery");
+    mount_mint_ladder(&h.qubo, &["one"]).await;
+    mint_mock(500, "").mount(&h.qubo).await;
+    let high = stream_name(DEVICE_ID, Quality::High);
+    let low = stream_name(DEVICE_ID, Quality::Low);
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let warm = common::eventually(|| async {
+        h.go2rtc.stream_view(&high).1 && h.go2rtc.stream_view(&low).0 >= 1
+    })
+    .await;
+    assert!(
+        warm,
+        "the chain is open and held first: {:?} {:?}",
+        h.go2rtc.stream_view(&high),
+        h.go2rtc.stream_view(&low)
+    );
+
+    // A cadence re-mint is refused: transient, so neither source goes.
+    let refused = common::eventually(|| async {
+        mint_count(&h.qubo).await >= 2
+            && matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason }
+                    if reason == "http error: 500 Internal Server Error"
+            )
+    })
+    .await;
+    assert!(refused, "a cadence re-mint was refused");
+
+    // Sampled over the loop's next slices: a transient refusal keeps the
+    // high's hold and the tile's.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            h.go2rtc.stream_view(&high).0 >= 1,
+            "a transient refusal keeps the high's hold: {:?}",
+            h.go2rtc.stream_view(&high)
+        );
+        assert!(
+            h.go2rtc.stream_view(&low).0 >= 1,
+            "a transient refusal keeps the tile's hold: {:?}",
+            h.go2rtc.stream_view(&low)
+        );
+    }
+    let ops = h.go2rtc.ops();
+    assert_eq!(
+        last_op(&ops, &low),
+        Some(format!("put:{low}")),
+        "a transient refusal never drops the chain: {ops:?}"
+    );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
 
