@@ -3,10 +3,16 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import Home from './Home.svelte';
+
+// The real tile never renders a camera's detail, so the Home tests read
+// the props it is handed through a stand-in.
+vi.mock('../lib/CameraTile.svelte', async () => ({
+  default: (await import('../lib/CameraTileStub.svelte')).default,
+}));
 
 afterEach(() => {
   cleanup();
@@ -119,4 +125,52 @@ test('a settled camera is not re-asked', async () => {
     asked(calls),
     'a live stream of the right class is left alone',
   ).toEqual([]);
+});
+
+test('a retile drops the stale reason and detail', async () => {
+  vi.useFakeTimers();
+  const detail =
+    'go2rtc api: error sending request for url (http://127.0.0.1:1984/api/streams?<redacted>)';
+  let hang = false;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (url === '/api/cameras') {
+        if (hang) return new Promise<Response>(() => {});
+        return json({
+          cameras: [
+            {
+              id: 'hall',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'stream engine unavailable',
+              details: detail,
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (url === '/api/motion/hero') {
+        return json({ hero: null });
+      }
+      return json({ stream: 'hall-low' });
+    }),
+  );
+
+  render(Home, { onlocked: vi.fn(), onopen: vi.fn() });
+  // The first watch marks the camera waking; the next poll restores the
+  // server's degraded answer.
+  await vi.advanceTimersByTimeAsync(3500);
+  const shown = () => JSON.parse(screen.getByTestId('camera').textContent ?? '{}');
+  expect(shown().details, 'the tile carries the server detail').toBe(detail);
+
+  // The poll after the retile never answers, so the tile's own state is
+  // what remains on screen.
+  hang = true;
+  screen.getByText('retile').click();
+  await vi.advanceTimersByTimeAsync(100);
+
+  expect(shown().state, 'the retile asks for a fresh stream').toBe('waking');
+  expect(shown().reason, 'and drops the old reason').toBe(null);
+  expect(shown().details, 'and the detail with it').toBe(null);
 });
