@@ -12,8 +12,10 @@ test-scripts:
 fmt-check:
     cargo fmt --all -- --check
 
-# Lint the workspace with clippy, warnings denied.
-lint:
+# Lint the workspace with clippy, warnings denied. The SPA is a prerequisite:
+# the server embeds web/dist, and clippy fails to compile without it on a
+# clean checkout.
+lint: build-web
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Run every test suite; builds the SPA first, since the server embeds it.

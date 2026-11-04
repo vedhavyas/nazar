@@ -7,6 +7,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { ApiError, api } from './api';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
   // The base resolves at import time, so each address test re-imports.
@@ -50,6 +51,31 @@ test('a failed call without the envelope falls back to the status line', async (
   )) as ApiError;
 
   expect(failure.message, 'a non-envelope body still yields a reason').toContain('502');
+});
+
+test('a hung call is abandoned at its timeout', async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          );
+        }),
+    ),
+  );
+
+  const failure = api.cameras().then(
+    () => null,
+    (error: unknown) => error,
+  );
+  await vi.advanceTimersByTimeAsync(15_000);
+
+  const error = (await failure) as Error;
+  expect(error, 'the call does not hang forever').toBeInstanceOf(Error);
+  expect(error.message, 'and says what happened').toBe('the server did not answer in time');
 });
 
 test('every call sends the documented shape', async () => {

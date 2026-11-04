@@ -223,6 +223,146 @@ test('a waking tile keeps its player mounted and shows a spinner', () => {
   ).toBeTruthy();
 });
 
+test('a waking tile whose picture plays reads Live, not Starting', async () => {
+  vi.useFakeTimers();
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'waking', reason: null },
+    stream: 'cam-1-low',
+    onwatch,
+  });
+
+  const video = document.querySelector('video') as HTMLVideoElement;
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+
+  expect(
+    screen.getByText('Live'),
+    'the picture is the truth about what the person sees',
+  ).toBeTruthy();
+  expect(screen.queryByText('Starting'), 'no Starting over a playing picture').toBeNull();
+  expect(document.querySelector('.spinner'), 'and no spinner over it').toBeNull();
+});
+
+test('a picture that arrives late clears the failure note', async () => {
+  vi.useFakeTimers();
+  liveTile();
+
+  await vi.advanceTimersByTimeAsync(20_100);
+  expect(screen.getByText(/did not start/), 'the miss is named').toBeTruthy();
+
+  // The auto-rebuild remounts the player; the new one paints.
+  await vi.advanceTimersByTimeAsync(1_100);
+  const video = await videoOf();
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+
+  expect(
+    screen.queryByText(/did not start/),
+    'the note goes with the failure a late picture ended',
+  ).toBeNull();
+});
+
+test('a new stream over a frame that painted starts again', async () => {
+  vi.useFakeTimers();
+  const onwatch = vi.fn();
+  const camera = { id: 'cam-1', name: 'Hall', state: 'waking' as const, reason: null };
+  const { rerender } = render(CameraTile, {
+    camera,
+    stream: 'cam-1-low',
+    onwatch,
+  });
+
+  const video = document.querySelector('video') as HTMLVideoElement;
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+  expect(screen.getByText('Live'), 'the playing picture is the truth').toBeTruthy();
+  expect(document.querySelector('.spinner'), 'and no spinner over it').toBeNull();
+
+  await rerender({ camera, stream: 'cam-1-high', onwatch });
+  await tick();
+
+  expect(
+    screen.getByText('Starting'),
+    'the new stream has no picture yet, so the latency latch cannot carry over',
+  ).toBeTruthy();
+  expect(document.querySelector('.spinner'), 'and the spinner is back').toBeTruthy();
+});
+
+test('a re-keyed player that paints before the next tick reads Live', async () => {
+  vi.useFakeTimers();
+  const onwatch = vi.fn();
+  const camera = { id: 'cam-1', name: 'Hall', state: 'waking' as const, reason: null };
+  const { rerender } = render(CameraTile, {
+    camera,
+    stream: 'cam-1-low',
+    onwatch,
+  });
+
+  const first = document.querySelector('video') as HTMLVideoElement;
+  Object.defineProperty(first, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+  expect(screen.getByText('Live'), 'the first picture paints').toBeTruthy();
+
+  // A new stream re-keys the player, and the fresh picture paints before
+  // the watch's next 2.5s tick.
+  await rerender({ camera, stream: 'cam-1-high', onwatch });
+  const second = document.querySelector('video') as HTMLVideoElement;
+  Object.defineProperty(second, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+
+  expect(
+    screen.getByText('Live'),
+    'a fast repaint is reported instead of Starting forever',
+  ).toBeTruthy();
+  expect(screen.queryByText('Starting'), 'no Starting over the picture').toBeNull();
+});
+
+test('a recovered tab reports a fresh picture painted before the tick', async () => {
+  vi.useFakeTimers();
+  const onwatch = vi.fn();
+  render(CameraTile, {
+    camera: { id: 'cam-1', name: 'Hall', state: 'waking', reason: null },
+    stream: 'cam-1-low',
+    onwatch,
+  });
+  const video = document.querySelector('video') as HTMLVideoElement;
+  video.dispatchEvent(new Event('playing'));
+  video.currentTime = 4;
+  Object.defineProperty(video, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+  expect(screen.getByText('Live'), 'the picture is up first').toBeTruthy();
+  const firstPlayer = document.querySelector('video-rtc');
+
+  // The tab hides and the peer dies behind it: the clock stops.
+  setHidden(true);
+  await vi.advanceTimersByTimeAsync(60_000);
+  setHidden(false);
+  // The dead peer rebuilds after the grace; the fresh player paints before
+  // the watch's next 2.5s tick.
+  await vi.advanceTimersByTimeAsync(4_100);
+  expect(
+    document.querySelector('video-rtc'),
+    'the dead player was re-keyed',
+  ).not.toBe(firstPlayer);
+  const fresh = document.querySelector('video') as HTMLVideoElement;
+  Object.defineProperty(fresh, 'readyState', { configurable: true, get: () => 4 });
+  await vi.advanceTimersByTimeAsync(2_600);
+  await tick();
+
+  expect(
+    screen.getByText('Live'),
+    'the recovered picture is reported instead of Starting',
+  ).toBeTruthy();
+  expect(screen.queryByText('Starting'), 'no Starting over it').toBeNull();
+});
+
 test('a waking tile does not run the player start window', async () => {
   vi.useFakeTimers();
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('');

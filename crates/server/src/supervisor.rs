@@ -1,6 +1,6 @@
 //! The stream supervisor: one mint-and-swap loop per live camera.
 //!
-//! Stream sessions last about five minutes, so a live stream is re-minted
+//! Stream sessions last about 3.5-4 minutes, so a live stream is re-minted
 //! on a cadence and the account session is re-read from the store on every
 //! mint. Qubo access tokens last about an hour; a stored 180-day refresh
 //! token heals them, spent once per refused call wherever a refusal is
@@ -65,7 +65,9 @@ const WATCH_FLOOR: Duration = Duration::from_millis(50);
 /// How the supervisor paces itself.
 #[derive(Debug, Clone, Copy)]
 pub struct Pacing {
-    /// How often a live stream is re-minted.
+    /// How often a live stream is proactively re-minted. The cloud session
+    /// ends after 215-252s (measured on the hub 2026-11-03..04); minting at
+    /// 180s puts the replacement in place while the old URL still serves.
     pub remint: Duration,
     /// The first retry delay after a failure; doubles up to `retry_max`.
     pub retry_base: Duration,
@@ -118,12 +120,16 @@ pub struct Pacing {
     /// without media: the passes inside the cooldown take the cloud path,
     /// and the lane is retried once it elapses.
     pub lane_cooldown: Duration,
+    /// How long a device whose stream slot is held elsewhere is left alone
+    /// before the next mint. The slot belongs to another session, and no
+    /// ladder below this can change that.
+    pub busy_backoff: Duration,
 }
 
 impl Default for Pacing {
     fn default() -> Self {
         Self {
-            remint: Duration::from_secs(240),
+            remint: Duration::from_secs(180),
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
             mint_settle: Duration::from_secs(60),
@@ -135,6 +141,7 @@ impl Default for Pacing {
             touch_ttl: Duration::from_secs(30),
             arm_timeout: Duration::from_secs(15),
             lane_cooldown: Duration::from_secs(600),
+            busy_backoff: Duration::from_mins(5),
         }
     }
 }
@@ -387,9 +394,17 @@ impl Stall {
     }
 }
 
+/// The gateway's answer when the device's stream slot is already held - by
+/// the Qubo app on a phone, or another session. Measured per camera rather
+/// than per account: the other three mint while this one is refused.
+const BUSY_CODE: &str = "ERR_STM_003";
+/// What the tile says while the slot is held elsewhere.
+pub const BUSY_REASON: &str = "the camera is busy: another player is using its stream";
+
 /// Why a mint did not take. `stale_source` marks the cloud's definitive
 /// "device is offline": the URL the stream holds cannot serve until the
-/// camera is back.
+/// camera is back. `busy` marks a device whose stream slot is held
+/// elsewhere: retrying cannot help until that session ends.
 #[derive(Debug)]
 struct MintFailure {
     reason: String,
@@ -398,6 +413,7 @@ struct MintFailure {
     /// serve.
     signature: String,
     stale_source: bool,
+    busy: bool,
 }
 
 impl MintFailure {
@@ -407,25 +423,32 @@ impl MintFailure {
             reason: scrubbed.clone(),
             signature: scrubbed,
             stale_source: false,
+            busy: false,
         }
     }
 
     /// A refused mint. Anything but the offline code may clear on the next
     /// attempt, so only that one condemns the source.
     fn from_error(err: &qubo::QuboError) -> Self {
-        if matches!(err, qubo::QuboError::Api { code, .. } if code == "ERR_STM_010") {
+        let text = match err {
+            qubo::QuboError::Api { status, .. } => format!("http {status}: {err}"),
+            _ => err.to_string(),
+        };
+        if matches!(err, qubo::QuboError::Api { code, .. } if code == BUSY_CODE) {
+            Self {
+                reason: BUSY_REASON.to_owned(),
+                signature: redact_credentials(&text),
+                stale_source: false,
+                busy: true,
+            }
+        } else if matches!(err, qubo::QuboError::Api { code, .. } if code == "ERR_STM_010") {
             Self {
                 reason: "device offline in the cloud".to_owned(),
                 signature: "device offline in the cloud".to_owned(),
                 stale_source: true,
+                busy: false,
             }
         } else {
-            // The status is part of the failure: a 5xx and a 4xx with the
-            // same envelope read the same without it.
-            let text = match err {
-                qubo::QuboError::Api { status, .. } => format!("http {status}: {err}"),
-                _ => err.to_string(),
-            };
             Self::transient(&text)
         }
     }
@@ -437,6 +460,7 @@ impl From<EngineFailure> for MintFailure {
             reason: failure.reason,
             signature: failure.signature,
             stale_source: false,
+            busy: false,
         }
     }
 }
@@ -604,7 +628,7 @@ impl Supervisor {
     /// A fresh hold-consumer death is the earliest honest witness of a
     /// spent session: go2rtc keeps reporting the producer connected long
     /// after the frames stopped (the hub's death sat invisible ~58s until
-    /// the producer's own read timeout), while the consumer dies with the
+    /// the producer's own start timeout), while the consumer dies with the
     /// frames. A death well into the session's life re-mints at once; a
     /// young one is a swap's own churn and is only recorded.
     fn hold_witness(&self, name: &str, seen: &mut Option<Instant>, last_mint: Instant) -> bool {
@@ -983,7 +1007,15 @@ impl Supervisor {
             let mut state = self.state.write().await;
             if let Some(tracked) = state.get_mut(&name) {
                 tracked.last_request = Instant::now();
-                if retry && matches!(tracked.state, StreamState::Degraded { .. }) {
+                // A retry must not be swallowed while the stream is Waking
+                // or Degraded: the person's Try again is the way out of a
+                // mint that has not landed or has failed.
+                if retry
+                    && matches!(
+                        tracked.state,
+                        StreamState::Degraded { .. } | StreamState::Waking
+                    )
+                {
                     tracked.wake.notify_one();
                 }
                 return Ok(tracked.state.clone());
@@ -1091,7 +1123,7 @@ impl Supervisor {
         // or a Try again must not put the low back on a source that no
         // longer exists. The next successful mint rebuilds it.
         if self.is_dropped(&high) {
-            self.settle(&name, self.status_for_name(&high).await).await;
+            self.settle_from(&high, &name).await;
         } else if fresh || retry {
             // The chain is asserted on the ask, not on the loop's next
             // slice: a tile must not wait out a cadence, and a re-assert
@@ -1112,7 +1144,7 @@ impl Supervisor {
                     if self.is_dropped(&high) {
                         self.drop_source(&name).await;
                     }
-                    self.settle(&name, self.status_for_name(&high).await).await;
+                    self.settle_from(&high, &name).await;
                 }
                 Err(failure) => {
                     let reason = self.report_chain_failure(&name, failure);
@@ -1296,7 +1328,12 @@ impl Supervisor {
         let mut stall = Stall::new();
         let mut last_mint = Instant::now();
         let mut seen_hold_death: Option<Instant> = None;
+        // A device whose stream slot is held elsewhere: no retry before
+        // this instant, and no hold to hot-loop against a stream with no
+        // source.
+        let mut busy_until: Option<Instant> = None;
         loop {
+            self.expire_busy(&name, &mut busy_until, &mut stall).await;
             let now = Instant::now();
             // Waited until the mint is due - sliced, so the producer's
             // health is checked while waiting too, not only when the next
@@ -1311,6 +1348,11 @@ impl Supervisor {
                     true
                 }
             };
+            // The floor can expire during the slice: re-read it before the
+            // wake's decision, so an expired floor never reaches a mint with
+            // its busy state and reason still pinned.
+            self.expire_busy(&name, &mut busy_until, &mut stall).await;
+            let busy = busy_until.is_some();
             // A wake that is not due to mint is only a re-check: the mint
             // waits for its own cadence, or for a person's Try again whose
             // last mint failed - that one skips the backoff. A retry that
@@ -1323,10 +1365,13 @@ impl Supervisor {
                 // The tile chain is held warm like the high - born on the
                 // first ask, kept afterwards: a tab must never wait out its
                 // chain's spawn (measured through the hub: 30s cold).
-                if held_low.is_none() {
+                if held_low.is_none() && !busy {
                     held_low = self.tile_hold(&name).await;
                 }
-                if self.hold_witness(&name, &mut seen_hold_death, last_mint) {
+                // A busy device's holds are released; a death witness there
+                // would pull the next mint onto the failure ladder, which is
+                // exactly the churn the busy floor exists to stop.
+                if !busy && self.hold_witness(&name, &mut seen_hold_death, last_mint) {
                     tracing::info!(
                         stream = %name,
                         "the hold consumer died; re-minting at once"
@@ -1334,22 +1379,10 @@ impl Supervisor {
                     stall.connected = true;
                     next_mint = Instant::now();
                 }
-                match self.stall_response(&name, &mut stall).await {
+                match self.stall_response(&name, &mut stall, busy).await {
                     StallStep::Remint => {
                         failed = true;
-                        // Pulled forward, never pushed back - but never
-                        // onto a mint too young to have connected: the
-                        // camera's push lags, and replacing the URL under
-                        // an in-flight push starves it. A producer proven
-                        // alive needs no settle; a fresh dial gets it, and
-                        // consecutive dials that never connect double it
-                        // (capped), so a stuck push gets ever-longer
-                        // windows instead of a metronome.
-                        let mut due = Instant::now() + stall.wait.max(self.pacing.retry_base);
-                        if !stall.connected {
-                            let shift = stall.mints_unconnected.saturating_sub(1).min(2);
-                            due = due.max(last_mint + self.pacing.mint_settle * (1 << shift));
-                        }
+                        let due = self.stall_deadline(&stall, last_mint, busy_until);
                         next_mint = next_mint.min(due);
                     }
                     StallStep::Closed => {
@@ -1359,7 +1392,10 @@ impl Supervisor {
                         // open.
                         failed = false;
                         wait = Duration::ZERO;
-                        next_mint = Instant::now() + self.pacing.remint;
+                        let next = Instant::now() + self.pacing.remint;
+                        // A closed run is not a reason to mint inside a busy
+                        // floor still standing.
+                        next_mint = busy_until.map_or(next, |until| next.max(until));
                     }
                     StallStep::Idle => {}
                 }
@@ -1374,26 +1410,18 @@ impl Supervisor {
                     "re-minting a starved stream"
                 );
             }
-            next_mint = match self.mint_and_swap(&device, Quality::High).await {
+            // A mint on the plain cadence, with a hold riding, refreshes the
+            // source in place: go2rtc keeps the attached consumer through
+            // the swap. Every other mint tears the stream down first.
+            let refresh = stall.since.is_none() && !failed && held.is_some();
+            next_mint = match self.mint_and_swap(&device, Quality::High, refresh).await {
                 Ok(()) => {
                     failed = false;
-                    stall.mint_error = None;
-                    // The ladder counts fresh mints that never connected;
-                    // a mint that replaced a connected producer starts it
-                    // over (this mint's own connect resets it too, in the
-                    // watch).
-                    stall.mints_unconnected = if stall.connected {
-                        0
-                    } else {
-                        stall.mints_unconnected + 1
-                    };
-                    stall.connected = false;
-                    last_mint = Instant::now();
-                    if held.is_none() {
-                        held = self.start_hold(&name);
-                    }
-                    self.reconcile_low(&name).await;
-                    if stall.since.is_none() {
+                    busy_until = None;
+                    if self
+                        .note_mint_success(&name, &mut stall, &mut last_mint, &mut held)
+                        .await
+                    {
                         // A recovered stream starts its backoff over: the
                         // next failure waits retry_base, not the grown tail
                         // of the storm before it. While a run is open the
@@ -1401,11 +1429,11 @@ impl Supervisor {
                         // not arrived, and the run's own backoff - not this
                         // one - is what paces the next attempt.
                         wait = Duration::ZERO;
-                        self.mark_live(&name).await;
                     }
                     Instant::now() + self.pacing.remint
                 }
                 Err(failure) => {
+                    let busy = failure.busy;
                     self.note_failed_mint(&name, failure, &mut stall, &mut held_low)
                         .await;
                     failed = true;
@@ -1414,13 +1442,110 @@ impl Supervisor {
                     // window, and the reason must not flicker away from the
                     // person's Try again on a blip. Only the mint-failure
                     // backoff restarts.
-                    wait = (wait * 2)
-                        .max(self.pacing.retry_base)
-                        .min(self.pacing.retry_max);
-                    Instant::now() + wait
+                    if busy {
+                        // The device's slot is held elsewhere: release the
+                        // holds (against a stream with no source they only
+                        // die and re-dial) and wait the floor out. A retry -
+                        // the person's, or the tile's own rebuild - skips
+                        // it; the loop's cadence does not.
+                        held = None;
+                        held_low = None;
+                        let until = Instant::now() + self.pacing.busy_backoff;
+                        busy_until = Some(until);
+                        until
+                    } else {
+                        wait = (wait * 2)
+                            .max(self.pacing.retry_base)
+                            .min(self.pacing.retry_max);
+                        // A non-busy failure keeps the busy floor standing.
+                        let next = Instant::now() + wait;
+                        busy_until.map_or(next, |until| next.max(until))
+                    }
                 }
             };
         }
+    }
+
+    /// Clear an elapsed busy floor, the run it kept open, and the tracked
+    /// busy sentence: none of them may outlive the floor.
+    async fn expire_busy(&self, name: &str, busy_until: &mut Option<Instant>, stall: &mut Stall) {
+        if busy_until.is_some_and(|until| Instant::now() >= until) {
+            *busy_until = None;
+            let _ = stall.close();
+            self.clear_busy_state(name).await;
+        }
+    }
+
+    /// Advance a tracked stream off the busy sentence when its floor passes,
+    /// for the high and the tile that mirrors it.
+    async fn clear_busy_state(&self, name: &str) {
+        fn advance(state: &mut StreamState) {
+            if let StreamState::Degraded { reason } = state
+                && reason == BUSY_REASON
+            {
+                *state = StreamState::Waking;
+            }
+        }
+        let mut state = self.state.write().await;
+        if let Some(tracked) = state.get_mut(name) {
+            advance(&mut tracked.state);
+        }
+        if let Some(low) = low_name_of(name)
+            && let Some(tile) = state.get_mut(&low)
+        {
+            advance(&mut tile.state);
+        }
+    }
+
+    /// The next attempt a `Remint` step arms: pulled forward, but never
+    /// onto a mint too young to have connected, and never inside a busy
+    /// device's floor.
+    fn stall_deadline(
+        &self,
+        stall: &Stall,
+        last_mint: Instant,
+        busy_until: Option<Instant>,
+    ) -> Instant {
+        let mut due = Instant::now() + stall.wait.max(self.pacing.retry_base);
+        if !stall.connected {
+            let shift = stall.mints_unconnected.saturating_sub(1).min(2);
+            due = due.max(last_mint + self.pacing.mint_settle * (1 << shift));
+        }
+        if let Some(until) = busy_until {
+            due = due.max(until);
+        }
+        due
+    }
+
+    /// Book a landed mint: reset the ladder, restart a lost hold, reconcile
+    /// the tile chain. Returns whether the stall run closed.
+    async fn note_mint_success(
+        &self,
+        name: &str,
+        stall: &mut Stall,
+        last_mint: &mut Instant,
+        held: &mut Option<HeldStream>,
+    ) -> bool {
+        stall.mint_error = None;
+        // The ladder counts fresh mints that never connected; a mint that
+        // replaced a connected producer starts it over (this mint's own
+        // connect resets it too, in the watch).
+        stall.mints_unconnected = if stall.connected {
+            0
+        } else {
+            stall.mints_unconnected + 1
+        };
+        stall.connected = false;
+        *last_mint = Instant::now();
+        if held.is_none() {
+            *held = self.start_hold(name);
+        }
+        self.reconcile_low(name).await;
+        let closed = stall.since.is_none();
+        if closed {
+            self.mark_live(name).await;
+        }
+        closed
     }
 
     /// One mint, handed straight to go2rtc. The source swaps under the
@@ -1431,17 +1556,29 @@ impl Supervisor {
     /// over its bound, a session that ended, or a lane benched after media
     /// silence - falls back to the cloud mint for that pass, and a benched
     /// lane is retried once its cooldown elapses.
-    async fn mint_and_swap(&self, device: &Device, quality: Quality) -> Result<(), MintFailure> {
+    async fn mint_and_swap(
+        &self,
+        device: &Device,
+        quality: Quality,
+        refresh: bool,
+    ) -> Result<(), MintFailure> {
         let name = stream_name(&device.device_id, quality);
         if let Some(lane) = &self.lane
             && self.prefer_p2p.contains(&device.device_id)
         {
             match self.lane_session(lane, device).await {
                 Ok(session) => match session.source_for(&name) {
-                    Ok(source) => match self.put_and_confirm(&name, &source).await {
-                        Ok(()) => {
+                    Ok(source) => match self.put_and_confirm(&name, &source, refresh).await {
+                        Ok(applied) => {
                             self.mark_minted(&name);
-                            tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
+                            if applied {
+                                tracing::info!(stream = %name, "fast lane armed; feeding go2rtc its decrypted RTP");
+                            } else {
+                                tracing::info!(
+                                    stream = %name,
+                                    "the fast-lane refresh did not take; keeping the serving source"
+                                );
+                            }
                             return Ok(());
                         }
                         Err(failure) => {
@@ -1477,24 +1614,30 @@ impl Supervisor {
             Ok(mint) => mint,
             Err(err) => {
                 self.settle_auth(&err);
-                return Err(MintFailure::from_error(&err));
+                let failure = MintFailure::from_error(&err);
+                if failure.busy && refresh {
+                    // Says whether the cloud counts narar's own hold as the
+                    // session holding the device: a refresh runs before the
+                    // old session would have ended.
+                    tracing::warn!(stream = %name, "a refresh was refused busy while held");
+                }
+                return Err(failure);
             }
         };
-        self.put_and_confirm(&name, &live_source(&mint.url)).await?;
+        self.put_and_confirm(&name, &live_source(&mint.url), refresh)
+            .await?;
         self.needs_login.store(false, Ordering::SeqCst);
         self.mark_minted(&name);
         Ok(())
     }
 
-    /// Hand a fresh source to a stream that may already exist: the old
-    /// entry, and the ffmpeg go2rtc runs for it, is torn down first.
-    /// go2rtc's in-place update leaves the predecessor's process running
-    /// (measured on the hub: whole generations of chains beside the live
-    /// ones, on both the cloud pulls and the loopback re-encodes), and a
-    /// superseded session keeps serving the camera's push, so the old
-    /// ffmpeg never starves out on its own. Every re-PUT in this file goes
-    /// through here; an absent entry's delete finds nothing and is not an
-    /// error.
+    /// Hand a fresh source to a stream that may already exist, tearing the
+    /// old entry down first. Used by the recovery swap and by every mint
+    /// that is not a scheduled refresh; a refresh patches the source in
+    /// place instead (see `put_and_confirm`). A DELETE removes only the map
+    /// entry, so the predecessor's object keeps its consumers, and its
+    /// producer stops when the last of them leaves. An absent entry's
+    /// delete finds nothing and is not an error.
     async fn swap_source(&self, name: &str, source: &str) -> Result<(), EngineFailure> {
         match self.go2rtc.delete_stream(name).await {
             Ok(()) => {}
@@ -1553,8 +1696,38 @@ impl Supervisor {
     /// stays unspent until its first consumer dials it - a viewer, or
     /// narar's own hold, which with a hold configured is the dial that
     /// makes the stream warm.
-    async fn put_and_confirm(&self, name: &str, source: &str) -> Result<(), EngineFailure> {
-        self.swap_source(name, source).await?;
+    async fn put_and_confirm(
+        &self,
+        name: &str,
+        source: &str,
+        refresh: bool,
+    ) -> Result<bool, EngineFailure> {
+        if refresh {
+            // A scheduled refresh patches the existing stream's source:
+            // go2rtc keeps the attached consumers (the hold, a viewer) bound
+            // to the same object, and the running producer reconnects to the
+            // new URL. A PUT would replace the object under the name,
+            // leaving them on the old one and the hold to die at its
+            // session's end.
+            if let Err(err) = self.go2rtc.patch_stream(name, source).await {
+                // A failed patch is not a dead stream: if go2rtc still lists
+                // a connected producer, keep the picture and try the refresh
+                // again on the next cadence rather than forcing a tear-down.
+                if self.stream_connected(name).await {
+                    let EngineFailure { reason, signature } = failure_detail(&err);
+                    tracing::warn!(
+                        stream = %name,
+                        %reason,
+                        cause = %signature,
+                        "the refresh did not take; keeping the serving stream"
+                    );
+                    return Ok(false);
+                }
+                return Err(failure_detail(&err));
+            }
+        } else {
+            self.swap_source(name, source).await?;
+        }
         let held = self
             .go2rtc
             .streams()
@@ -1568,7 +1741,18 @@ impl Supervisor {
                 signature: "go2rtc did not take the stream".to_owned(),
             });
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether go2rtc still lists a connected producer for `name`: the
+    /// serving stream a failed refresh must not degrade.
+    async fn stream_connected(&self, name: &str) -> bool {
+        self.go2rtc
+            .streams()
+            .await
+            .ok()
+            .and_then(|streams| streams.into_iter().find(|stream| stream.name == name))
+            .is_some_and(|stream| stream.connected)
     }
 
     /// What the server can see of the stream's producer right now. A
@@ -1649,7 +1833,7 @@ impl Supervisor {
     /// its window and its reason must still land - and only the producer
     /// connecting closes it; an unreadable or absent producer leaves it
     /// standing.
-    async fn stall_response(&self, name: &str, stall: &mut Stall) -> StallStep {
+    async fn stall_response(&self, name: &str, stall: &mut Stall, busy: bool) -> StallStep {
         match self.watch_producer(name).await {
             ProducerWatch::Up => {
                 stall.connected = true;
@@ -1671,11 +1855,14 @@ impl Supervisor {
                 let Some(since) = stall.since else {
                     return StallStep::Idle;
                 };
-                self.stall_cadence(name, stall, since).await
+                self.stall_cadence(name, stall, since, busy).await
             }
             ProducerWatch::Stalled(started) => {
+                if stall.since.is_none() {
+                    tracing::info!(stream = %name, "a stall run opened");
+                }
                 let since = stall.open(started);
-                self.stall_cadence(name, stall, since).await
+                self.stall_cadence(name, stall, since, busy).await
             }
         }
     }
@@ -1687,8 +1874,25 @@ impl Supervisor {
     /// fresh camera push takes 6-12s (measured 2026-10-16), so the first
     /// attempt is armed no earlier than the grace's end rather than on the
     /// base backoff, which would swap the URL out from under the dial.
-    async fn stall_cadence(&self, name: &str, stall: &mut Stall, since: Instant) -> StallStep {
+    async fn stall_cadence(
+        &self,
+        name: &str,
+        stall: &mut Stall,
+        since: Instant,
+        busy: bool,
+    ) -> StallStep {
         let waiting = since.elapsed();
+        if busy {
+            // The slot is held elsewhere for the whole floor: the tile keeps
+            // the busy sentence and its Try again instead of a Waking window
+            // that can offer neither.
+            let reason = stall
+                .mint_error
+                .clone()
+                .unwrap_or_else(|| BUSY_REASON.to_owned());
+            self.mark_degraded(name, reason).await;
+            return StallStep::Remint;
+        }
         // The grace protects a fresh dial; a producer proven alive this
         // mint died, and its replacement cannot trample anything.
         if !stall.connected && waiting < self.pacing.connect_grace {
@@ -1855,9 +2059,14 @@ impl Supervisor {
         stall: &mut Stall,
         held_low: &mut Option<HeldStream>,
     ) {
+        let busy = failure.busy;
         let dropped = failure.stale_source;
         let reason = self.settle_mint_failure(name, failure).await;
-        if stall.since.is_some() {
+        // A busy refusal is the tile's reason until a mint succeeds, the
+        // run closes, or the floor expires, whether or not a run is open: a
+        // viewer touch can open one later and the stall cadence would
+        // otherwise replace it with the generic producer line.
+        if busy || stall.since.is_some() {
             stall.mint_error = Some(reason);
         }
         if dropped {
@@ -1876,9 +2085,9 @@ impl Supervisor {
             cause = %failure.signature,
             "stream re-mint failed"
         );
-        if failure.stale_source {
-            // The device is offline in the cloud: neither the high's URL
-            // nor the low chain that dials it can serve. Dropping both
+        if failure.stale_source || failure.busy {
+            // Offline or busy: neither the high's URL nor the low chain
+            // that dials it can serve until the slot is free. Dropping both
             // stops go2rtc dialling a dead source; the mark keeps
             // reconcile_low and a tile's retry from rebuilding the chain
             // until a mint succeeds.
@@ -1927,6 +2136,20 @@ impl Supervisor {
         {
             tile.state = StreamState::Degraded { reason };
         }
+    }
+
+    /// Copy the high's state onto the tile under one lock: two reads can
+    /// interleave with a busy failure and leave the low Live over a
+    /// Degraded high.
+    async fn settle_from(&self, high: &str, low: &str) {
+        let mut state = self.state.write().await;
+        let next = state
+            .get(high)
+            .map_or(StreamState::Offline, |tracked| tracked.state.clone());
+        state
+            .entry(low.to_owned())
+            .or_insert_with(new_tracked)
+            .state = next;
     }
 
     /// Set a tracked stream's state to the state of the stream it mirrors.
@@ -2006,6 +2229,36 @@ mod tests {
         assert!(
             pacing.connect_grace < pacing.connect_window,
             "the first attempt waits out a whole slow dial before the window can end it"
+        );
+    }
+
+    /// The refresh must land before the shortest measured cloud session
+    /// ends (215s). Pushing it back to 240s sits inside the measured range
+    /// and brings back the cold gap.
+    #[test]
+    fn the_default_remint_leads_the_measured_cloud_session() {
+        assert!(
+            Pacing::default().remint < Duration::from_secs(215),
+            "the scheduled refresh must beat the cloud session's end"
+        );
+    }
+
+    /// A device-limit refusal is busy: the tile gets a sentence that makes
+    /// sense, and the log keeps the API's own words.
+    #[test]
+    fn a_device_limit_refusal_is_busy_with_its_own_words() {
+        let failure = MintFailure::from_error(&qubo::QuboError::Api {
+            status: 400,
+            code: "ERR_STM_003".to_owned(),
+            message: "Device stream limit reached".to_owned(),
+        });
+        assert!(failure.busy, "the device's slot is held elsewhere");
+        assert!(!failure.stale_source, "the device is not offline");
+        assert_eq!(failure.reason, BUSY_REASON);
+        assert!(
+            failure.signature.contains("ERR_STM_003"),
+            "the log keeps the API's own text: {}",
+            failure.signature
         );
     }
 
@@ -2427,7 +2680,7 @@ mod tests {
         );
 
         let failure = supervisor
-            .put_and_confirm("cam-high", "ffmpeg:x")
+            .put_and_confirm("cam-high", "ffmpeg:x", false)
             .await
             .expect_err("the confirm fails");
         assert!(
@@ -2638,6 +2891,7 @@ mod tests {
             .put_and_confirm(
                 "cam-high",
                 "ffmpeg:rtsps://wowza.example/live/cam?wowzaToken=sek-a&sessionId=sid-b",
+                false,
             )
             .await
             .map_err(MintFailure::from)

@@ -143,18 +143,34 @@ export interface PrivacyResult {
   privacy: boolean | null;
 }
 
+/** How long one call may hang before it is abandoned: a fetch that never
+ * answers must not pin the caller's own in-flight flag forever. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: init.body ? { 'content-type': 'application/json' } : undefined,
-  });
-  if (!response.ok) {
-    throw new ApiError(response.status, await errorMessage(response));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${base}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: init.body ? { 'content-type': 'application/json' } : undefined,
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, await errorMessage(response));
+    }
+    if (response.status === 204) {
+      return undefined as T;
+    }
+    return (await response.json()) as T;
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error('the server did not answer in time');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  if (response.status === 204) {
-    return undefined as T;
-  }
-  return (await response.json()) as T;
 }
 
 async function errorMessage(response: Response): Promise<string> {

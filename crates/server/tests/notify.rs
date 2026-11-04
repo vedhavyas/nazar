@@ -389,6 +389,7 @@ async fn harness(store: Arc<NotificationStore>) -> Harness {
             touch_ttl: Duration::from_millis(300),
             arm_timeout: Duration::from_secs(15),
             lane_cooldown: Duration::from_secs(600),
+            busy_backoff: Duration::from_mins(5),
         },
     );
     let episodes = common::episodes_in(&data_dir);
@@ -498,13 +499,8 @@ async fn a_still_comes_from_a_pipeline_already_running() {
         .await
         .expect("watch");
     assert_eq!(started.status(), reqwest::StatusCode::OK);
-    let live = common::eventually(|| async {
-        h.go2rtc
-            .puts()
-            .iter()
-            .any(|(name, _)| name == &format!("{CAMERA}-high"))
-    })
-    .await;
+    let live =
+        common::eventually(|| async { h.go2rtc.has_stream(&format!("{CAMERA}-high")) }).await;
     assert!(live, "the stream reached go2rtc");
     // Past the coalesce window, so the next sighting is its own episode.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -623,13 +619,8 @@ async fn the_bell_rings_before_the_still_is_resolved() {
         .await
         .expect("watch");
     assert_eq!(started.status(), reqwest::StatusCode::OK);
-    let live = common::eventually(|| async {
-        h.go2rtc
-            .puts()
-            .iter()
-            .any(|(name, _)| name == &format!("{CAMERA}-high"))
-    })
-    .await;
+    let live =
+        common::eventually(|| async { h.go2rtc.has_stream(&format!("{CAMERA}-high")) }).await;
     assert!(live, "a pipeline is running, so the grab is a real one");
     // A viewer on it, so the producer is actually up: the grab reads a
     // free frame instead of dialling the URL for one.
@@ -689,13 +680,8 @@ async fn the_still_landing_is_told_again() {
         .await
         .expect("watch");
     assert_eq!(started.status(), reqwest::StatusCode::OK);
-    let live = common::eventually(|| async {
-        h.go2rtc
-            .puts()
-            .iter()
-            .any(|(name, _)| name == &format!("{CAMERA}-high"))
-    })
-    .await;
+    let live =
+        common::eventually(|| async { h.go2rtc.has_stream(&format!("{CAMERA}-high")) }).await;
     assert!(live, "a pipeline is running, so the grab is a real one");
     // A viewer on it, so the producer is actually up: the grab reads a
     // free frame instead of dialling the URL for one.

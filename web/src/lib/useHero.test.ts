@@ -132,6 +132,56 @@ test('the event socket does not come back after the teardown', async () => {
   vi.useRealTimers();
 });
 
+/** A source whose hero answers the test resolves by hand, in any order. */
+function deferredSource() {
+  const calls: Array<{
+    resolve: (hero: string | null) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  const source: HeroSource = {
+    hero: () =>
+      new Promise((resolve, reject) => {
+        calls.push({ resolve, reject });
+      }),
+    watch: () => () => {},
+  };
+  return { source, calls };
+}
+
+test('the newest hero answer wins when an older one lands last', async () => {
+  const { source, calls } = deferredSource();
+  const house = createHero(() => [hall, gate], source);
+
+  const first = house.refresh();
+  const second = house.refresh();
+  calls[1].resolve('gate');
+  await second;
+  calls[0].resolve('hall');
+  await first;
+
+  expect(
+    house.hero,
+    'the older answer does not overwrite the newer one',
+  ).toBe('gate');
+});
+
+test('a failed newer ask leaves the older answer standing', async () => {
+  const { source, calls } = deferredSource();
+  const house = createHero(() => [hall, gate], source);
+
+  const first = house.refresh();
+  const second = house.refresh();
+  calls[1].reject(new Error('blip'));
+  await second;
+  calls[0].resolve('hall');
+  await first;
+
+  expect(
+    house.hero,
+    'the answer that did land is kept',
+  ).toBe('hall');
+});
+
 test('an event re-asks the server who is big', async () => {
   const fake = fakeSource('hall');
   const house = createHero(() => [hall, gate], fake.source);

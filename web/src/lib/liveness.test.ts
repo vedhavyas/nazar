@@ -80,6 +80,23 @@ test('a blocked window does not run (the server is still waking)', () => {
   watch.cancel();
 });
 
+test('a playing picture is reported even while the server is waking', () => {
+  vi.useFakeTimers();
+  const video = document.createElement('video');
+  const node = host(video);
+  const verdicts: string[] = [];
+  const watch = pictureWatch(
+    () => node,
+    (v) => verdicts.push(v),
+    () => true,
+  );
+
+  setPicture(video, true);
+  vi.advanceTimersByTime(2_500);
+  expect(verdicts, 'the element is the truth about what the person sees').toEqual(['painted']);
+  watch.cancel();
+});
+
 test('a picture already painted never gets the word later', () => {
   vi.useFakeTimers();
   const video = document.createElement('video');

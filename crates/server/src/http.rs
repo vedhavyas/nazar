@@ -642,6 +642,9 @@ fn degraded_words(reason: &str) -> (&'static str, Option<String>) {
     if reason == "the producer has not connected" {
         return ("camera is not responding", None);
     }
+    if reason == crate::supervisor::BUSY_REASON {
+        return (crate::supervisor::BUSY_REASON, None);
+    }
     let short = if reason.starts_with("go2rtc") {
         "stream engine unavailable"
     } else if reason.starts_with("auth error") {
@@ -1428,6 +1431,11 @@ mod tests {
         assert_eq!(
             degraded_words("the producer has not connected").0,
             "camera is not responding"
+        );
+        assert_eq!(
+            degraded_words(crate::supervisor::BUSY_REASON),
+            (crate::supervisor::BUSY_REASON, None),
+            "a held stream slot reads as busy, not as a cloud failure"
         );
     }
 

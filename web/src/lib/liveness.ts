@@ -27,12 +27,9 @@ export function pictureWatch(
   let noted = false;
   let here = false;
   const timer = setInterval(() => {
-    if (blocked()) {
-      // The server is still waking: the window has nothing to run against.
-      missingSince = null;
-      noted = false;
-      return;
-    }
+    // A picture that is already there is reported even while the server
+    // still calls the stream waking: the element is the truth about what
+    // the person sees.
     if (holdsPicture(element())) {
       missingSince = null;
       noted = false;
@@ -43,6 +40,12 @@ export function pictureWatch(
       return;
     }
     here = false;
+    if (blocked()) {
+      // The server is still waking: the window has nothing to run against.
+      missingSince = null;
+      noted = false;
+      return;
+    }
     missingSince ??= Date.now();
     if (!noted && Date.now() - missingSince >= PICTURE_WINDOW_MS) {
       noted = true;
@@ -52,6 +55,12 @@ export function pictureWatch(
   return {
     cancel() {
       clearInterval(timer);
+    },
+    /** A new player is a new picture: the next paint is a new verdict. */
+    reset() {
+      here = false;
+      missingSince = Date.now();
+      noted = false;
     },
   };
 }
