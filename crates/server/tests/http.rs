@@ -63,6 +63,7 @@ fn test_pacing() -> Pacing {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     }
 }
 
@@ -1631,6 +1632,7 @@ async fn a_proxied_viewer_ask_heals_a_dead_stream() {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     })
     .await;
     mount_discovery(&h.qubo).await;

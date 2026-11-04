@@ -178,3 +178,175 @@ test('a retile drops the stale reason and detail', async () => {
   const retiled = calls.filter((url) => url.includes('/live?')).pop();
   expect(retiled, 'the retile pulls the mint forward').toContain('retry=true');
 });
+
+test('an event re-syncs a settled house to the new hero', async () => {
+  vi.useFakeTimers();
+  const sockets: Array<{ onmessage: (() => void) | null }> = [];
+  class FakeSocket {
+    onmessage: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    constructor() {
+      sockets.push(this);
+    }
+    close() {
+      this.onclose?.();
+    }
+  }
+  vi.stubGlobal('WebSocket', FakeSocket);
+
+  let hero: string | null = null;
+  const calls: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      if (url === '/api/cameras') {
+        return json({
+          cameras: [
+            { id: 'hall', name: 'Hall', state: 'live', reason: null },
+            { id: 'gate', name: 'Gate', state: 'live', reason: null },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (url === '/api/motion/hero') {
+        return json({ hero });
+      }
+      return json({ stream: `${url.replace('/api/cameras/', '').split('/live')[0]}-stream` });
+    }),
+  );
+
+  render(Home, { onlocked: vi.fn(), onopen: vi.fn() });
+  await vi.advanceTimersByTimeAsync(50);
+  expect(
+    asked(calls),
+    'the settled house starts with both tiles low',
+  ).toEqual([
+    'POST /api/cameras/hall/live?quality=low',
+    'POST /api/cameras/gate/live?quality=low',
+  ]);
+
+  // The house moves; the event must sync the promoted camera, not wait for
+  // a poll a settled house never runs.
+  hero = 'gate';
+  calls.length = 0;
+  sockets[0]?.onmessage?.();
+  await vi.advanceTimersByTimeAsync(50);
+
+  expect(
+    asked(calls),
+    'the promoted camera is asked high on the event',
+  ).toEqual(['POST /api/cameras/gate/live?quality=high']);
+});
+
+test('a pass queued by an unmounted home does not run', async () => {
+  vi.useFakeTimers();
+  let camerasCalls = 0;
+  const liveGates: Array<() => void> = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (url === '/api/cameras') {
+        camerasCalls += 1;
+        return json({
+          cameras: [
+            {
+              id: 'hall',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'the producer has not connected',
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (url === '/api/motion/hero') {
+        return json({ hero: null });
+      }
+      await new Promise<void>((resolve) => {
+        liveGates.push(resolve);
+      });
+      return json({ stream: 'hall-low' });
+    }),
+  );
+
+  const { unmount } = render(Home, { onlocked: vi.fn(), onopen: vi.fn() });
+  await vi.advanceTimersByTimeAsync(10);
+  expect(camerasCalls, 'the first pass landed').toBe(1);
+  expect(liveGates.length, 'the first pass waits on the stream').toBe(1);
+
+  // A retile starts its own stream ask, which also waits.
+  screen.getByText('retile').click();
+  await vi.advanceTimersByTimeAsync(10);
+  expect(liveGates.length, 'the retile waits too').toBe(2);
+
+  unmount();
+  // Let the first pass finish after the house is gone, then the retile's
+  // queued refresh: neither may start a pass.
+  liveGates[0]();
+  await vi.advanceTimersByTimeAsync(10);
+  const before = camerasCalls;
+  liveGates[1]();
+  await vi.advanceTimersByTimeAsync(50);
+
+  expect(
+    camerasCalls,
+    'an unmounted home runs no queued pass',
+  ).toBe(before);
+});
+
+test('a retile during a poll does not start a second cameras pass', async () => {
+  vi.useFakeTimers();
+  let camerasCalls = 0;
+  let inFlight = 0;
+  let mostInFlight = 0;
+  let releaseSecond: (() => void) | undefined;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (url === '/api/cameras') {
+        camerasCalls += 1;
+        inFlight += 1;
+        mostInFlight = Math.max(mostInFlight, inFlight);
+        if (camerasCalls === 2) {
+          await new Promise<void>((resolve) => {
+            releaseSecond = resolve;
+          });
+        }
+        inFlight -= 1;
+        return json({
+          cameras: [
+            {
+              id: 'hall',
+              name: 'Hall',
+              state: 'degraded',
+              reason: 'the producer has not connected',
+            },
+          ],
+          needsLogin: false,
+        });
+      }
+      if (url === '/api/motion/hero') {
+        return json({ hero: null });
+      }
+      return json({ stream: 'hall-low' });
+    }),
+  );
+
+  render(Home, { onlocked: vi.fn(), onopen: vi.fn() });
+  await vi.advanceTimersByTimeAsync(10);
+  expect(camerasCalls, 'the first pass landed').toBe(1);
+
+  // The poll opens the second pass and it hangs.
+  await vi.advanceTimersByTimeAsync(3100);
+  expect(camerasCalls, 'the poll is in flight').toBe(2);
+
+  // A retile finishes and asks for a refresh while that pass is still out.
+  screen.getByText('retile').click();
+  await vi.advanceTimersByTimeAsync(10);
+  expect(mostInFlight, 'only one cameras pass is ever in flight').toBe(1);
+
+  releaseSecond?.();
+  await vi.advanceTimersByTimeAsync(10);
+  expect(camerasCalls, 'the queued pass runs after the first one finishes').toBe(3);
+});

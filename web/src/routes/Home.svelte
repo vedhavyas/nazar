@@ -31,7 +31,23 @@
   const house = createHero(() => cameras);
   const AWAY_KEY = 'nazar.away';
 
+  /** One cameras pass at a time: a retile and the poll can both ask, and
+   * two overlapping passes can read different hero decisions - asking the
+   * same camera low and then high is the re-attach that costs a second
+   * negotiation. Hero reads of their own are ordered inside createHero. */
+  let refreshing = false;
+  let refreshAgain = false;
+  /** Whether the component is still mounted: a queued pass must not run
+   * into a house that is already gone. */
+  let active = false;
+
   async function refresh() {
+    if (!active) return;
+    if (refreshing) {
+      refreshAgain = true;
+      return;
+    }
+    refreshing = true;
     try {
       const page = await api.cameras();
       // The poll usually re-reads the same house: keep the objects when
@@ -68,6 +84,11 @@
       error = err instanceof Error ? err.message : String(err);
     } finally {
       loaded = true;
+      refreshing = false;
+      if (refreshAgain) {
+        refreshAgain = false;
+        if (active) void refresh();
+      }
     }
   }
 
@@ -77,6 +98,8 @@
    * and still on the server, is left alone.
    */
   async function syncStreams() {
+    // house.tiles puts the hero first (createHero moves it to index 0), and
+    // its high attach is the picture the person is waiting for.
     for (const tile of house.tiles) {
       const want: Quality = tile.hero ? 'high' : 'low';
       const settled = tile.camera.state !== 'offline' && qualities[tile.camera.id] === want;
@@ -124,14 +147,20 @@
   });
 
   onMount(() => {
+    active = true;
     try {
       house.setAway(localStorage.getItem(AWAY_KEY) === '1');
     } catch {
       // No storage, no remembered preference.
     }
-    const stop = house.follow();
+    // Every house event runs a full guarded pass, so a settled house
+    // re-syncs its quality after a promotion the poll never sees.
+    const stop = house.follow(() => void refresh());
     void refresh();
-    return stop;
+    return () => {
+      active = false;
+      stop();
+    };
   });
 </script>
 

@@ -44,19 +44,31 @@ export function createHero(cameras: () => Camera[], source: HeroSource = serverS
     }));
   });
 
+  /** The newest successful hero ask wins: the event socket and a poll can
+   * overlap, and an older answer landing last must not overwrite the
+   * newer one. A failed newer ask leaves the older answer standing. */
+  let asking = 0;
+  let answered = 0;
+
   /** Ask the server who is big. */
   async function refresh(): Promise<void> {
+    const ask = ++asking;
     try {
-      hero = await source.hero();
+      const next = await source.hero();
+      if (ask >= answered) {
+        answered = ask;
+        hero = next;
+      }
     } catch {
       // The list's own error surface covers an unreachable server; a hero
       // is not worth a second banner.
     }
   }
 
-  /** Follow the house: every event is a hint to re-ask. */
-  function follow(): () => void {
-    return source.watch(() => void refresh());
+  /** Follow the house: every event is a hint to re-ask, or to run the
+   * caller's own pass when it has more to sync than the hero. */
+  function follow(onEvent?: () => void): () => void {
+    return source.watch(onEvent ?? (() => void refresh()));
   }
 
   return {

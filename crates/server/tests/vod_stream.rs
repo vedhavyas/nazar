@@ -87,6 +87,7 @@ async fn harness(stream_idle: Duration) -> Harness {
             touch_ttl: Duration::from_millis(300),
             arm_timeout: Duration::from_secs(15),
             lane_cooldown: Duration::from_secs(600),
+            busy_backoff: Duration::from_mins(5),
         },
     );
     let snapshots = Snapshots::new(
@@ -444,12 +445,20 @@ async fn an_unwatched_playback_releases_itself() {
 
 #[tokio::test]
 async fn a_watched_playback_is_not_released() {
-    let h = harness(Duration::from_millis(60)).await;
+    let h = harness(Duration::from_millis(300)).await;
     mount_vod(&h.qubo).await;
-    h.go2rtc.set_viewers(&format!("vod-{CAMERA}"), 1);
+    let name = format!("vod-{CAMERA}");
     assert_eq!(play(&h, CLIP_MS).await.status(), reqwest::StatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The viewer attaches after the mint's PUT has installed the stream
+    // object, as the player's own attach does.
+    let landed =
+        common::eventually(|| async { h.go2rtc.puts().iter().any(|(listed, _)| listed == &name) })
+            .await;
+    assert!(landed, "the playback stream landed: {:?}", h.go2rtc.ops());
+    h.go2rtc.set_viewers(&name, 1);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         h.go2rtc.deletes().is_empty(),
         "a watched playback outlives the idle window: {:?}",
@@ -457,7 +466,7 @@ async fn a_watched_playback_is_not_released() {
     );
 
     // The viewer leaves; the idle rule applies again.
-    h.go2rtc.set_viewers(&format!("vod-{CAMERA}"), 0);
+    h.go2rtc.set_viewers(&name, 0);
     let released =
         common::eventually(|| async { h.go2rtc.deletes() == vec![format!("vod-{CAMERA}")] }).await;
     assert!(released, "once nobody is watching, it is released");

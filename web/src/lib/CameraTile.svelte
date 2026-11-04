@@ -26,6 +26,10 @@
   let stalled = $state<null | 'start' | 'frozen'>(null);
   /** Whether the fallback stream is carrying the picture. */
   let fallingBack = $state(false);
+  /** Whether the element itself is showing a picture. The server's state
+   * can lag a player that is already playing; the tile says what the
+   * person can see. */
+  let painting = $state(false);
 
   // A stalled picture heals itself on a bounded backoff: a never-started
   // picture is rebuilt, a frozen one only re-asked - its frame is held and
@@ -47,16 +51,35 @@
   const liveness = pictureWatch(
     () => picture,
     (state) => {
-      if (state === 'start') {
-        if (stalled === 'start') return;
-        stalled = 'start';
-        rebuild.schedule('start');
+      if (state === 'painted') {
+        painting = true;
+        // A late picture ends the start failure it outlived; the note and
+        // its Try again must go with it.
+        if (stalled === 'start') stalled = null;
         return;
       }
-      if (stalled === 'start') stalled = null;
+      painting = false;
+      if (stalled === 'start') return;
+      stalled = 'start';
+      rebuild.schedule('start');
     },
     () => camera.state === 'waking',
   );
+
+  /** What the tile says: a picture that is already playing is Live even
+   * while the server still calls the stream waking. */
+  const shown = $derived(camera.state === 'waking' && painting ? 'live' : camera.state);
+
+  // A new stream or attempt is a new player: the old picture does not come
+  // with it, so a playing latch from the last one must not claim Live over
+  // an empty stage. The watch's own latch resets too, or a fresh player
+  // that paints before the next tick never reports its picture.
+  $effect(() => {
+    void stream;
+    void attempt;
+    painting = false;
+    liveness.reset();
+  });
   $effect(() => () => liveness.cancel());
 
   const STATE_WORDS: Record<Camera['state'], string> = {
@@ -103,7 +126,7 @@
     {:else}
       <h2>{camera.name}</h2>
     {/if}
-    <span class="state" data-state={camera.state}>{STATE_WORDS[camera.state]}</span>
+    <span class="state" data-state={shown}>{STATE_WORDS[shown]}</span>
   </header>
 
   {#if (camera.state === 'live' || camera.state === 'waking') && stream}
@@ -111,11 +134,15 @@
       <Player
         {stream}
         {attempt}
-        waiting={camera.state === 'waking'}
+        waiting={camera.state === 'waking' && !painting}
         muted
         onsettled={(state) => {
           if (state === 'hls' || state === 'recovered') {
             fallingBack = state === 'hls';
+            painting = false;
+            // A recovered tab re-keys the player; its fresh picture must
+            // report itself even if it paints before the next tick.
+            if (state === 'recovered') liveness.reset();
             stalled = null;
             rebuild.settled();
             // The local rebuild is the fast step; the server is asked too,
@@ -125,14 +152,16 @@
             return;
           }
           fallingBack = false;
+          painting = false;
           stalled = state;
           rebuild.schedule(state);
         }}
       />
-      {#if camera.state === 'waking'}
+      {#if camera.state === 'waking' && !painting}
         <!-- Waking keeps the player mounted: unmounting tore the picture
              down, and a remount re-negotiated it - the flip that made a
-             refocus look like a restart. -->
+             refocus look like a restart. A picture already playing keeps
+             the spinner away. -->
         <div class="spinner" role="status" aria-label="Starting the stream"></div>
       {/if}
     </div>

@@ -261,8 +261,33 @@ impl Go2rtc {
         Ok(())
     }
 
-    /// Drop the stream `name` and the producer behind it. go2rtc's own UI
-    /// deletes with `?src=`, so that is the shape its API takes.
+    /// Update the source of the stream `name` in place. go2rtc patches the
+    /// existing stream object, so its consumers stay bound to it and the
+    /// running producer reconnects to the new URL; a PUT would replace the
+    /// object under the name and leave those consumers on the old one.
+    pub async fn patch_stream(&self, name: &str, source: &str) -> Result<(), Go2rtcError> {
+        let response = self
+            .http
+            .patch(self.api_for("/api/streams")?)
+            .query(&[("name", name), ("src", source)])
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Go2rtcError::Rejected {
+                status: status.as_u16(),
+                body: snippet(&body),
+            });
+        }
+        tracing::debug!(stream = name, "go2rtc stream source patched");
+        Ok(())
+    }
+
+    /// Remove the stream `name` from go2rtc's map. A consumer already bound
+    /// to the object keeps it alive, and its producer stops when the last
+    /// consumer leaves. go2rtc's own UI deletes with `?src=`, so that is the
+    /// shape its API takes.
     pub async fn delete_stream(&self, name: &str) -> Result<(), Go2rtcError> {
         let response = self
             .http
@@ -879,7 +904,7 @@ fn drain_tail(mut stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandl
 /// flowing picture. The consumer's own exit is also the earliest witness
 /// of a spent session: go2rtc keeps reporting the producer connected long
 /// after the frames stopped (measured on the hub: a session death sat
-/// invisible for ~58s until the producer's own read timeout fired).
+/// invisible for ~58s until the producer's own start timeout fired).
 pub struct FfmpegHold {
     ffmpeg: PathBuf,
     /// When each stream's consumer last exited, by stream name.

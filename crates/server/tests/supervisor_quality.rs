@@ -27,6 +27,24 @@ const MINT_PATH: &str = "/stream-manager/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe
 
 static NEXT_SESSION_FILE: AtomicUsize = AtomicUsize::new(0);
 
+/// A hold whose lease is attached: enough for the loop to treat a plain
+/// cadence mint as a refresh of a stream that already has a consumer.
+struct QuietHold;
+
+struct QuietLease;
+
+impl server::supervisor::HoldLease for QuietLease {
+    fn attached(&self) -> bool {
+        true
+    }
+}
+
+impl server::supervisor::StreamHold for QuietHold {
+    fn hold(&self, _name: &str) -> std::sync::Arc<dyn server::supervisor::HoldLease> {
+        std::sync::Arc::new(QuietLease)
+    }
+}
+
 struct Harness {
     supervisor: Supervisor,
     qubo: MockServer,
@@ -49,6 +67,7 @@ fn pacing(stream_idle: Duration) -> Pacing {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     }
 }
 
@@ -59,13 +78,22 @@ async fn harness(stream_idle: Duration) -> Harness {
 /// A harness on its own pacing, for tests that need the re-mint cadence
 /// or the retry backoff inside their window.
 async fn harness_with(pacing: Pacing) -> Harness {
-    harness_with_engine(pacing, None).await
+    harness_with_engine(pacing, None, false).await
+}
+
+/// Attach a viewer once the stream entry exists: a PUT installs a fresh
+/// object, so an attach before it belongs to the predecessor.
+async fn attach_viewer(h: &Harness, name: &str) {
+    let landed = common::eventually(|| async { h.go2rtc.has_stream(name) }).await;
+    assert!(landed, "the first mint landed: {:?}", h.go2rtc.ops());
+    h.go2rtc.set_viewers(name, 1);
 }
 
 /// A harness whose supervisor talks to `engine` instead of the fake: a
 /// closed or silent address is how a transport failure reaches the engine
-/// calls, whose failure text the fake's own answers cannot produce.
-async fn harness_with_engine(pacing: Pacing, engine: Option<String>) -> Harness {
+/// calls, whose failure text the fake's own answers cannot produce. With
+/// `hold`, narar's own consumer rides each landed stream.
+async fn harness_with_engine(pacing: Pacing, engine: Option<String>, hold: bool) -> Harness {
     let qubo = MockServer::start().await;
     let go2rtc = common::FakeApi::start().await;
     mount_discovery(&qubo).await;
@@ -87,6 +115,11 @@ async fn harness_with_engine(pacing: Pacing, engine: Option<String>) -> Harness 
         Go2rtc::connect(base.parse().expect("a url")).expect("a client"),
         pacing,
     );
+    let supervisor = if hold {
+        supervisor.with_hold(std::sync::Arc::new(QuietHold))
+    } else {
+        supervisor
+    };
     supervisor.refresh_devices().await.expect("discovery");
     Harness {
         supervisor,
@@ -128,6 +161,11 @@ fn mint_body(quality: &str) -> String {
         "sessionId": format!("session-{quality}"),
     })
     .to_string()
+}
+
+/// The gateway's device-limit refusal, as captured.
+fn busy_body() -> String {
+    r#"{"code":"ERR_STM_003","message":"Device stream limit reached"}"#.to_owned()
 }
 
 fn mint_mock(quality: &str, status: u16, body: String) -> Mock {
@@ -373,6 +411,7 @@ async fn the_chain_is_re_asserted_after_a_mint() {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     })
     .await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
@@ -420,12 +459,12 @@ async fn the_chain_is_re_asserted_after_a_mint() {
 async fn a_watched_stream_waits_out_the_remint_cadence() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    h.go2rtc.set_viewers(&format!("{DEVICE_ID}-high"), 1);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream wakes");
+    attach_viewer(&h, &format!("{DEVICE_ID}-high")).await;
     // Several idle windows pass, all of them watched: the early wake is
     // only a re-check of the watch, not a mint.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -556,6 +595,7 @@ async fn a_recovered_camera_starts_its_backoff_over() {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     })
     .await;
     // Two refusals, then an answer: the loop has backed off to 200ms when
@@ -659,12 +699,12 @@ async fn a_tile_is_never_dropped_while_the_hero_keeps_streaming() {
 async fn a_tile_with_a_viewer_is_never_dropped() {
     let h = harness(Duration::from_millis(60)).await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
-    h.go2rtc.set_viewers(&format!("{DEVICE_ID}-low"), 1);
 
     h.supervisor
         .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the tile wakes");
+    attach_viewer(&h, &format!("{DEVICE_ID}-low")).await;
     // Nobody asks again: a home that is watching holds the stream open,
     // and the browser never tells this server about it. The viewer holds
     // the cloud stream too, since the tile rides it.
@@ -868,6 +908,7 @@ async fn a_transport_failure_keeps_its_cause_on_every_site() {
     let h = harness_with_engine(
         pacing(Duration::from_millis(60)),
         Some(format!("http://{dead}")),
+        false,
     )
     .await;
     mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
@@ -1080,6 +1121,528 @@ async fn a_re_mint_failure_names_its_cause() {
         cause_of(&timed_out),
         cause_of(&refused),
         "the two causes differ: {timed_out} vs {refused}"
+    );
+}
+
+/// A scheduled re-mint patches the source in place: go2rtc keeps the
+/// attached consumer bound to the same stream object, so there is no
+/// tear-down and the tile stays Live. The test scales the 180s cadence to
+/// 150ms; the measured cloud session ends at 215-252s.
+#[tokio::test]
+async fn a_scheduled_refresh_patches_the_source_and_keeps_the_hold() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.remint = Duration::from_millis(150);
+    pacing.connect_grace = Duration::from_millis(400);
+    let h = harness_with_engine(pacing, None, true).await;
+    // Two mint answers, so the refresh has to carry a different source than
+    // the first PUT.
+    mint_mock("high", 200, mint_body("first"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mount_mint(&h.qubo, "high", 200, mint_body("second")).await;
+    let name = format!("{DEVICE_ID}-high");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    // The fake's consumer attaches after the first PUT, as the real hold's
+    // dial does: a PUT installs a fresh stream object with nobody on it.
+    let landed = common::eventually(|| async { h.go2rtc.has_stream(&name) }).await;
+    assert!(landed, "the first mint landed: {:?}", h.go2rtc.ops());
+    h.go2rtc.hold(&name, true);
+
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "the held stream is live first");
+
+    let refreshed = common::eventually(|| async {
+        h.go2rtc
+            .ops()
+            .iter()
+            .any(|op| op == &format!("patch:{name}"))
+    })
+    .await;
+    assert!(
+        refreshed,
+        "the cadence patched the source in place: {:?}",
+        h.go2rtc.ops()
+    );
+
+    let puts = h.go2rtc.puts();
+    let patches = h.go2rtc.patches();
+    assert_eq!(puts.len(), 1, "the first mint is the only PUT: {puts:?}");
+    assert!(
+        puts[0].1.contains("_first"),
+        "the first mint used the first answer: {:?}",
+        puts[0].1
+    );
+    assert!(
+        patches[0].1.contains("_second"),
+        "the patch carried the fresh source: {:?}",
+        patches[0].1
+    );
+    assert_ne!(
+        patches[0].1, puts[0].1,
+        "the refresh did not re-send the first source"
+    );
+    let ops = h.go2rtc.ops();
+    let first_put = ops
+        .iter()
+        .position(|op| op.starts_with("put:"))
+        .expect("the first mint put the stream");
+    assert!(
+        !ops[first_put..].iter().any(|op| op.starts_with("delete:")),
+        "a refresh never tears the stream down: {ops:?}"
+    );
+    let (consumers, connected) = h.go2rtc.stream_view(&name);
+    assert_eq!(consumers, 1, "the hold stayed bound to the stream object");
+    assert!(connected, "and its producer is connected");
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        ),
+        "the tile is Live after the refresh: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+}
+
+/// A refused refresh must not degrade a stream that is still serving: the
+/// old source carries the picture and the next cadence tries the refresh
+/// again without a DELETE+PUT.
+#[tokio::test]
+async fn a_refused_refresh_keeps_the_serving_stream() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.remint = Duration::from_millis(150);
+    pacing.connect_grace = Duration::from_millis(400);
+    let h = harness_with_engine(pacing, None, true).await;
+    mount_mint(&h.qubo, "high", 200, mint_body("high")).await;
+    let name = format!("{DEVICE_ID}-high");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let landed = common::eventually(|| async { h.go2rtc.has_stream(&name) }).await;
+    assert!(landed, "the first mint landed: {:?}", h.go2rtc.ops());
+    h.go2rtc.hold(&name, true);
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "the held stream is live first");
+
+    // The patch is refused, but the old source is still connected.
+    h.go2rtc.set_patch_status(500);
+    let attempted = common::eventually(|| async { !h.go2rtc.patches().is_empty() }).await;
+    assert!(attempted, "the cadence tried the refresh");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        ),
+        "a refused refresh keeps the serving stream live: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    assert!(
+        h.go2rtc.patches().len() >= 2,
+        "the next cadence tries the refresh again: {:?}",
+        h.go2rtc.patches()
+    );
+    let ops = h.go2rtc.ops();
+    let first_put = ops
+        .iter()
+        .position(|op| op.starts_with("put:"))
+        .expect("the first mint put the stream");
+    assert!(
+        !ops[first_put..].iter().any(|op| op.starts_with("delete:")),
+        "no teardown follows a refused refresh: {ops:?}"
+    );
+}
+
+/// A device whose stream slot is held elsewhere is reported as busy, and
+/// the loop waits the hard floor instead of the 1-60s ladder. A viewer
+/// touch inside the floor opens a stall run; the busy sentence must stand
+/// for the whole floor, never a Waking window with no way out.
+#[tokio::test]
+async fn a_device_limit_refusal_is_reported_busy_and_waited_out() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.retry_base = Duration::from_millis(100);
+    pacing.retry_max = Duration::from_millis(100);
+    let h = harness_with(pacing).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"{"code":"ERR_STM_003","message":"Device stream limit reached"}"#,
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+
+    let busy = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+        )
+    })
+    .await;
+    assert!(
+        busy,
+        "the tile is told the camera is busy: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    let calls = mint_calls(&h.qubo).await;
+    // A viewer arrives on the empty stream and opens a run. The premise is
+    // observable in the log; without the touch this run never opens.
+    let captured = common::capture::Captured::start();
+    h.supervisor.note_viewer_touch(&format!("{DEVICE_ID}-high"));
+    let opened =
+        common::eventually(|| async { captured.text().contains("a stall run opened") }).await;
+    assert!(
+        opened,
+        "the viewer's touch opened a run: {}",
+        captured.text()
+    );
+    // Sample the whole window: the reason must never give way to Waking.
+    for _ in 0..35 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+            ),
+            "the busy reason stands across the window: {:?}",
+            h.supervisor.status(DEVICE_ID).await
+        );
+    }
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        calls,
+        "the busy floor holds: no ladder retry inside it"
+    );
+
+    // A Try again from the degraded state is not swallowed: it mints at
+    // once, even though the floor is still armed.
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the retry is accepted");
+    let retried = common::eventually(|| async { mint_calls(&h.qubo).await > calls }).await;
+    assert!(retried, "a Try again reaches the camera");
+
+    // A retry that lands on a non-busy error must not slip back onto the
+    // 1-60s ladder while the busy floor stands.
+    let calls = mint_calls(&h.qubo).await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the retry is accepted");
+    let retried = common::eventually(|| async { mint_calls(&h.qubo).await > calls }).await;
+    assert!(retried, "the retry reaches the camera");
+    let calls = mint_calls(&h.qubo).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        calls,
+        "a non-busy failure keeps the busy floor: no ladder storm"
+    );
+}
+
+/// A refresh refused busy on a viewed stream whose predecessor DELETE then
+/// fails: the entry stays, the slow producer connects, and the run closes
+/// while the floor stands. The closed run must not arm a mint inside it.
+#[tokio::test]
+async fn a_closed_run_does_not_mint_inside_the_busy_floor() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.remint = Duration::from_millis(150);
+    pacing.busy_backoff = Duration::from_millis(1_200);
+    pacing.liveness_poll = Duration::from_millis(20);
+    let h = harness_with_engine(pacing, None, true).await;
+    mint_mock("high", 200, mint_body("first"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"{"code":"ERR_STM_003","message":"Device stream limit reached"}"#,
+            ),
+        )
+        .mount(&h.qubo)
+        .await;
+    let name = format!("{DEVICE_ID}-high");
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(live, "the held stream is live first");
+
+    // A viewer on the entry, a producer that is not connected yet, and a
+    // DELETE that refuses to remove the entry when the busy drop runs.
+    h.go2rtc.set_viewers(&name, 1);
+    h.go2rtc.disconnect_producer(&name);
+    h.go2rtc.set_delete_status(500, None);
+
+    let calls = mint_calls(&h.qubo).await;
+    let refused = common::eventually(|| async {
+        mint_calls(&h.qubo).await > calls
+            && matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+            )
+    })
+    .await;
+    assert!(
+        refused,
+        "the refusal is read as busy: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    // The slow producer connects: the run closes while the floor stands.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.go2rtc.connect_producer(&name);
+    let closed = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(closed, "the producer's connect closed the run");
+
+    let calls = mint_calls(&h.qubo).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        calls,
+        "a closed run does not arm a mint inside the busy floor"
+    );
+}
+
+/// The busy floor ends cleanly: an open run is closed at expiry, a
+/// non-busy failure recorded during the floor keeps its actionable reason,
+/// and the post-floor success lifts the stream to Live. Removing the close
+/// leaves the run standing so the success never reads Live; erasing any
+/// Degraded state at expiry loses the non-busy reason.
+#[tokio::test]
+async fn a_busy_floor_expires_into_the_retry() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.busy_backoff = Duration::from_millis(800);
+    pacing.liveness_poll = Duration::from_millis(20);
+    // The in-floor non-busy failure backs off fast enough to be pulled onto
+    // the floor's end, not far past it.
+    pacing.retry_base = Duration::from_millis(50);
+    pacing.retry_max = Duration::from_millis(50);
+    let h = harness_with(pacing).await;
+    mint_mock("high", 400, busy_body())
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    // The in-floor retry fails non-busy; the post-floor mint is slow, so
+    // the sample below lands while it is in flight.
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(mint_body("high"))
+                .set_delay(Duration::from_millis(700)),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("the stream registers");
+    let busy = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+        )
+    })
+    .await;
+    assert!(busy, "the first mint is refused busy");
+
+    // A viewer run opens inside the floor, and a forced retry lands on a
+    // non-busy failure: its reason must survive the floor's expiry.
+    let captured = common::capture::Captured::start();
+    h.supervisor.note_viewer_touch(&format!("{DEVICE_ID}-high"));
+    let opened =
+        common::eventually(|| async { captured.text().contains("a stall run opened") }).await;
+    assert!(opened, "the viewer's touch opened a run");
+
+    let calls = mint_calls(&h.qubo).await;
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, true)
+        .await
+        .expect("the retry is accepted");
+    let retried = common::eventually(|| async {
+        mint_calls(&h.qubo).await > calls
+            && matches!(
+                h.supervisor.status(DEVICE_ID).await,
+                StreamState::Degraded { reason } if reason != server::supervisor::BUSY_REASON
+            )
+    })
+    .await;
+    assert!(
+        retried,
+        "the forced retry minted and its non-busy failure is recorded: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+
+    // The floor is 800ms; the post-floor mint takes 700ms. At 800ms after
+    // the retry the floor has passed and the success is in flight.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Degraded { .. }
+        ),
+        "the non-busy failure survives the floor: {:?} after {} mints",
+        h.supervisor.status(DEVICE_ID).await,
+        mint_calls(&h.qubo).await
+    );
+
+    let live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status(DEVICE_ID).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(
+        live,
+        "the post-floor success lands live: {:?}",
+        h.supervisor.status(DEVICE_ID).await
+    );
+    assert_eq!(
+        mint_calls(&h.qubo).await,
+        3,
+        "busy, non-busy retry, success"
+    );
+}
+
+/// The busy floor advances the tile's state too, not only the high's.
+#[tokio::test]
+async fn a_busy_floor_clears_the_tile_too() {
+    let mut pacing = pacing(Duration::from_millis(60));
+    pacing.remint = Duration::from_millis(150);
+    pacing.busy_backoff = Duration::from_millis(250);
+    pacing.liveness_poll = Duration::from_millis(20);
+    let h = harness_with(pacing).await;
+    // One success, then a busy refusal, then a slow success after the floor.
+    mint_mock("high", 200, mint_body("first"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.qubo)
+        .await;
+    mint_mock("high", 400, busy_body())
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&h.qubo)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(MINT_PATH))
+        .and(query_param("type", "high"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(mint_body("second"))
+                .set_delay(Duration::from_millis(700)),
+        )
+        .mount(&h.qubo)
+        .await;
+
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::Low, false)
+        .await
+        .expect("the tile registers");
+    let both_live = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Live { .. }
+        ) && matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Live { .. }
+        )
+    })
+    .await;
+    assert!(both_live, "the high and the tile are live first");
+
+    let busy = common::eventually(|| async {
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+        ) && matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Degraded { reason } if reason == server::supervisor::BUSY_REASON
+        )
+    })
+    .await;
+    assert!(busy, "both read busy inside the floor");
+
+    // Floor at 250ms, post-floor success takes 700ms: at 350ms the floor
+    // has passed and the success is in flight, so both should read Waking.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::High).await,
+            StreamState::Waking
+        ),
+        "the high advances off busy: {:?}",
+        h.supervisor.status_for(DEVICE_ID, Quality::High).await
+    );
+    assert!(
+        matches!(
+            h.supervisor.status_for(DEVICE_ID, Quality::Low).await,
+            StreamState::Waking
+        ),
+        "the tile follows the high off busy: {:?}",
+        h.supervisor.status_for(DEVICE_ID, Quality::Low).await
     );
 }
 

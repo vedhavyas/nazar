@@ -97,6 +97,7 @@ async fn harness(
             touch_ttl: Duration::from_millis(300),
             arm_timeout,
             lane_cooldown,
+            busy_backoff: Duration::from_mins(5),
         },
     )
     .with_fast_lane(
@@ -748,4 +749,92 @@ async fn a_benched_lane_is_retried_once_its_cooldown_elapses() {
 
     let retried = common::eventually(|| async { h.lane.arms() == 2 }).await;
     assert!(retried, "the lane is retried once its cooldown elapses");
+}
+
+/// A scheduled refresh on a fast-lane camera patches the source in place:
+/// the hold stays bound and no teardown runs.
+#[tokio::test]
+async fn a_scheduled_refresh_patches_a_fast_lane_source() {
+    let mut h = harness(
+        FakeLane::new(),
+        vec![DEVICE_ID.to_owned()],
+        Duration::from_secs(15),
+        Duration::from_millis(150),
+        Duration::from_secs(600),
+    )
+    .await;
+    h.supervisor = h
+        .supervisor
+        .clone()
+        .with_hold(Arc::new(common::FakeHold::attaching(h.go2rtc.clone())));
+    h.supervisor
+        .ensure(DEVICE_ID, Quality::High, false)
+        .await
+        .expect("ensure accepts");
+    let name = format!("{DEVICE_ID}-high");
+    let landed = common::eventually(|| async { h.go2rtc.has_stream(&name) }).await;
+    assert!(landed, "the fast lane landed: {:?}", h.go2rtc.ops());
+
+    let refreshed = common::eventually(|| async {
+        h.go2rtc
+            .ops()
+            .iter()
+            .any(|op| op == &format!("patch:{name}"))
+    })
+    .await;
+    assert!(
+        refreshed,
+        "the cadence patched the fast-lane source: {:?}",
+        h.go2rtc.ops()
+    );
+
+    let ops = h.go2rtc.ops();
+    let first_put = ops
+        .iter()
+        .position(|op| op.starts_with("put:"))
+        .expect("the first mint put the stream");
+    assert!(
+        !ops[first_put..].iter().any(|op| op.starts_with("delete:")),
+        "a refresh never tears the fast-lane stream down: {ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| op.starts_with("put:")).count(),
+        1,
+        "the first mint is the only PUT: {ops:?}"
+    );
+    let (consumers, connected) = h.go2rtc.stream_view(&name);
+    assert_eq!(consumers, 1, "the hold stayed bound to the stream object");
+    assert!(connected, "and its producer is connected");
+
+    // A refused refresh keeps the serving source and says so, not "armed".
+    let captured = common::capture::Captured::start();
+    h.go2rtc.set_patch_status(500);
+    let before = h.go2rtc.patches().len();
+    let attempted = common::eventually(|| async { h.go2rtc.patches().len() > before }).await;
+    assert!(attempted, "the next cadence tried a patch");
+    let kept = common::eventually(|| async {
+        captured
+            .text()
+            .contains("the fast-lane refresh did not take; keeping the serving source")
+    })
+    .await;
+    assert!(
+        kept,
+        "the refused fast-lane refresh is named as kept: {}",
+        captured.text()
+    );
+    // An arm logged by a refresh already in flight when the refusal was
+    // armed is legitimate; only an arm after the kept line would be wrong.
+    let text = captured.text();
+    let kept_at = text
+        .find("the fast-lane refresh did not take; keeping the serving source")
+        .expect("the kept line");
+    assert!(
+        !text[kept_at..].contains("fast lane armed"),
+        "a refused refresh is not logged as an arm: {}",
+        &text[kept_at..]
+    );
+    let (consumers, connected) = h.go2rtc.stream_view(&name);
+    assert_eq!(consumers, 1, "the hold stays bound after a refused refresh");
+    assert!(connected, "and the producer keeps serving");
 }

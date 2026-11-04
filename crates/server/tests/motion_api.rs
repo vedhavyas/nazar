@@ -76,6 +76,7 @@ fn pacing() -> Pacing {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     }
 }
 

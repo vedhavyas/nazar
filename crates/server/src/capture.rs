@@ -34,6 +34,11 @@ impl Captured {
                 "the capture subscriber could not be installed: {:?}",
                 installed.err()
             );
+            // A callsite already hit before the install was cached as
+            // disabled process-wide; rebuilding the cache re-reads every
+            // callsite against the new subscriber, so a line emitted by an
+            // earlier test is not silently lost here.
+            tracing::callsite::rebuild_interest_cache();
         });
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let previous = CAPTURE.with(|slot| slot.replace(Some(Arc::clone(&buffer))));

@@ -51,6 +51,7 @@ fn pacing(remint: Duration) -> Pacing {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     }
 }
 
@@ -147,9 +148,18 @@ async fn is_live(supervisor: &Supervisor) -> bool {
     matches!(supervisor.status(DEVICE_ID).await, StreamState::Live { .. })
 }
 
+/// Attach a viewer once the first mint's stream entry exists: a PUT installs
+/// a fresh object, so an attach sent before it would belong to the
+/// predecessor and be invisible to the streams view.
+async fn attach_viewer(h: &Harness, name: &str) {
+    let landed = common::eventually(|| async { h.go2rtc.has_stream(name) }).await;
+    assert!(landed, "the first mint landed: {:?}", h.go2rtc.ops());
+    h.go2rtc.set_viewers(name, 1);
+}
+
 /// Whether the wire's last streams operation was a release: a delete with
-/// no PUT after it. Every re-mint's swap deletes and then puts, so a swap
-/// never reads as one.
+/// nothing after it. A recovery swap follows its delete with a put, and a
+/// refresh patches without deleting at all.
 fn released_last(h: &Harness) -> bool {
     h.go2rtc
         .ops()
@@ -157,7 +167,7 @@ fn released_last(h: &Harness) -> bool {
         .is_some_and(|op| op.starts_with("delete:"))
 }
 
-/// The last streams operation for `name`, as `put:<name>` or `delete:<name>`.
+/// The last streams operation for `name`: put, patch or delete.
 fn last_op(ops: &[String], name: &str) -> Option<String> {
     ops.iter().rev().find(|op| op.ends_with(name)).cloned()
 }
@@ -341,6 +351,7 @@ async fn a_manual_retry_forces_a_remint_and_clears_the_login_flag() {
         touch_ttl: Duration::from_millis(300),
         arm_timeout: Duration::from_secs(15),
         lane_cooldown: Duration::from_secs(600),
+        busy_backoff: Duration::from_mins(5),
     })
     .await;
     mount_discovery(&h.qubo).await;
@@ -1072,7 +1083,7 @@ async fn a_remint_reaps_the_predecessor_before_the_swap() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(reminted, "the loop re-mints: {:?}", h.go2rtc.puts());
@@ -1110,7 +1121,7 @@ async fn a_stalled_producer_is_reminted_with_a_fresh_url() {
         .expect("the stream registers");
     // A viewer on the picture: that is what makes the stall the loop's
     // business.
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
     assert!(reminted, "the loop keeps minting: {:?}", h.go2rtc.puts());
@@ -1169,7 +1180,7 @@ async fn a_dead_producer_re_mints_without_a_release_racing_it() {
 
     // A viewer arrives at the dead picture: the stall machinery re-mints
     // on its own, with no release racing the heal.
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() > started }).await;
     assert!(
         reminted,
@@ -1204,7 +1215,7 @@ async fn the_state_stays_waking_until_the_producer_connects() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let waking = common::eventually(|| async {
         h.supervisor.status(DEVICE_ID).await == StreamState::Waking
@@ -1221,6 +1232,9 @@ async fn the_state_stays_waking_until_the_producer_connects() {
         h.go2rtc.puts()
     );
 
+    // The fresh PUT cleared the viewer; its rebuilt player attaches to the
+    // new object, and the camera's push connects it.
+    attach_viewer(&h, &name).await;
     h.go2rtc.connect_producer(&name);
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the picture's return flips the state live");
@@ -1250,7 +1264,7 @@ async fn a_stalled_producer_leaves_live_and_reads_waking() {
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the stream is live first");
 
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     h.go2rtc.disconnect_producer(&name);
     let waking = common::eventually(|| async {
         h.supervisor.status(DEVICE_ID).await == StreamState::Waking
@@ -1284,7 +1298,7 @@ async fn a_slow_producer_connects_within_the_grace() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     // The producer needs its moment; no re-mint may cut it short.
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1317,16 +1331,19 @@ async fn a_late_viewer_heals_through_a_fresh_mint() {
         .expect("the stream registers");
 
     // The first viewer attaches and leaves: the URL is spent.
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the first viewer's picture is up");
     h.go2rtc.set_viewers(&name, 0);
 
     // The late viewer: the spent URL cannot connect, so the watch mints
     // fresh, and the picture comes up on the second URL.
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let mints = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(mints, "a fresh mint went out: {:?}", h.go2rtc.puts());
+    // The fresh PUT installs a new stream object; the viewer re-attaches to
+    // it, as its rebuilt player does.
+    attach_viewer(&h, &name).await;
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "and the late viewer's picture is up");
     let _ = std::fs::remove_file(&h.sessions_path);
@@ -1349,7 +1366,7 @@ async fn a_producer_that_never_connects_degrades_after_the_window() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let degraded = common::eventually(|| async {
         matches!(
@@ -1397,7 +1414,7 @@ async fn a_degraded_stream_stays_degraded_across_attempts() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let degraded = common::eventually(|| async {
         matches!(
@@ -1454,7 +1471,7 @@ async fn a_mint_failure_mid_stall_does_not_restart_the_window() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let degraded = common::eventually(|| async {
         matches!(
@@ -1537,7 +1554,7 @@ async fn an_offline_mint_failure_drops_the_stale_source_and_keeps_the_reason() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let refused = common::eventually(|| async { mint_count(&h.qubo).await >= 2 }).await;
     assert!(refused, "the re-mint runs");
@@ -1621,7 +1638,7 @@ async fn an_offline_drop_removes_the_low_chain() {
         .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the low chain registers");
-    h.go2rtc.set_viewers(&high, 1);
+    attach_viewer(&h, &high).await;
 
     let dropped = common::eventually(|| async {
         let ops = h.go2rtc.ops();
@@ -1720,7 +1737,7 @@ async fn an_ask_put_landing_after_the_offline_drop_drops_the_low_chain() {
     // The starved high is re-minted and refused: the drop lands while the
     // ask is still blocked on its own DELETE.
     let deletes_before = h.go2rtc.deletes().len();
-    h.go2rtc.set_viewers(&high, 1);
+    attach_viewer(&h, &high).await;
     let dropped = common::eventually(|| async {
         let deletes = h.go2rtc.deletes();
         // The drop's own delete of the high, then its delete of the low:
@@ -1794,7 +1811,7 @@ async fn a_mint_after_an_offline_drop_rebuilds_the_low_chain() {
         .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the low chain registers");
-    h.go2rtc.set_viewers(&high, 1);
+    attach_viewer(&h, &high).await;
 
     // The rebuild is only meaningful after the drop: wait for both gone.
     let dropped = common::eventually(|| async {
@@ -1850,7 +1867,9 @@ async fn a_mint_after_an_offline_drop_rebuilds_the_low_chain() {
     );
 
     // The camera's push lands on the rebuilt source: the run closes and
-    // the recovered stream reads live, its offline reason gone.
+    // the recovered stream reads live, its offline reason gone. The viewer
+    // re-attaches to the fresh high object first.
+    attach_viewer(&h, &high).await;
     h.go2rtc.connect_producer(&high);
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(
@@ -1888,7 +1907,7 @@ async fn a_non_offline_refusal_keeps_the_stale_source() {
         .ensure(DEVICE_ID, Quality::Low, false)
         .await
         .expect("the low chain registers");
-    h.go2rtc.set_viewers(&high, 1);
+    attach_viewer(&h, &high).await;
 
     let refused = common::eventually(|| async {
         matches!(
@@ -2183,7 +2202,7 @@ async fn a_refusal_before_a_run_is_not_carried_into_it() {
 
     // A viewer arrives: the run opens, and its window lands before the
     // next attempt's backoff does.
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let waking = common::eventually(|| async {
         h.supervisor.status_for(DEVICE_ID, Quality::High).await == StreamState::Waking
     })
@@ -2322,7 +2341,7 @@ async fn a_transient_mint_failure_keeps_the_stale_source() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     let degraded = common::eventually(|| async {
         matches!(
@@ -2492,7 +2511,7 @@ async fn a_connected_producer_ignores_a_fresh_ask() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the attended stream is live");
 
@@ -2525,7 +2544,7 @@ async fn an_unreadable_or_missing_producer_does_not_heal() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let degraded = common::eventually(|| async {
         matches!(
             h.supervisor.status(DEVICE_ID).await,
@@ -2867,7 +2886,7 @@ async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(reminted, "the starved run re-mints: {:?}", h.go2rtc.puts());
 
@@ -2882,7 +2901,9 @@ async fn a_closed_run_does_not_re_mint_on_the_stale_deadline() {
     );
 
     // The camera's push lands on the URL already attached: the run closes
-    // while the failure's tail is still standing.
+    // while the failure's tail is still standing. The viewer re-attaches
+    // to the fresh object first.
+    attach_viewer(&h, &name).await;
     h.go2rtc.connect_producer(&name);
     let live = common::eventually(|| async { is_live(&h.supervisor).await }).await;
     assert!(live, "the recovery closes the run");
@@ -2964,7 +2985,7 @@ async fn a_young_mint_is_not_trampled_by_the_run() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
 
     // Inside the settle: the waiting viewer does not get the URL swapped
     // out from under the dial.
@@ -3010,14 +3031,21 @@ async fn a_hold_death_re_mints_at_once() {
     assert!(warm, "the hold warmed the producer");
     // The producer stays CONNECTED throughout: the illusion is the point.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let mints = h.go2rtc.puts().len();
+    let put_op = format!("put:{name}");
+    let patch_op = format!("patch:{name}");
+    let remints = |ops: &[String]| {
+        ops.iter()
+            .filter(|op| *op == &put_op || *op == &patch_op)
+            .count()
+    };
+    let before = remints(&h.go2rtc.ops());
 
     hold.report_death();
-    let reminted = common::eventually(|| async { h.go2rtc.puts().len() > mints }).await;
+    let reminted = common::eventually(|| async { remints(&h.go2rtc.ops()) > before }).await;
     assert!(
         reminted,
-        "the hold's death re-mints without a viewer: {:?}",
-        h.go2rtc.puts()
+        "the hold's death refreshes the source without a viewer: {:?}",
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -3048,14 +3076,22 @@ async fn a_young_mints_hold_death_does_not_churn() {
     assert!(warm, "the hold warmed the producer");
 
     // The death lands inside the mint's settle: a swap's churn, not a
-    // witness.
+    // witness. A churn mint on a held stream is a patch, so count both.
+    let put_op = format!("put:{name}");
+    let patch_op = format!("patch:{name}");
+    let remints = |ops: &[String]| {
+        ops.iter()
+            .filter(|op| *op == &put_op || *op == &patch_op)
+            .count()
+    };
+    let before = remints(&h.go2rtc.ops());
     hold.report_death();
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        h.go2rtc.puts().len(),
-        1,
+        remints(&h.go2rtc.ops()),
+        before,
         "a swap-churn death mints nothing: {:?}",
-        h.go2rtc.puts()
+        h.go2rtc.ops()
     );
     let _ = std::fs::remove_file(&h.sessions_path);
 }
@@ -3083,7 +3119,7 @@ async fn a_stuck_push_backs_the_mints_off() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let second = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(second, "the stuck run re-mints after the first settle");
 
@@ -3128,7 +3164,7 @@ async fn a_stall_re_mints_on_a_compounding_backoff() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let reminting = common::eventually(|| async { h.go2rtc.puts().len() >= 3 }).await;
     assert!(reminting, "the run re-mints: {:?}", h.go2rtc.puts());
 
@@ -3170,7 +3206,7 @@ async fn a_never_attaching_hold_does_not_shadow_a_viewer() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
         !released_last(&h),
@@ -3202,7 +3238,7 @@ async fn a_never_attaching_hold_does_not_mask_a_starved_viewer() {
         .ensure(DEVICE_ID, Quality::High, false)
         .await
         .expect("the stream registers");
-    h.go2rtc.set_viewers(&name, 1);
+    attach_viewer(&h, &name).await;
     let reminted = common::eventually(|| async { h.go2rtc.puts().len() >= 2 }).await;
     assert!(
         reminted,

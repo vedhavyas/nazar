@@ -294,11 +294,13 @@ impl LaneSession for FakeSession {
 pub struct FakeApi {
     pub base: reqwest::Url,
     puts: Arc<Mutex<Vec<(String, String)>>>,
+    patches: Arc<Mutex<Vec<(String, String)>>>,
     /// The puts go2rtc actually took: what the streams view lists, as a
     /// refused put leaves no entry behind in the real one.
     taken: Arc<Mutex<Vec<(String, String)>>>,
     deletes: Arc<Mutex<Vec<String>>>,
     put_status: Arc<AtomicU16>,
+    patch_status: Arc<AtomicU16>,
     put_refused_marker: Arc<Mutex<Option<String>>>,
     streams_visible: Arc<AtomicBool>,
     streams_error: Arc<AtomicBool>,
@@ -328,8 +330,10 @@ pub struct FakeApi {
     /// How long a DELETE takes to answer, in milliseconds: a teardown that
     /// can be caught mid-flight.
     delete_delay: Arc<AtomicU64>,
-    /// Every streams-admin operation in the order it landed, `put:<name>`
-    /// and `delete:<name>`: the order tests otherwise cannot see.
+    /// Every PUT attempt, every accepted PATCH and every DELETE in the
+    /// order it landed, as `put:<name>`, `patch:<name>`, `delete:<name>`:
+    /// the order tests otherwise cannot see. A refused PATCH is not here;
+    /// every patch attempt, refused or not, is in `patches()`.
     ops: Arc<Mutex<Vec<String>>>,
     /// The answer a DELETE gives: 200 with no body unless a test sets one.
     delete_answer: Arc<Mutex<(u16, Option<String>)>>,
@@ -390,9 +394,11 @@ async fn hold_at_door(gate: &Arc<Mutex<Option<DeleteGate>>>, name: &str) {
 impl FakeApi {
     pub async fn start() -> Self {
         let puts = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
         let taken = Arc::new(Mutex::new(Vec::new()));
         let deletes = Arc::new(Mutex::new(Vec::new()));
         let put_status = Arc::new(AtomicU16::new(200));
+        let patch_status = Arc::new(AtomicU16::new(200));
         let put_refused_marker = Arc::new(Mutex::new(None));
         let streams_visible = Arc::new(AtomicBool::new(true));
         let streams_error = Arc::new(AtomicBool::new(false));
@@ -414,6 +420,8 @@ impl FakeApi {
             &Knobs {
                 delete_gate: &delete_gate,
                 put_status: &put_status,
+                patch_status: &patch_status,
+                patches: &patches,
                 put_refused_marker: &put_refused_marker,
                 streams_visible: &streams_visible,
                 streams_error: &streams_error,
@@ -441,9 +449,11 @@ impl FakeApi {
         Self {
             base: format!("http://{addr}").parse().expect("a url"),
             puts,
+            patches,
             taken,
             deletes,
             put_status,
+            patch_status,
             put_refused_marker,
             streams_visible,
             streams_error,
@@ -462,10 +472,16 @@ impl FakeApi {
         }
     }
 
-    /// The streams-admin operations received so far, in arrival order, as
-    /// `put:<name>` and `delete:<name>`.
+    /// The streams-admin operations so far, in arrival order, as
+    /// `put:<name>` (attempts included), accepted `patch:<name>` and
+    /// `delete:<name>`.
     pub fn ops(&self) -> Vec<String> {
         self.ops.lock().unwrap().clone()
+    }
+
+    /// The source PATCHes received so far, as `(name, source)`.
+    pub fn patches(&self) -> Vec<(String, String)> {
+        self.patches.lock().unwrap().clone()
     }
 
     /// Arm the next DELETE of `name` at the fake's door: the test learns
@@ -600,6 +616,11 @@ impl FakeApi {
     /// Answer stream PUTs with `status` from now on.
     pub fn set_put_status(&self, status: u16) {
         self.put_status.store(status, Ordering::SeqCst);
+    }
+
+    /// Answer source PATCHes with `status` from now on.
+    pub fn set_patch_status(&self, status: u16) {
+        self.patch_status.store(status, Ordering::SeqCst);
     }
 
     /// Report nothing from GET /api/streams, as a go2rtc that acked a PUT
@@ -746,6 +767,8 @@ impl Drop for FakeLease {
 struct Knobs<'a> {
     delete_gate: &'a Arc<Mutex<Option<DeleteGate>>>,
     put_status: &'a Arc<AtomicU16>,
+    patch_status: &'a Arc<AtomicU16>,
+    patches: &'a Arc<Mutex<Vec<(String, String)>>>,
     put_refused_marker: &'a Arc<Mutex<Option<String>>>,
     streams_visible: &'a Arc<AtomicBool>,
     streams_error: &'a Arc<AtomicBool>,
@@ -795,7 +818,68 @@ fn streams_routes(
         )
 }
 
-/// The streams endpoint's three methods, as go2rtc 1.9.14 answers them.
+/// The PATCH answer: SetSource on the existing stream object, so its
+/// consumers stay bound and its producer moves to the new URL.
+fn patch_handler(
+    knobs: &Knobs<'_>,
+    viewers: &Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+) -> axum::routing::MethodRouter {
+    let taken = Arc::clone(knobs.taken);
+    let patches = Arc::clone(knobs.patches);
+    let status = Arc::clone(knobs.patch_status);
+    let ops = Arc::clone(knobs.ops);
+    let urls = Arc::clone(knobs.url_state);
+    let dialed = Arc::clone(knobs.dialed);
+    let viewers = Arc::clone(viewers);
+    let held = Arc::clone(knobs.held);
+    axum::routing::patch(move |Query(params): Query<HashMap<String, String>>| {
+        let taken = Arc::clone(&taken);
+        let patches = Arc::clone(&patches);
+        let status = Arc::clone(&status);
+        let ops = Arc::clone(&ops);
+        let urls = Arc::clone(&urls);
+        let dialed = Arc::clone(&dialed);
+        let viewers = Arc::clone(&viewers);
+        let held = Arc::clone(&held);
+        async move {
+            let name = params.get("name").cloned().unwrap_or_default();
+            let source = params.get("src").cloned().unwrap_or_default();
+            patches.lock().unwrap().push((name.clone(), source.clone()));
+            let code = StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status");
+            if !code.is_success() {
+                return code;
+            }
+            {
+                let mut listed = taken.lock().unwrap();
+                match listed.iter_mut().find(|(listed, _)| listed == &name) {
+                    Some(entry) => entry.1.clone_from(&source),
+                    None => listed.push((name.clone(), source.clone())),
+                }
+            }
+            // SetSource on the existing object: its consumers stay bound
+            // and its producer reconnects to the new URL on its next
+            // reconnect, spending that URL's one dial. The fake does not
+            // model the gap before that reconnect.
+            let riding = viewers.lock().unwrap().contains_key(&name)
+                || held.lock().unwrap().contains_key(&name);
+            {
+                let mut urls = urls.lock().unwrap();
+                let state = urls.entry(name.clone()).or_insert((0, 0));
+                state.0 += 1;
+                if riding {
+                    state.1 = state.0;
+                }
+            }
+            if riding {
+                dialed.lock().unwrap().insert(name.clone());
+            }
+            ops.lock().unwrap().push(format!("patch:{name}"));
+            StatusCode::OK
+        }
+    })
+}
+
+/// The streams endpoint's four methods, as go2rtc 1.9.14 answers them.
 fn streams_methods(
     puts: &Arc<Mutex<Vec<(String, String)>>>,
     deletes: &Arc<Mutex<Vec<String>>>,
@@ -830,27 +914,6 @@ fn streams_methods(
                 .lock()
                 .unwrap()
                 .push((name.clone(), source.clone()));
-            // A fresh source is a fresh URL. Attached consumers - viewers
-            // or narar's own hold - ride the swap, as go2rtc swaps the
-            // source under the stream's name: their producer restarts and
-            // dials the new URL, spending its one dial for this
-            // generation. With nobody attached the URL stays unspent, and
-            // the next new attach is the one that dials it.
-            let riding = served.lock().unwrap().contains_key(&name)
-                || held.lock().unwrap().contains_key(&name);
-            {
-                let mut urls = urls.lock().unwrap();
-                let state = urls.entry(name.clone()).or_insert((0, 0));
-                state.0 += 1;
-                if riding {
-                    state.1 = state.0;
-                }
-            }
-            if riding {
-                dialed.lock().unwrap().insert(name.clone());
-            } else {
-                dialed.lock().unwrap().remove(&name);
-            }
             ops.lock().unwrap().push(format!("put:{name}"));
             let marker = refused
                 .lock()
@@ -862,7 +925,21 @@ fn streams_methods(
                 StatusCode::from_u16(status.load(Ordering::SeqCst)).expect("a status")
             };
             if code.is_success() {
-                taken.lock().unwrap().push((name.clone(), source.clone()));
+                // A PUT installs a brand-new stream object under the name.
+                // Consumers stay bound to the old object, so the entry the
+                // streams view lists has none, and its producer is not
+                // dialed until something attaches to this new object.
+                served.lock().unwrap().remove(&name);
+                held.lock().unwrap().remove(&name);
+                {
+                    let mut urls = urls.lock().unwrap();
+                    let state = urls.entry(name.clone()).or_insert((0, 0));
+                    state.0 += 1;
+                }
+                dialed.lock().unwrap().remove(&name);
+                let mut listed = taken.lock().unwrap();
+                listed.retain(|(listed, _)| listed != &name);
+                listed.push((name.clone(), source.clone()));
             }
             // A rejected PUT quotes the source back, as go2rtc's own
             // refusals do - token and all.
@@ -878,6 +955,7 @@ fn streams_methods(
             (code, body)
         }
     });
+    let patch_stream = patch_handler(knobs, viewers);
     let drop_stream = delete_handler(
         Arc::clone(deletes),
         Arc::clone(knobs.delete_delay),
@@ -897,7 +975,10 @@ fn streams_methods(
         connect_after: Arc::clone(knobs.connect_after),
         held: Arc::clone(knobs.held),
     });
-    put_stream.delete(drop_stream).get(list_streams)
+    put_stream
+        .delete(drop_stream)
+        .get(list_streams)
+        .patch(patch_stream)
 }
 
 /// The DELETE answer: recorded on arrival, the entry dropped, then the
